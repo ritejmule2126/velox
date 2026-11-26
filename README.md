@@ -1,4 +1,12 @@
-# Velox
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="assets/velox-dark.svg">
+    <source media="(prefers-color-scheme: light)" srcset="assets/velox.svg">
+    <img alt="Velox logo" src="assets/velox.svg" width="128" height="128">
+  </picture>
+</p>
+
+<h1 align="center">Velox</h1>
 
 **A memory-safe reverse proxy and L4/L7 load balancer in pure Rust.**
 HTTP/3 + HTTP/2 + HTTP/1.1 at the edge, pooled HTTP/1.1 / h2c / Unix sockets to your backends, zero-reload configuration, and request-smuggling defences that don't rely on the HTTP library's good manners.

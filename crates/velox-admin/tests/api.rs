@@ -437,3 +437,16 @@ async fn cache_endpoints_are_404_without_a_cache_and_guarded_like_the_rest() {
     assert_eq!(status, StatusCode::FORBIDDEN, "browser-originated purge refused");
     assert!(cache.purges.lock().unwrap().is_empty());
 }
+
+#[tokio::test]
+async fn logo_endpoints_serve_transparent_and_dark_svgs() {
+    let f = fixture(None);
+    for path in ["/favicon.svg", "/admin/v1/logo.svg"] {
+        let (status, _, text) = call(&f, Method::GET, path, None).await;
+        assert_eq!(status, StatusCode::OK, "{path}");
+        assert!(text.starts_with("<svg ") && !text.contains("fill=\"#0B0F19\""), "{path}: {text}");
+    }
+    let (status, _, text) = call(&f, Method::GET, "/admin/v1/logo-dark.svg", None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(text.starts_with("<svg ") && text.contains("fill=\"#0B0F19\""));
+}

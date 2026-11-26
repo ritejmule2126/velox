@@ -15,6 +15,8 @@ use velox_core::{Config, ConfigError, SharedState};
 use velox_telemetry::Metrics;
 
 const MAX_BODY: usize = 1024 * 1024;
+const LOGO_SVG: &[u8] = include_bytes!("../../../assets/velox.svg");
+const LOGO_DARK_SVG: &[u8] = include_bytes!("../../../assets/velox-dark.svg");
 
 /// Re-reads the configuration source (normally `velox.toml`) and applies it.
 pub trait Reloader: Send + Sync + 'static {
@@ -71,6 +73,13 @@ fn plain(status: StatusCode, content_type: &'static str, body: String) -> Respon
     let mut resp = Response::new(Full::new(Bytes::from(body)));
     *resp.status_mut() = status;
     resp.headers_mut().insert(header::CONTENT_TYPE, header::HeaderValue::from_static(content_type));
+    resp
+}
+
+fn static_svg(svg: &'static [u8]) -> Response<Full<Bytes>> {
+    let mut resp = Response::new(Full::new(Bytes::from_static(svg)));
+    *resp.status_mut() = StatusCode::OK;
+    resp.headers_mut().insert(header::CONTENT_TYPE, header::HeaderValue::from_static("image/svg+xml; charset=utf-8"));
     resp
 }
 
@@ -220,6 +229,8 @@ impl AdminApi {
         match (method, segs.as_slice()) {
             (&Method::GET, ["healthz"]) => Ok(plain(StatusCode::OK, "text/plain", "ok\n".into())),
             (&Method::GET, ["metrics"]) => self.metrics_response(),
+            (&Method::GET, ["favicon.svg"] | ["admin", "v1", "logo.svg"]) => Ok(static_svg(LOGO_SVG)),
+            (&Method::GET, ["admin", "v1", "logo-dark.svg"]) => Ok(static_svg(LOGO_DARK_SVG)),
             (&Method::GET, ["admin", "v1", "status"]) => {
                 let snap = self.state.load();
                 json(
