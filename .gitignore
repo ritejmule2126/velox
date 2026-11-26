@@ -1,0 +1,17 @@
+# Rust
+/target/
+**/*.rs.bk
+# Fuzzing
+/fuzz/target/
+/fuzz/corpus/
+/fuzz/artifacts/
+# IDE / OS
+.idea/
+.vscode/
+*.iml
+.DS_Store
+# Local secrets & runtime state
+.env
+*.pem
+*.key
+/acme-cache/

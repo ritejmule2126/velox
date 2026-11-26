@@ -1,0 +1,22 @@
+# Throughput-test configuration: plain HTTP, no rate limit, no access log.
+[server]
+http_addr = "127.0.0.1:8080"
+
+[limits]
+max_connections        = 0
+max_connections_per_ip = 0
+
+[admin]
+addr = "127.0.0.1:9901"
+
+[telemetry]
+log_level  = "warn"
+access_log = false
+
+[[upstream]]
+name      = "bench"
+algorithm = "least_conn"
+backends  = [{ addr = "127.0.0.1:3000" }, { addr = "127.0.0.1:3001" }]
+
+[[route]]
+upstream = "bench"

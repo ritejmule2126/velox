@@ -1,0 +1,25 @@
+//! # velox-security
+//!
+//! * [`ratelimit`]: lock-free GCRA token buckets keyed by IP or header.
+//! * [`connlimit`]: global and per-IP connection caps with RAII permits.
+//! * [`tls`]: `rustls` configuration, SNI certificate selection with hot
+//!   reload, and development self-signed certificates.
+//! * [`headers`]: HSTS and response-header policy.
+//! * `acme` (feature `acme`): HTTP-01 certificate issuance and renewal.
+
+#![forbid(unsafe_code)]
+#![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used, clippy::panic))]
+
+#[cfg(feature = "acme")]
+pub mod acme;
+pub mod challenge;
+pub mod connlimit;
+pub mod headers;
+pub mod ratelimit;
+pub mod tls;
+
+pub use challenge::ChallengeStore;
+pub use connlimit::{ConnectionLimiter, ConnectionPermit};
+pub use headers::ResponsePolicy;
+pub use ratelimit::{rate_key, Decision, RateKey, RateLimiter, RateLimiters};
+pub use tls::{SniResolver, TlsError};

@@ -1,0 +1,91 @@
+[workspace]
+resolver = "2"
+members = ["crates/velox-core", "crates/velox-telemetry", "crates/velox-security", "crates/velox-health", "crates/velox-proxy", "crates/velox-admin", "crates/velox-cli"]
+exclude = ["fuzz"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.88"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/ritejmule2126/velox"
+authors = ["Velox contributors"]
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+strip = "symbols"
+# `panic = "unwind"` (the default) is deliberate: a bug in one request task
+# must never take down every other connection.
+
+[profile.dev]
+# Dependencies dominate test time (TLS, QUIC); optimise them even in debug.
+[profile.dev.package."*"]
+opt-level = 2
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+missing_docs = "warn"
+
+[workspace.lints.clippy]
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
+
+[workspace.dependencies]
+# internal
+velox-core = { path = "crates/velox-core" }
+velox-telemetry = { path = "crates/velox-telemetry" }
+velox-security = { path = "crates/velox-security" }
+velox-health = { path = "crates/velox-health" }
+velox-proxy = { path = "crates/velox-proxy" }
+velox-admin = { path = "crates/velox-admin" }
+
+# async runtime / http
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time", "sync", "signal", "io-util", "fs"] }
+tokio-util = { version = "0.7", features = ["rt"] }
+hyper = { version = "1", features = ["http1", "http2", "server", "client"] }
+hyper-util = { version = "0.1", features = ["tokio", "server", "server-auto", "server-graceful", "client", "client-legacy", "http1", "http2"] }
+http-body = "1"
+http-body-util = "0.1"
+http = "1"
+bytes = "1"
+httparse = "1"
+tower-service = "0.3"
+pin-project-lite = "0.2"
+futures-util = { version = "0.3", default-features = false, features = ["std"] }
+
+# tls / quic
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12", "logging"] }
+quinn = { version = "0.11", default-features = false, features = ["runtime-tokio", "rustls-ring"] }
+h3 = "0.0.8"
+h3-quinn = "0.0.10"
+rcgen = { version = "0.13", default-features = false, features = ["ring", "pem"] }
+socket2 = { version = "0.5", features = ["all"] }
+
+# config / state
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+humantime-serde = "1"
+arc-swap = "1"
+dashmap = "6"
+ipnet = { version = "2", features = ["serde"] }
+
+# errors / observability
+thiserror = "2"
+anyhow = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", default-features = false, features = ["json", "env-filter", "fmt", "std", "registry", "ansi"] }
+prometheus = { version = "0.13", default-features = false }
+
+# misc
+clap = { version = "4", features = ["derive"] }
+fastrand = "2"
+
+# dev
+proptest = "1"
+criterion = { version = "0.5", default-features = false, features = ["cargo_bench_support"] }
+tempfile = "3"

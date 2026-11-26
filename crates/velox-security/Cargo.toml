@@ -1,0 +1,35 @@
+[package]
+name = "velox-security"
+description = "Velox rate limiting, connection limits, TLS (rustls) and security headers"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[lints]
+workspace = true
+
+[features]
+default = []
+# Automatic certificates via ACME HTTP-01 (Let's Encrypt).
+acme = ["dep:instant-acme", "dep:tokio", "dep:tokio-util", "dep:serde_json", "dep:tracing"]
+
+[dependencies]
+velox-core.workspace = true
+arc-swap.workspace = true
+dashmap.workspace = true
+http.workspace = true
+rcgen.workspace = true
+rustls.workspace = true
+thiserror.workspace = true
+instant-acme = { version = "0.8", optional = true, default-features = false, features = ["ring", "hyper-rustls"] }
+tokio = { workspace = true, optional = true }
+serde_json = { workspace = true, optional = true }
+tokio-util = { workspace = true, optional = true }
+tracing = { workspace = true, optional = true }
+
+[dev-dependencies]
+tempfile.workspace = true
+tokio = { workspace = true }

@@ -1,0 +1,34 @@
+[package]
+name = "velox-core"
+description = "Velox core: config schema, atomic state, routing and strict HTTP sanitisation"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+arc-swap.workspace = true
+bytes.workspace = true
+fastrand.workspace = true
+http.workspace = true
+httparse.workspace = true
+humantime-serde.workspace = true
+ipnet.workspace = true
+serde.workspace = true
+thiserror.workspace = true
+toml.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true
+criterion.workspace = true
+proptest.workspace = true
+tempfile.workspace = true
+
+[[bench]]
+name = "core_bench"
+harness = false

@@ -1,0 +1,49 @@
+[package]
+name = "velox-proxy"
+description = "Velox reverse proxy data plane: HTTP/1.1, HTTP/2, HTTP/3, L4, load balancing"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+velox-core.workspace = true
+velox-telemetry.workspace = true
+velox-security.workspace = true
+velox-health.workspace = true
+bytes.workspace = true
+fastrand.workspace = true
+futures-util.workspace = true
+h3.workspace = true
+h3-quinn.workspace = true
+http.workspace = true
+http-body.workspace = true
+http-body-util.workspace = true
+hyper.workspace = true
+hyper-util.workspace = true
+pin-project-lite.workspace = true
+quinn.workspace = true
+arc-swap.workspace = true
+rustls.workspace = true
+socket2.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tokio-rustls.workspace = true
+tokio-util.workspace = true
+tower-service.workspace = true
+tracing.workspace = true
+dashmap.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }
+criterion.workspace = true
+tempfile.workspace = true
+
+[[bench]]
+name = "lb_bench"
+harness = false

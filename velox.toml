@@ -1,0 +1,193 @@
+# =============================================================================
+# Velox sample configuration
+#
+#   velox validate -c velox.toml     check it (reports *every* problem at once)
+#   velox start    -c velox.toml     run it
+#   velox reload                     re-read this file in a running instance
+#                                    (also: `kill -HUP <pid>` or the admin API)
+#
+# Everything below except the listener addresses is hot-reloadable: Velox
+# builds a new immutable snapshot, validates it, and swaps it in atomically.
+# In-flight requests finish on the snapshot they started with, keep-alive
+# connections stay open, and an invalid file is rejected without side effects.
+# Durations accept "250ms", "5s", "10m", "1h".
+# =============================================================================
+
+# -----------------------------------------------------------------------------
+# Listeners  (changing these needs a restart)
+# -----------------------------------------------------------------------------
+[server]
+# Cleartext HTTP/1.1. Use 0.0.0.0:80 in production (needs CAP_NET_BIND_SERVICE).
+http_addr  = "0.0.0.0:8080"
+# TLS listener: HTTP/2 + HTTP/1.1 (ALPN). Use 0.0.0.0:443 in production.
+https_addr = "0.0.0.0:8443"
+# HTTP/3 (QUIC over UDP) on the same port as https_addr unless h3_addr is set.
+# TCP responses advertise it:  Alt-Svc: h3=":8443"; ma=86400
+h3              = true
+# h3_addr       = "0.0.0.0:8443"
+alt_svc_max_age = 86400
+
+accept_workers = 1          # parallel accept loops per TCP listener
+reuse_port     = true       # SO_REUSEPORT when accept_workers > 1
+tcp_nodelay    = true
+backlog        = 1024
+drain_timeout  = "30s"      # SIGTERM/SIGINT: wait this long for in-flight requests
+
+# -----------------------------------------------------------------------------
+# DoS hardening: hard bounds on every dimension of a request
+# -----------------------------------------------------------------------------
+[limits]
+max_header_bytes           = 16384     # request line + all headers (HTTP/1)
+max_headers                = 100       # (max 128)
+max_uri_bytes              = 8192
+max_request_body_bytes     = 10485760  # 10 MiB; 0 = unlimited
+max_connections            = 10000     # 0 = unlimited
+max_connections_per_ip     = 256       # IPv6 sources are grouped per /64
+max_streams_per_connection = 100       # HTTP/2 and HTTP/3
+retry_body_buffer_bytes    = 65536     # bodies up to this size can be retried on another backend
+
+# -----------------------------------------------------------------------------
+# Timeouts: nothing in Velox waits forever
+# -----------------------------------------------------------------------------
+[timeouts]
+tls_handshake      = "10s"   # TLS and QUIC handshakes
+header_read        = "10s"   # full request head must arrive in this time (Slowloris)
+idle_keepalive     = "60s"   # between requests on a connection
+request_body_idle  = "30s"   # max gap between client body frames (slow POST)
+upstream_connect   = "3s"
+upstream_response  = "30s"   # until upstream response *headers*
+upstream_body_idle = "60s"   # max gap between upstream body frames
+write_stall        = "30s"   # a client that never drains our response is cut off
+
+# -----------------------------------------------------------------------------
+# TLS (rustls). Pick one or more certificate sources.
+# -----------------------------------------------------------------------------
+[tls]
+# Development only: generate an in-memory self-signed certificate when no
+# configured certificate matches. Remove in production.
+self_signed_fallback = true
+
+# Certificates are chosen by SNI. Wildcards ("*.example.com") are supported; an
+# entry with no server_names is the default. Reloaded on `velox reload`.
+# [[tls.certs]]
+# server_names = ["example.com", "www.example.com"]
+# cert_file    = "/etc/velox/certs/example.com.crt"
+# key_file     = "/etc/velox/certs/example.com.key"
+
+[tls.hsts]                    # sent on TLS responses only
+enabled            = true
+max_age            = 31536000
+include_subdomains = false
+preload            = false
+
+# Automatic certificates via ACME HTTP-01 (Let's Encrypt). Needs a binary built
+# with `--features acme`, port 80 reachable from the internet, and `http_addr`
+# listening on it. Issued certificates are installed without a restart and
+# renewed ~30 days before expiry.
+# [tls.acme]
+# domains       = ["example.com", "www.example.com"]
+# contact_email = "ops@example.com"
+# directory_url = "https://acme-v02.api.letsencrypt.org/directory"   # use the staging URL while testing
+# cache_dir     = "/var/lib/velox/acme"
+
+# -----------------------------------------------------------------------------
+# Header hygiene
+# -----------------------------------------------------------------------------
+[security]
+# Peers whose X-Forwarded-* / Forwarded headers are believed (e.g. your cloud
+# load balancer). From anyone else those headers are discarded and rebuilt, so
+# clients cannot spoof their address.
+trusted_proxies    = []        # e.g. ["10.0.0.0/8", "fd00::/8"]
+nosniff            = true      # add X-Content-Type-Options: nosniff if the upstream did not
+hide_server_header = false
+[security.response_headers]    # added only when the upstream did not set them
+# "referrer-policy" = "no-referrer"
+
+# -----------------------------------------------------------------------------
+# Rate limiting: token bucket, lock-free, per client IP (or per header value)
+# -----------------------------------------------------------------------------
+# Default policy for every route; a route can override it or opt out with
+# `rate_limit = { enabled = false }`.
+[rate_limit]
+requests_per_second = 200.0
+burst               = 400
+key                 = "ip"                 # or "header:x-api-key" (falls back to the IP if absent)
+
+# -----------------------------------------------------------------------------
+# Admin API + metrics (localhost only)
+# -----------------------------------------------------------------------------
+[admin]
+addr = "127.0.0.1:9901"     # must be a loopback address
+# token_env = "VELOX_ADMIN_TOKEN"   # require `Authorization: Bearer $VELOX_ADMIN_TOKEN`
+
+[telemetry]
+log_level   = "info"        # or e.g. "info,velox_proxy=debug"; RUST_LOG overrides
+log_format  = "json"        # "json" (one object per line) or "pretty"
+access_log  = true          # one line per request with request_id, status, latency…
+# Prometheus text endpoint also served at http://127.0.0.1:9901/metrics.
+# Expose it to a scraper on its own port (serves ONLY /metrics and /healthz):
+# metrics_addr = "0.0.0.0:9100"
+
+# -----------------------------------------------------------------------------
+# Upstreams
+# -----------------------------------------------------------------------------
+[[upstream]]
+name      = "app"
+# round_robin | least_conn | p2c (power of two choices) | consistent_hash
+algorithm = "p2c"
+# protocol: "http1" (default) or "h2c" (HTTP/2 prior knowledge, multiplexed)
+protocol  = "http1"
+retries   = 1               # extra attempts on *another* backend (connect failures; idempotent requests on timeouts)
+# hash_on = "ip"            # for consistent_hash: "ip", "path" or "header:x-user-id"
+backends = [
+  { addr = "127.0.0.1:3000", weight = 1 },
+  { addr = "127.0.0.1:3001", weight = 1 },
+  # { addr = "unix:/run/app/web.sock" },   # Unix domain sockets work too
+]
+
+# Active health checks: probes with jitter and hysteresis.
+[upstream.health]
+kind                = "http"       # or "tcp"
+path                = "/healthz"
+interval            = "5s"
+timeout             = "2s"
+jitter              = 0.2          # ±20% so probes don't synchronise
+healthy_threshold   = 2            # consecutive successes to come back
+unhealthy_threshold = 3            # consecutive failures to go down
+status_min          = 200
+status_max          = 399
+
+# Passive outlier detection (circuit breaking) driven by real traffic.
+[upstream.outlier]
+enabled              = true
+consecutive_failures = 5           # connect errors, timeouts, 502/503/504
+base_ejection_time   = "30s"       # doubles on each repeat, up to max_ejection_time
+max_ejection_time    = "5m"
+max_ejection_percent = 50          # never eject more than this share of the pool
+
+[upstream.pool]
+idle_timeout         = "60s"
+max_idle_per_backend = 64
+
+# -----------------------------------------------------------------------------
+# Routes: exact host > wildcard host > any host; longest path prefix wins
+# -----------------------------------------------------------------------------
+[[route]]
+name          = "site"
+hosts         = []                  # [] = any host; e.g. ["example.com", "*.example.com"]
+path_prefix   = "/"
+upstream      = "app"
+# strip_prefix   = false            # remove path_prefix before forwarding
+# redirect_https = false            # answer plain-HTTP requests with a 308 to https
+# timeout        = "10s"            # override timeouts.upstream_response
+# request_headers = { "x-env" = "prod" }
+# rate_limit = { requests_per_second = 20.0, burst = 40, key = "header:x-api-key" }
+
+# -----------------------------------------------------------------------------
+# Optional: raw TCP (L4) load balancing, e.g. a database or MQTT broker.
+# Reuses an [[upstream]] (health checks, outlier detection, balancing).
+# -----------------------------------------------------------------------------
+# [[tcp_proxy]]
+# listen       = "0.0.0.0:5433"
+# upstream     = "postgres"
+# idle_timeout = "10m"
