@@ -34,7 +34,7 @@ HTTP/3 + HTTP/2 + HTTP/1.1 at the edge, pooled HTTP/1.1 / h2c / Unix sockets to 
 
 ```bash
 # Rust 1.88+
-cargo build --release          # → target/release/velox  (~7 MB, stripped)
+cargo build --release          # → target/release/velox  (~5 MB: fat LTO, stripped, panic=abort)
 cargo test --workspace --all-features
 
 # two throwaway backends
@@ -131,7 +131,7 @@ flowchart LR
 4. **Route** — one `ArcSwap` load; exact host → wildcard → catch-all, longest path prefix on segment boundaries.
 5. **Rate limit** — GCRA bucket per client IP or header value → `429` + `Retry-After`.
 6. **Forward headers** — hop-by-hop stripped (including `Connection`-nominated names), `X-Forwarded-For/Proto/Host`, `X-Real-IP`, RFC 7239 `Forwarded` rebuilt (untrusted peers cannot spoof them), `X-Request-Id` minted or propagated.
-7. **Balance + forward** — pick a backend, send over a pooled connection, fail over to *another* backend on connect errors (and on timeouts for idempotent requests); record the outcome for outlier detection.
+7. **Balance + forward** — pick a backend in O(1), send over a pooled connection, fail over to *another* backend on connect errors (and on timeouts for idempotent requests) — **all attempts share one `upstream_response` deadline** (see below); record the outcome for outlier detection.
 8. **Respond** — hop-by-hop stripped, HSTS / `nosniff` / `Alt-Svc` / `X-Request-Id` added, body streamed under an idle-timeout, metrics and access log emitted.
 
 Every failure maps to one status: `400/431/501` (rejected input), `404` (no route), `408`, `413`, `429`, `502`, `503`, `504`. Nothing on this path can panic.
@@ -155,9 +155,16 @@ Smuggling needs two parties to disagree about where a request ends. Velox remove
 * **After `hyper` — and for h2/h3.** The same rules run on typed headers, plus h2/h3-specific ones (no `Connection`, `Keep-Alive`, `Transfer-Encoding`, `Upgrade`, `TE` ≠ `trailers`; `:authority` must match `Host`).
 * **WebSocket upgrades** are honoured only for `Upgrade: websocket` (never `h2c`), must carry no body, and if the backend declines the upgrade the connection is closed rather than reused.
 
+### Host, redirects and retries
+
+* **Strict `Host` labels.** Labels are RFC 1123 (`[A-Za-z0-9-]`, no leading/trailing hyphen); `_` is rejected unless you set `security.allow_underscores_in_host = true` (useful for container service names; it relaxes *only* `_`). The switch applies to the HTTP/1 wire guard, the HTTP/2/3 typed check and route/SNI host patterns.
+* **No open redirects.** `redirect_https` on a catch-all route (`hosts = []`) would reflect whatever `Host` the client sent into `Location`, so validation **refuses** that configuration unless the route sets `canonical_host`. A request with no host at all (HTTP/1.0) gets a `400` rather than a redirect, and `OPTIONS *` redirects to `/`.
+* **One deadline for all retry attempts.** Failover attempts share a single `upstream_response` (or per-route `timeout`) budget, so `retries = 2` can no longer triple the worst-case latency. The trade-off is deliberate: an attempt that burns the whole budget on a *hung* backend ends the request with `504` instead of trying another node; connect failures (the common failover case) are still retried immediately, and hung backends are removed from rotation by outlier detection and health checks.
+* **HTTP/3 bodies.** The body is pumped on its own task, so routing and `413`/`429` decisions never wait for the first frame. `Content-Length` is enforced against the bytes that actually arrive (too many *or* too few ⇒ `400`, never a silent truncation), trailers — including trailers-only requests — are forwarded, and a stalled body gets a real `408`. (An HTTP/3 request whose *headers* never arrive has no stream to answer on, so it is reset.)
+
 ### Denial of service
 
-Every stage has a bound — see `[limits]` and `[timeouts]` in [`velox.toml`](velox.toml): TLS/QUIC handshake, **header read (Slowloris)**, idle keep-alive, client body idle, upstream connect, upstream response, upstream body idle, **write stall (slow-read)**; max header bytes/count/URI, body size, connections (global and per IP), concurrent streams; HTTP/2 rapid-reset limits; QUIC address validation under load; bounded rate-limiter memory (overflow bucket).
+Every stage has a bound — see `[limits]` and `[timeouts]` in [`velox.toml`](velox.toml): TLS/QUIC handshake, **header read (Slowloris)**, idle keep-alive, client body idle, upstream connect, upstream response, upstream body idle, **write stall (slow-read)**; max header bytes/count/URI, body size, connections (global and per IP), concurrent streams; HTTP/2 rapid-reset limits; QUIC address validation under load; bounded rate-limiter memory. When a shard of the limiter is full, inserting a new key evicts one entry *from that shard* (an expired bucket first, otherwise the closest to refilling after a bounded clock sweep). Eviction only ever makes the evicted key more permissive, so a flood of fabricated source keys cannot throttle new legitimate users; the cost is that an attacker able to mint hundreds of thousands of source keys can reset *other abusers'* penalty state.
 
 ### Admin API
 
@@ -304,17 +311,19 @@ cargo bench -p velox-core    # head parsing, guard, hop-by-hop, forwarded header
 cargo bench -p velox-proxy   # LB selection (4/32/128 backends) and rate-limit checks
 ```
 
-Measured on an Apple-silicon laptop (single thread, release):
+Measured on an Apple-silicon laptop (single thread, release build with fat LTO). "Before" is the previous revision (thin LTO); the router and `H1Guard` rows also include the build-profile change.
 
-| Operation | Time |
-|---|---|
-| Parse + validate a typical request head (8 headers) | ~290 ns (≈800 MiB/s) |
-| Same, through the stateful guard | ~520 ns |
-| Hop-by-hop strip / `X-Forwarded-*`+`Forwarded` rewrite | ~260 ns / ~560 ns |
-| Route lookup, exact host among 500 routes / wildcard+prefix | ~32 ns / ~22 ns |
-| Load config snapshot (`ArcSwap`) | ~4.4 ns |
-| LB pick, 32 backends: round-robin / consistent-hash / P2C / least-conn | ~24 ns / ~28 ns / ~103 ns / ~101 ns |
-| Rate-limit check (GCRA, 1 024 keys) | ~30 ns |
+| Operation | Before | Now |
+|---|---|---|
+| Parse + validate a typical request head (8 headers) | ~274 ns | ~286 ns (unchanged code; noise) |
+| Same, through the stateful guard (SWAR head scan, no copies) | ~498 ns | ~410 ns (−18%) |
+| `X-Forwarded-*` + `Forwarded` rewrite (stack buffers, ~3 allocs instead of ~10) | ~494 ns | ~408 ns (−18%) |
+| Hop-by-hop strip (allocation-free) | ~212 ns | ~211 ns |
+| Route lookup, exact host among 500 routes / wildcard+prefix | ~43 / ~39 ns | ~25 / ~21 ns |
+| LB pick, P2C — 4 / 32 / 128 backends | ~48 / ~84 / ~243 ns | **~23 / ~23 / ~23 ns** (O(1)) |
+| LB pick, round-robin — 128 backends | ~40 ns | ~22 ns (O(1) uniform, O(log n) weighted) |
+| LB pick, least-conn / consistent-hash (unchanged algorithms) | ~67 ns / ~26 ns @32 | ~69 ns / ~26 ns @32 |
+| Rate-limit check (GCRA, 1 024 keys) | ~27 ns | ~33 ns (**+6 ns**: explicit shards + bounded eviction instead of `DashMap`) |
 
 ### End-to-end throughput
 
@@ -324,9 +333,9 @@ bench/run.sh 10 64        # duration (s), connections
 
 Starts two minimal hyper backends (`crates/velox-cli/examples/bench_backend.rs`) and Velox (`bench/velox.bench.toml`), then drives load with the best of `oha` / `wrk` / `ab`, first against a backend directly (baseline) and then through Velox. For serious numbers use a separate load generator host and `oha`/`wrk`, plus `h2load` for HTTP/2 and HTTP/3.
 
-Smoke measurement on the same laptop, loopback, `ab -k -c 64` (single-threaded client, so treat as indicative): **≈ 317 k req/s direct vs ≈ 105 k req/s through Velox, 0 failed requests**, mean latency 0.6 ms at 64 connections. The gap is the proxy's per-request work (validation, routing, header rewrite, pooled upstream hop) on a machine that is also running the client and both backends.
+Smoke measurement on the same laptop, loopback, `ab -k -c 64` (single-threaded client, so treat as indicative): **≈ 300 k req/s direct vs ≈ 95–103 k req/s through Velox, 0 failed requests**, mean latency ≈ 0.6 ms at 64 connections. The numbers did **not** change measurably with the allocation work above.
 
----
+Why: a sampling profile of the proxy under this load shows ~84 % of samples are parked worker threads and, of the *active* samples, essentially all are kernel time (`kevent`, `recvfrom`, `sendto`, `writev`); `malloc` is a few percent. On macOS loopback each proxied request costs four syscalls plus polling (~45 µs of CPU in total), so saving a few hundred nanoseconds of user-space work is below 1 %. Expect user-space costs to matter more on Linux with `io_uring`-class syscall overhead, multiple NIC queues and a real load generator; measure there before tuning further.
 
 ## Known limitations
 
@@ -337,6 +346,7 @@ Smoke measurement on the same laptop, loopback, `ab -k -c 64` (single-threaded c
 * **HTTP/2 over cleartext (h2c) on the client side** is not served — HTTP/2 is negotiated via ALPN on the TLS listener.
 * **Streaming uploads are not retried**: only bodies up to `retry_body_buffer_bytes` with a known length are replayable on another backend; others get a single attempt.
 * **ACME** is not tested against a live CA (see above); wildcard certificates (DNS-01) are unsupported.
+* **`panic = "abort"`** in the release profile: a bug that panics takes the whole process down (run under a supervisor, which the container image/orchestrators do) instead of unwinding one connection task. Library code has no `unwrap`/`expect`/`panic`, enforced by clippy.
 * **Dockerfile** is built in CI; it was not built on the machine this was developed on (no Docker daemon was running).
 * Coverage-guided fuzzing runs in CI on nightly; the stable test-suite uses deterministic mutation fuzzing instead.
 

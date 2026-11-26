@@ -20,17 +20,21 @@ const FORWARDED: HeaderName = HeaderName::from_static("forwarded");
 const PROXY_CONNECTION: HeaderName = HeaderName::from_static("proxy-connection");
 const KEEP_ALIVE: HeaderName = HeaderName::from_static("keep-alive");
 
-fn valid_label(label: &str) -> bool {
+/// RFC 1123 label: letters, digits and hyphens, not starting or ending with
+/// a hyphen, 1–63 octets. Underscores are *not* hostname characters; they are
+/// only tolerated when the operator opts in (`allow_underscore`), e.g. for
+/// container service names.
+fn valid_label(label: &str, allow_underscore: bool) -> bool {
     !label.is_empty()
         && label.len() <= 63
         && !label.starts_with('-')
         && !label.ends_with('-')
-        && label.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+        && label.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || (allow_underscore && b == b'_'))
 }
 
-fn valid_hostname(name: &str) -> bool {
+fn valid_hostname(name: &str, allow_underscore: bool) -> bool {
     let name = name.strip_suffix('.').unwrap_or(name);
-    !name.is_empty() && name.len() <= 253 && name.split('.').all(valid_label)
+    !name.is_empty() && name.len() <= 253 && name.split('.').all(|l| valid_label(l, allow_underscore))
 }
 
 fn valid_port(p: &str) -> bool {
@@ -38,8 +42,14 @@ fn valid_port(p: &str) -> bool {
 }
 
 /// Validate a `Host` / `:authority` value: `reg-name | IPv4 | [IPv6]` with an
-/// optional numeric port. Rejects userinfo, whitespace, path characters, etc.
+/// optional numeric port. Rejects userinfo, whitespace, path characters and
+/// underscores (strict RFC 1123 labels).
 pub fn validate_host(h: &str) -> Result<(), Violation> {
+    validate_host_with(h, false)
+}
+
+/// [`validate_host`] with an explicit policy for `_` in labels.
+pub fn validate_host_with(h: &str, allow_underscore: bool) -> Result<(), Violation> {
     if h.is_empty() || h.len() > 255 {
         return Err(Violation::Host);
     }
@@ -52,8 +62,8 @@ pub fn validate_host(h: &str) -> Result<(), Violation> {
         }
     } else {
         match h.rsplit_once(':') {
-            Some((host, port)) => valid_hostname(host) && valid_port(port),
-            None => valid_hostname(h),
+            Some((host, port)) => valid_hostname(host, allow_underscore) && valid_port(port),
+            None => valid_hostname(h, allow_underscore),
         }
     };
     if ok {
@@ -64,9 +74,9 @@ pub fn validate_host(h: &str) -> Result<(), Violation> {
 }
 
 /// Validate a route/SNI host pattern: exact name or `*.suffix`.
-pub fn validate_host_pattern(p: &str) -> Result<(), String> {
+pub fn validate_host_pattern(p: &str, allow_underscore: bool) -> Result<(), String> {
     let body = p.strip_prefix("*.").unwrap_or(p);
-    if valid_hostname(body) {
+    if valid_hostname(body, allow_underscore) {
         Ok(())
     } else {
         Err("must be a host name or `*.suffix`".to_owned())
@@ -92,7 +102,12 @@ fn digits_only(v: &[u8]) -> bool {
 ///
 /// For HTTP/1 the byte-level guard has already run; this additionally covers
 /// HTTP/2 and HTTP/3 where `hyper`/`h3` hand us typed headers.
-pub fn validate_request_headers(version: Version, headers: &HeaderMap, uri: &Uri) -> Result<(), Violation> {
+pub fn validate_request_headers(
+    version: Version,
+    headers: &HeaderMap,
+    uri: &Uri,
+    allow_underscore_host: bool,
+) -> Result<(), Violation> {
     let modern = matches!(version, Version::HTTP_2 | Version::HTTP_3);
 
     // --- host / :authority ---
@@ -106,13 +121,13 @@ pub fn validate_request_headers(version: Version, headers: &HeaderMap, uri: &Uri
     let authority = uri.authority().map(http::uri::Authority::as_str);
     match (host_hdr, authority) {
         (Some(h), Some(a)) => {
-            validate_host(h)?;
-            validate_host(a)?;
+            validate_host_with(h, allow_underscore_host)?;
+            validate_host_with(a, allow_underscore_host)?;
             if !h.eq_ignore_ascii_case(a) {
                 return Err(Violation::Host);
             }
         }
-        (Some(v), None) | (None, Some(v)) => validate_host(v)?,
+        (Some(v), None) | (None, Some(v)) => validate_host_with(v, allow_underscore_host)?,
         (None, None) => {
             if version == Version::HTTP_11 || modern {
                 return Err(Violation::Host);
@@ -186,28 +201,42 @@ pub fn is_websocket_upgrade(headers: &HeaderMap) -> bool {
 
 /// Remove hop-by-hop headers (RFC 9110 §7.6.1) plus any header nominated by
 /// `Connection`. Framing headers are never removable via `Connection`.
+///
+/// Allocation-free: nominated names are removed straight from the borrowed
+/// token text rather than being parsed into owned `HeaderName`s.
 pub fn strip_hop_by_hop(headers: &mut HeaderMap) {
-    if headers.contains_key(CONNECTION) {
-        let nominated: Vec<HeaderName> = connection_tokens(headers)
-            .filter_map(|t| HeaderName::from_bytes(t.as_bytes()).ok())
-            .filter(|n| n != CONTENT_LENGTH && n != HOST)
-            .collect();
-        for n in nominated {
-            headers.remove(n);
+    if let http::header::Entry::Occupied(entry) = headers.entry(CONNECTION) {
+        // Draining the values releases the borrow on `headers` so the
+        // nominated headers can be removed while we still read the tokens.
+        let (_, values) = entry.remove_entry_mult();
+        let mut inline: [Option<HeaderValue>; 4] = [None, None, None, None];
+        let mut spill: Vec<HeaderValue> = Vec::new(); // empty Vec does not allocate
+        for (i, v) in values.enumerate() {
+            match inline.get_mut(i) {
+                Some(slot) => *slot = Some(v),
+                None => spill.push(v),
+            }
+        }
+        for v in inline.iter().flatten().chain(spill.iter()) {
+            remove_nominated(headers, v);
         }
     }
-    for name in [
-        CONNECTION,
-        KEEP_ALIVE,
-        PROXY_AUTHENTICATE,
-        PROXY_AUTHORIZATION,
-        TE,
-        TRAILER,
-        TRANSFER_ENCODING,
-        UPGRADE,
-        PROXY_CONNECTION,
-    ] {
+    for name in
+        [KEEP_ALIVE, PROXY_AUTHENTICATE, PROXY_AUTHORIZATION, TE, TRAILER, TRANSFER_ENCODING, UPGRADE, PROXY_CONNECTION]
+    {
         headers.remove(name);
+    }
+}
+
+fn remove_nominated(headers: &mut HeaderMap, connection_value: &HeaderValue) {
+    let Ok(text) = connection_value.to_str() else { return };
+    for token in text.split(',').map(str::trim) {
+        if token.is_empty() || token.eq_ignore_ascii_case("content-length") || token.eq_ignore_ascii_case("host") {
+            continue;
+        }
+        // `remove` on a `&str` key looks the name up without allocating and
+        // simply finds nothing for tokens that are not valid header names.
+        headers.remove(token);
     }
 }
 
@@ -215,52 +244,209 @@ fn is_trusted(ip: IpAddr, trusted: &[IpNet]) -> bool {
     trusted.iter().any(|n| n.contains(&ip))
 }
 
-/// Parse the whole `X-Forwarded-For` chain; any invalid hop voids the chain.
-fn parse_xff(headers: &HeaderMap) -> Vec<IpAddr> {
-    let mut out = Vec::new();
+/// Is the whole `X-Forwarded-For` chain present and made of valid IPs?
+/// (Any invalid hop voids the chain; more than 64 hops is refused.)
+fn xff_valid(headers: &HeaderMap) -> bool {
+    let mut n = 0usize;
     for v in headers.get_all(X_FORWARDED_FOR) {
-        let Ok(s) = v.to_str() else { return Vec::new() };
+        let Ok(s) = v.to_str() else { return false };
         for part in s.split(',') {
-            match part.trim().parse::<IpAddr>() {
-                Ok(ip) => out.push(ip),
-                Err(_) => return Vec::new(),
+            if part.trim().parse::<IpAddr>().is_err() {
+                return false;
             }
-            if out.len() > 64 {
-                return Vec::new();
+            n += 1;
+            if n > 64 {
+                return false;
             }
         }
     }
-    out
+    n > 0
+}
+
+/// Walk a *validated* chain right-to-left past trusted hops.
+fn client_from_valid_chain(headers: &HeaderMap, trusted: &[IpNet]) -> Option<IpAddr> {
+    let mut leftmost = None;
+    for v in headers.get_all(X_FORWARDED_FOR).iter().rev() {
+        for part in v.to_str().ok()?.rsplit(',') {
+            let ip: IpAddr = part.trim().parse().ok()?;
+            if !is_trusted(ip, trusted) {
+                return Some(ip);
+            }
+            leftmost = Some(ip);
+        }
+    }
+    leftmost // every hop was trusted: the leftmost is the best we have
 }
 
 /// Determine the real client IP: the TCP peer unless the peer is a trusted
 /// proxy, in which case walk `X-Forwarded-For` right-to-left past trusted hops.
 pub fn resolve_client_ip(headers: &HeaderMap, peer: IpAddr, trusted: &[IpNet]) -> IpAddr {
-    if !is_trusted(peer, trusted) {
+    if !is_trusted(peer, trusted) || !xff_valid(headers) {
         return peer;
     }
-    let chain = parse_xff(headers);
-    chain.iter().rev().find(|ip| !is_trusted(**ip, trusted)).copied().or_else(|| chain.first().copied()).unwrap_or(peer)
+    client_from_valid_chain(headers, trusted).unwrap_or(peer)
 }
 
-fn set_header(headers: &mut HeaderMap, name: HeaderName, value: &str) {
-    if let Ok(v) = HeaderValue::from_str(value) {
-        headers.insert(name, v);
+/// A small formatting buffer: 256 bytes inline, spilling to the heap only for
+/// unusually long values. Lets header values be built without intermediate
+/// `String`s.
+struct SmallBuf {
+    inline: [u8; 256],
+    len: usize,
+    spill: Vec<u8>,
+}
+
+impl SmallBuf {
+    fn new() -> Self {
+        Self { inline: [0; 256], len: 0, spill: Vec::new() }
+    }
+
+    fn push(&mut self, bytes: &[u8]) {
+        if self.spill.is_empty() && self.len + bytes.len() <= self.inline.len() {
+            self.inline[self.len..self.len + bytes.len()].copy_from_slice(bytes);
+            self.len += bytes.len();
+        } else {
+            if self.spill.is_empty() {
+                self.spill.extend_from_slice(&self.inline[..self.len]);
+            }
+            self.spill.extend_from_slice(bytes);
+        }
+    }
+
+    fn as_bytes(&self) -> &[u8] {
+        if self.spill.is_empty() {
+            &self.inline[..self.len]
+        } else {
+            &self.spill
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.as_bytes().is_empty()
+    }
+
+    fn to_value(&self) -> Option<HeaderValue> {
+        HeaderValue::from_bytes(self.as_bytes()).ok()
     }
 }
 
-fn forwarded_for_token(ip: IpAddr) -> String {
-    match ip {
-        IpAddr::V4(v4) => v4.to_string(),
-        IpAddr::V6(v6) => format!("\"[{v6}]\""),
+impl std::fmt::Write for SmallBuf {
+    fn write_str(&mut self, s: &str) -> std::fmt::Result {
+        self.push(s.as_bytes());
+        Ok(())
     }
+}
+
+fn forwarded_values_safe(headers: &HeaderMap) -> bool {
+    headers.get_all(FORWARDED).iter().all(|v| v.len() <= 2048 && v.as_bytes().iter().all(|b| (0x20..0x7f).contains(b)))
 }
 
 /// Rewrite `X-Forwarded-For`, `X-Forwarded-Proto`, `X-Forwarded-Host`,
 /// `X-Real-IP` and `Forwarded` (RFC 7239) for the upstream request.
 ///
 /// Headers from untrusted peers are discarded (anti-spoofing); from trusted
-/// proxies they are extended. Returns the resolved client IP.
+/// proxies they are extended. `client` must come from [`resolve_client_ip`].
+/// Values are formatted into stack buffers, so each header costs one
+/// allocation (its `HeaderValue`) and nothing else; `host`, already a
+/// `HeaderValue`, is shared by reference count.
+pub fn apply_forwarded_headers_hv(
+    headers: &mut HeaderMap,
+    peer: IpAddr,
+    trusted: &[IpNet],
+    proto: &'static str,
+    host: Option<&HeaderValue>,
+    client: IpAddr,
+) {
+    let peer_trusted = is_trusted(peer, trusted);
+    let chain_ok = peer_trusted && xff_valid(headers);
+
+    // Honour an upstream proxy's proto/host only when it is trusted *and* sane.
+    let kept_proto: Option<&'static str> = if peer_trusted {
+        headers.get(X_FORWARDED_PROTO).and_then(|v| v.to_str().ok()).and_then(|v| {
+            if v.eq_ignore_ascii_case("https") {
+                Some("https")
+            } else if v.eq_ignore_ascii_case("http") {
+                Some("http")
+            } else {
+                None
+            }
+        })
+    } else {
+        None
+    };
+    let keep_host = peer_trusted
+        && headers.get(X_FORWARDED_HOST).and_then(|v| v.to_str().ok()).is_some_and(|v| validate_host(v).is_ok());
+
+    // X-Forwarded-For: existing chain (if trusted and valid) + this hop.
+    let mut xff = SmallBuf::new();
+    if chain_ok {
+        for v in headers.get_all(X_FORWARDED_FOR) {
+            for part in v.to_str().unwrap_or("").split(',') {
+                xff.push(part.trim().as_bytes());
+                xff.push(b", ");
+            }
+        }
+    }
+    let _ = write!(xff, "{peer}");
+
+    // Forwarded (RFC 7239): existing elements + ours.
+    let mut fwd = SmallBuf::new();
+    if peer_trusted && forwarded_values_safe(headers) {
+        for v in headers.get_all(FORWARDED) {
+            let s = v.as_bytes().trim_ascii();
+            if !s.is_empty() {
+                if !fwd.is_empty() {
+                    fwd.push(b", ");
+                }
+                fwd.push(s);
+            }
+        }
+        if !fwd.is_empty() {
+            fwd.push(b", ");
+        }
+    }
+    match peer {
+        IpAddr::V4(v4) => {
+            let _ = write!(fwd, "for={v4}");
+        }
+        IpAddr::V6(v6) => {
+            let _ = write!(fwd, "for=\"[{v6}]\"");
+        }
+    }
+    let _ = write!(fwd, ";proto={}", kept_proto.unwrap_or(proto));
+    if let Some(h) = host.and_then(|h| h.to_str().ok()) {
+        let _ = write!(fwd, ";host=\"{h}\"");
+    }
+
+    let mut real_ip = SmallBuf::new();
+    let _ = write!(real_ip, "{client}");
+    for (name, buf) in [(X_FORWARDED_FOR, &xff), (X_REAL_IP, &real_ip), (FORWARDED, &fwd)] {
+        match buf.to_value() {
+            Some(v) => {
+                headers.insert(name, v);
+            }
+            None => {
+                headers.remove(name);
+            }
+        }
+    }
+    if kept_proto.is_none() {
+        headers.insert(X_FORWARDED_PROTO, HeaderValue::from_static(proto));
+    }
+    if !keep_host {
+        match host {
+            Some(h) => {
+                headers.insert(X_FORWARDED_HOST, h.clone());
+            }
+            None => {
+                headers.remove(X_FORWARDED_HOST);
+            }
+        }
+    }
+}
+
+/// Convenience wrapper over [`apply_forwarded_headers_hv`] taking a `&str`
+/// host and resolving the client IP itself. Returns the resolved client IP.
 pub fn apply_forwarded_headers(
     headers: &mut HeaderMap,
     peer: IpAddr,
@@ -268,95 +454,33 @@ pub fn apply_forwarded_headers(
     proto: &'static str,
     host: Option<&str>,
 ) -> IpAddr {
-    let peer_trusted = is_trusted(peer, trusted);
     let client = resolve_client_ip(headers, peer, trusted);
-    let mut chain = if peer_trusted { parse_xff(headers) } else { Vec::new() };
-    chain.push(peer);
-
-    let keep_proto = peer_trusted
-        && headers
-            .get(X_FORWARDED_PROTO)
-            .and_then(|v| v.to_str().ok())
-            .is_some_and(|v| v.eq_ignore_ascii_case("http") || v.eq_ignore_ascii_case("https"));
-    let keep_host = peer_trusted
-        && headers.get(X_FORWARDED_HOST).and_then(|v| v.to_str().ok()).is_some_and(|v| validate_host(v).is_ok());
-    let proto_for_element = if keep_proto {
-        headers.get(X_FORWARDED_PROTO).and_then(|v| v.to_str().ok()).map_or(proto, |v| {
-            if v.eq_ignore_ascii_case("https") {
-                "https"
-            } else {
-                "http"
-            }
-        })
-    } else {
-        proto
-    };
-
-    let mut element = String::with_capacity(96);
-    let _ = write!(element, "for={};proto={}", forwarded_for_token(peer), proto_for_element);
-    if let Some(h) = host {
-        let _ = write!(element, ";host=\"{h}\"");
-    }
-    let existing_forwarded = if peer_trusted {
-        let mut parts = Vec::new();
-        for v in headers.get_all(FORWARDED) {
-            match v.to_str() {
-                Ok(s) if s.len() <= 2048 && s.bytes().all(|b| (0x20..0x7f).contains(&b)) => {
-                    parts.push(s.trim().to_owned())
-                }
-                _ => {
-                    parts.clear();
-                    break;
-                }
-            }
-        }
-        parts.join(", ")
-    } else {
-        String::new()
-    };
-
-    for n in [X_FORWARDED_FOR, X_REAL_IP, FORWARDED] {
-        headers.remove(n);
-    }
-    if !keep_proto {
-        headers.remove(X_FORWARDED_PROTO);
-    }
-    if !keep_host {
-        headers.remove(X_FORWARDED_HOST);
-    }
-
-    let mut xff = String::with_capacity(chain.len() * 16);
-    for (i, ip) in chain.iter().enumerate() {
-        if i > 0 {
-            xff.push_str(", ");
-        }
-        let _ = write!(xff, "{ip}");
-    }
-    set_header(headers, X_FORWARDED_FOR, &xff);
-    set_header(headers, X_REAL_IP, &client.to_string());
-    if !keep_proto {
-        set_header(headers, X_FORWARDED_PROTO, proto);
-    }
-    if !keep_host {
-        if let Some(h) = host {
-            set_header(headers, X_FORWARDED_HOST, h);
-        }
-    }
-    let forwarded = if existing_forwarded.is_empty() { element } else { format!("{existing_forwarded}, {element}") };
-    set_header(headers, FORWARDED, &forwarded);
+    let host = host.and_then(|h| HeaderValue::from_str(h).ok());
+    apply_forwarded_headers_hv(headers, peer, trusted, proto, host.as_ref(), client);
     client
 }
 
-/// Return the inbound `X-Request-Id` if it is safe, otherwise mint a new one.
-pub fn request_id_from(headers: &HeaderMap) -> String {
-    if let Some(v) = headers.get(X_REQUEST_ID).and_then(|v| v.to_str().ok()) {
-        let ok = !v.is_empty()
-            && v.len() <= 128
-            && v.bytes()
-                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.' | b':' | b'/' | b'=' | b'+'));
+/// The inbound `X-Request-Id` if it is a safe token, otherwise a fresh one.
+///
+/// Returns a ready-to-use [`HeaderValue`]: reusing an inbound id is a
+/// reference-count bump, and a generated id costs a single small allocation.
+pub fn request_id_from(headers: &HeaderMap) -> HeaderValue {
+    if let Some(v) = headers.get(X_REQUEST_ID) {
+        let b = v.as_bytes();
+        let ok = !b.is_empty()
+            && b.len() <= 128
+            && b.iter()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, b'-' | b'_' | b'.' | b':' | b'/' | b'=' | b'+'));
         if ok {
-            return v.to_owned();
+            return v.clone();
         }
     }
-    format!("{:032x}", fastrand::u128(..))
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut n = fastrand::u128(..);
+    let mut buf = [0u8; 32];
+    for slot in buf.iter_mut().rev() {
+        *slot = HEX[(n & 0xf) as usize];
+        n >>= 4;
+    }
+    HeaderValue::from_bytes(&buf).unwrap_or_else(|_| HeaderValue::from_static("0"))
 }

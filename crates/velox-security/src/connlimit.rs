@@ -1,5 +1,6 @@
 //! Global and per-source-IP connection caps.
 
+use dashmap::mapref::entry::Entry;
 use dashmap::DashMap;
 use std::net::IpAddr;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -89,10 +90,14 @@ pub struct ConnectionPermit {
 impl Drop for ConnectionPermit {
     fn drop(&mut self) {
         self.limiter.total.fetch_sub(1, Ordering::AcqRel);
-        if let Some(mut c) = self.limiter.per_ip.get_mut(&self.key) {
-            *c = c.saturating_sub(1);
+        // One shard lock: decrement, and drop the entry when it reaches zero.
+        if let Entry::Occupied(mut slot) = self.limiter.per_ip.entry(self.key) {
+            if *slot.get() <= 1 {
+                slot.remove();
+            } else {
+                *slot.get_mut() -= 1;
+            }
         }
-        self.limiter.per_ip.remove_if(&self.key, |_, c| *c == 0);
     }
 }
 
@@ -125,6 +130,30 @@ mod tests {
         drop(permits);
         assert_eq!(l.open(), 0);
         assert_eq!(l.sources(), 0);
+    }
+
+    #[test]
+    fn concurrent_acquire_release_never_leaks_or_underflows() {
+        let l = ConnectionLimiter::new();
+        let ips: Vec<IpAddr> = (1..=4).map(|i| format!("10.0.0.{i}").parse().unwrap()).collect();
+        let threads: Vec<_> = (0..8)
+            .map(|t| {
+                let (l, ips) = (Arc::clone(&l), ips.clone());
+                std::thread::spawn(move || {
+                    for i in 0..5_000usize {
+                        let ip = ips[(t + i) % ips.len()];
+                        if let Ok(p) = l.try_acquire(ip, 0, 3) {
+                            std::hint::black_box(&p);
+                        }
+                    }
+                })
+            })
+            .collect();
+        for t in threads {
+            t.join().unwrap();
+        }
+        assert_eq!(l.open(), 0, "every permit released");
+        assert_eq!(l.sources(), 0, "every per-IP entry reclaimed");
     }
 
     #[test]

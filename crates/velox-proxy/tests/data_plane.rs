@@ -494,3 +494,162 @@ async fn unix_socket_upstream_and_upstream_timeout() {
     assert!(t0.elapsed() < Duration::from_secs(2));
     h.running.shutdown().await;
 }
+
+// ---------------- hardening regressions ----------------
+
+/// A backend that accepts connections and never answers.
+async fn black_hole() -> SocketAddr {
+    let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = l.local_addr().unwrap();
+    tokio::spawn(async move {
+        let mut held = Vec::new();
+        while let Ok((s, _)) = l.accept().await {
+            held.push(s);
+        }
+    });
+    addr
+}
+
+async fn refused_port() -> SocketAddr {
+    TcpListener::bind("127.0.0.1:0").await.unwrap().local_addr().unwrap()
+}
+
+#[tokio::test]
+async fn all_retry_attempts_share_one_deadline() {
+    // Regression: each attempt got a fresh `upstream_response` timeout, so
+    // `retries = 2` turned 600 ms into 3 × 600 ms for a client waiting on hung backends.
+    let hung = [black_hole().await, black_hole().await, black_hole().await];
+    let toml = base("", &hung)
+        .replace("name = \"app\"\n", "name = \"app\"\nretries = 2\n")
+        .replace("[admin]", "[timeouts]\nupstream_response = \"600ms\"\n[admin]");
+    let h = start(&toml).await;
+    let t0 = std::time::Instant::now();
+    let r = raw(h.addr, &get("/"), Duration::from_secs(5)).await;
+    let took = t0.elapsed();
+    assert_eq!(status(&r), 504, "{r}");
+    assert!(took >= Duration::from_millis(550), "the budget is honoured, not undercut: {took:?}");
+    assert!(took < Duration::from_millis(1100), "total time is bounded by ONE timeout, not three: {took:?}");
+    h.running.shutdown().await;
+}
+
+#[tokio::test]
+async fn retries_still_fail_over_quickly_on_connect_errors_within_the_budget() {
+    let (live, hits) = backend(Arc::new(|_| text("third-time-lucky"))).await;
+    let backends = [refused_port().await, refused_port().await, live];
+    let toml = base("", &backends)
+        .replace("name = \"app\"\n", "name = \"app\"\nretries = 2\n")
+        .replace("[admin]", "[timeouts]\nupstream_response = \"2s\"\n[admin]");
+    let h = start(&toml).await;
+    for i in 0..9 {
+        let t0 = std::time::Instant::now();
+        let r = raw(h.addr, &get("/"), Duration::from_secs(3)).await;
+        assert_eq!(status(&r), 200, "request {i}: {r}");
+        assert!(t0.elapsed() < Duration::from_millis(700), "connect failures retry immediately: {:?}", t0.elapsed());
+    }
+    assert_eq!(hits.load(Ordering::SeqCst), 9);
+    h.running.shutdown().await;
+}
+
+fn redirect_config(route: &str) -> String {
+    format!(
+        "[server]\nhttp_addr = \"127.0.0.1:0\"\n[[upstream]]\nname = \"app\"\nbackends = [{{ addr = \"127.0.0.1:9\" }}]\n{route}"
+    )
+}
+
+#[tokio::test]
+async fn https_redirect_never_reflects_the_host_header_of_a_catch_all_route() {
+    // The config itself must refuse the open-redirect shape…
+    let bad = redirect_config("[[route]]\nupstream = \"app\"\nredirect_https = true\n");
+    let err = Config::from_toml_str(&bad).unwrap_err().to_string();
+    assert!(err.contains("open redirect"), "{err}");
+
+    // …and with a canonical host, attacker-chosen Host values are ignored.
+    let ok = redirect_config(
+        "[[route]]\nupstream = \"app\"\nredirect_https = true\ncanonical_host = \"secure.example.test\"\n",
+    );
+    let h = start(&ok).await;
+    for host in ["evil.example", "secure.example.test", "attacker.test:1234"] {
+        let r = raw(
+            h.addr,
+            format!("GET /p?q=1 HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\r\n").as_bytes(),
+            Duration::from_millis(400),
+        )
+        .await;
+        assert_eq!(status(&r), 308, "{host}: {r}");
+        assert!(
+            r.to_ascii_lowercase().contains("location: https://secure.example.test/p?q=1\r\n"),
+            "{host}: Location must use the canonical host: {r}"
+        );
+        assert!(!r.to_ascii_lowercase().contains("evil.example") && !r.to_ascii_lowercase().contains("attacker"));
+    }
+    h.running.shutdown().await;
+}
+
+#[tokio::test]
+async fn https_redirect_edge_cases_http10_without_host_and_options_star() {
+    // HTTP/1.0 without Host: a canonical route can still redirect safely…
+    let ok = redirect_config(
+        "[[route]]\nupstream = \"app\"\nredirect_https = true\ncanonical_host = \"secure.example.test\"\n",
+    );
+    let h = start(&ok).await;
+    let r = raw(h.addr, b"GET /legacy HTTP/1.0\r\n\r\n", Duration::from_millis(400)).await;
+    assert_eq!(status(&r), 308, "{r}");
+    assert!(r.to_ascii_lowercase().contains("location: https://secure.example.test/legacy\r\n"), "{r}");
+    // …and `OPTIONS *` is normalised to `/` instead of `https://host*`.
+    let r = raw(
+        h.addr,
+        b"OPTIONS * HTTP/1.1\r\nHost: whatever.test\r\nConnection: close\r\n\r\n",
+        Duration::from_millis(400),
+    )
+    .await;
+    assert_eq!(status(&r), 308, "{r}");
+    assert!(r.to_ascii_lowercase().contains("location: https://secure.example.test/\r\n"), "{r}");
+    h.running.shutdown().await;
+
+    // A host-scoped redirect route cannot match a Host-less request at all: 404, never a redirect.
+    let scoped =
+        redirect_config("[[route]]\nhosts = [\"app.example.test\"]\nupstream = \"app\"\nredirect_https = true\n");
+    let h = start(&scoped).await;
+    let r = raw(h.addr, b"GET / HTTP/1.0\r\n\r\n", Duration::from_millis(400)).await;
+    assert_eq!(status(&r), 404, "{r}");
+    assert!(!r.to_ascii_lowercase().contains("location:"));
+    // Host-scoped routes redirect to the (already matched) host.
+    let r = raw(
+        h.addr,
+        b"GET /x HTTP/1.1\r\nHost: APP.example.test:8080\r\nConnection: close\r\n\r\n",
+        Duration::from_millis(400),
+    )
+    .await;
+    assert_eq!(status(&r), 308, "{r}");
+    assert!(
+        r.to_ascii_lowercase().contains("location: https://app.example.test/x")
+            || r.to_ascii_lowercase().contains("location: https://app.example.test/x\r\n"),
+        "{r}"
+    );
+    h.running.shutdown().await;
+}
+
+#[tokio::test]
+async fn underscore_hosts_are_rejected_unless_the_operator_opts_in() {
+    let (b, hits) = backend(echo_headers()).await;
+    let req = b"GET / HTTP/1.1\r\nHost: my_service\r\nConnection: close\r\n\r\n";
+    let strict = start(&base("", &[b])).await;
+    let r = raw(strict.addr, req, Duration::from_millis(400)).await;
+    assert_eq!(status(&r), 400, "{r}");
+    assert_eq!(hits.load(Ordering::SeqCst), 0);
+    strict.running.shutdown().await;
+
+    let lenient =
+        start(&base("", &[b]).replace("[admin]", "[security]\nallow_underscores_in_host = true\n[admin]")).await;
+    let r = raw(lenient.addr, req, Duration::from_millis(400)).await;
+    assert_eq!(status(&r), 200, "{r}");
+    // Opting in relaxes only `_`; everything else about Host stays strict.
+    let r = raw(
+        lenient.addr,
+        b"GET / HTTP/1.1\r\nHost: bad host_x\r\nConnection: close\r\n\r\n",
+        Duration::from_millis(400),
+    )
+    .await;
+    assert_eq!(status(&r), 400, "{r}");
+    lenient.running.shutdown().await;
+}

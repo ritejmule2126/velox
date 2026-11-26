@@ -5,12 +5,16 @@ use http::{header::HeaderValue, HeaderMap, Method, Uri, Version};
 use proptest::prelude::*;
 use std::net::IpAddr;
 
+fn vrh(v: Version, h: &HeaderMap, u: &Uri) -> Result<(), Violation> {
+    validate_request_headers(v, h, u, false)
+}
+
 fn limits() -> H1Limits {
     H1Limits::default()
 }
 
-fn feed_all(guard: &mut H1Guard, data: &[u8]) -> Result<Release, GuardError> {
-    guard.feed(data)
+fn feed_all(guard: &mut H1Guard, data: &[u8]) -> Result<(), GuardError> {
+    guard.feed(data).map(|_| ())
 }
 
 /// Feed `chunks`, returning every byte the guard released, in order.
@@ -18,7 +22,7 @@ fn released_stream(guard: &mut H1Guard, chunks: &[&[u8]]) -> Result<Vec<u8>, Gua
     let mut out = Vec::new();
     for c in chunks {
         let r = guard.feed(c)?;
-        out.extend_from_slice(&r.carried);
+        out.extend_from_slice(r.carried);
         out.extend_from_slice(&c[r.skip..r.len]);
     }
     Ok(out)
@@ -199,7 +203,7 @@ fn host_rules() {
         assert!(head(&raw).is_err(), "accepted host {bad:?}");
     }
     for good in
-        ["example.com", "example.com:8080", "[::1]:443", "[2001:db8::1]", "127.0.0.1:80", "a.b-c.d_e", "example.com."]
+        ["example.com", "example.com:8080", "[::1]:443", "[2001:db8::1]", "127.0.0.1:80", "a.b-c.d-e", "example.com."]
     {
         let raw = format!("GET / HTTP/1.1\r\nHost: {good}\r\n\r\n");
         assert!(head(&raw).is_ok(), "rejected host {good:?}");
@@ -308,6 +312,7 @@ fn partial_heads_are_withheld_until_the_whole_head_validates() {
     assert!(g.has_partial_head());
     let r = g.feed(b"ample.com\r\n\r\nGET /b HTTP/1.1\r\nHo").unwrap();
     assert_eq!(r.carried, b"GET /a HTTP/1.1\r\nHost: example.com\r\n\r\n");
+    assert!(r.partial_head);
     assert_eq!((r.skip, r.len), (13, 13), "the rest of the chunk is the next, still-partial head");
     assert!(g.has_partial_head(), "second head is withheld again");
 }
@@ -393,24 +398,20 @@ fn typed_h2_rejects_connection_specific_headers() {
         ("te", "gzip"),
     ] {
         let h = hm(&[(k, v)]);
-        assert_eq!(
-            validate_request_headers(Version::HTTP_2, &h, &uri),
-            Err(Violation::ConnectionSpecificHeader),
-            "{k}"
-        );
+        assert_eq!(vrh(Version::HTTP_2, &h, &uri), Err(Violation::ConnectionSpecificHeader), "{k}");
     }
-    assert!(validate_request_headers(Version::HTTP_2, &hm(&[("te", "trailers")]), &uri).is_ok());
-    assert!(validate_request_headers(Version::HTTP_3, &hm(&[]), &uri).is_ok());
+    assert!(vrh(Version::HTTP_2, &hm(&[("te", "trailers")]), &uri).is_ok());
+    assert!(vrh(Version::HTTP_3, &hm(&[]), &uri).is_ok());
 }
 
 #[test]
 fn typed_rejects_authority_host_mismatch_and_cl_te() {
     let uri: Uri = "https://example.com/".parse().unwrap();
-    assert_eq!(validate_request_headers(Version::HTTP_2, &hm(&[("host", "evil.com")]), &uri), Err(Violation::Host));
-    assert!(validate_request_headers(Version::HTTP_2, &hm(&[("host", "EXAMPLE.com")]), &uri).is_ok());
+    assert_eq!(vrh(Version::HTTP_2, &hm(&[("host", "evil.com")]), &uri), Err(Violation::Host));
+    assert!(vrh(Version::HTTP_2, &hm(&[("host", "EXAMPLE.com")]), &uri).is_ok());
     let origin: Uri = "/p".parse().unwrap();
     assert_eq!(
-        validate_request_headers(
+        vrh(
             Version::HTTP_11,
             &hm(&[("host", "a"), ("content-length", "1"), ("transfer-encoding", "chunked")]),
             &origin
@@ -418,18 +419,11 @@ fn typed_rejects_authority_host_mismatch_and_cl_te() {
         Err(Violation::ContentLengthWithTransferEncoding)
     );
     assert_eq!(
-        validate_request_headers(
-            Version::HTTP_11,
-            &hm(&[("host", "a"), ("content-length", "1"), ("content-length", "1")]),
-            &origin
-        ),
+        vrh(Version::HTTP_11, &hm(&[("host", "a"), ("content-length", "1"), ("content-length", "1")]), &origin),
         Err(Violation::ContentLength)
     );
-    assert_eq!(validate_request_headers(Version::HTTP_11, &hm(&[]), &origin), Err(Violation::Host));
-    assert_eq!(
-        validate_request_headers(Version::HTTP_11, &hm(&[("host", "a"), ("host", "b")]), &origin),
-        Err(Violation::Host)
-    );
+    assert_eq!(vrh(Version::HTTP_11, &hm(&[]), &origin), Err(Violation::Host));
+    assert_eq!(vrh(Version::HTTP_11, &hm(&[("host", "a"), ("host", "b")]), &origin), Err(Violation::Host));
 }
 
 #[test]
@@ -522,6 +516,7 @@ fn request_id_reuse_and_generation() {
     assert_eq!(request_id_from(&hm(&[("x-request-id", "abc-123")])), "abc-123");
     let generated = request_id_from(&hm(&[("x-request-id", "bad id with spaces")]));
     assert_eq!(generated.len(), 32);
+    assert!(generated.as_bytes().iter().all(u8::is_ascii_hexdigit));
     assert_ne!(generated, request_id_from(&HeaderMap::new()));
     assert_eq!(request_id_from(&hm(&[("x-request-id", &"a".repeat(200))])).len(), 32);
 }
@@ -531,9 +526,9 @@ fn host_helpers() {
     assert_eq!(host_without_port("example.com:8080"), "example.com");
     assert_eq!(host_without_port("[::1]:8080"), "::1");
     assert_eq!(host_without_port("example.com."), "example.com");
-    assert!(validate_host_pattern("*.example.com").is_ok());
-    assert!(validate_host_pattern("*example.com").is_err());
-    assert!(validate_host_pattern("").is_err());
+    assert!(validate_host_pattern("*.example.com", false).is_ok());
+    assert!(validate_host_pattern("*example.com", false).is_err());
+    assert!(validate_host_pattern("", false).is_err());
     let _ = Method::GET;
 }
 
@@ -751,4 +746,157 @@ fn chunked_decoder_is_segmentation_independent_under_mutation() {
             Err(_) => assert!(err_b, "{input:?}"),
         }
     }
+}
+
+#[test]
+fn underscores_in_host_are_rejected_unless_explicitly_allowed() {
+    let strict = limits();
+    let lenient = H1Limits { allow_underscores_in_host: true, ..limits() };
+    let raw = "GET / HTTP/1.1\r\nHost: my_service:8080\r\n\r\n";
+    assert_eq!(parse_request_head(raw.as_bytes(), &strict), Err(Violation::Host));
+    assert!(parse_request_head(raw.as_bytes(), &lenient).is_ok());
+    // Everything else about the label stays strict even when `_` is allowed.
+    for bad in ["-a_b.com", "a_b-.com", "a b_c", "a_b..c", "[::1]_"] {
+        let raw = format!("GET / HTTP/1.1\r\nHost: {bad}\r\n\r\n");
+        assert!(parse_request_head(raw.as_bytes(), &lenient).is_err(), "{bad}");
+    }
+    // Typed (h2/h3) path and config patterns honour the same switch.
+    let uri: Uri = "https://svc_one/".parse().unwrap();
+    let h = HeaderMap::new();
+    assert_eq!(validate_request_headers(Version::HTTP_2, &h, &uri, false), Err(Violation::Host));
+    assert!(validate_request_headers(Version::HTTP_2, &h, &uri, true).is_ok());
+    assert!(validate_host_pattern("svc_one", false).is_err());
+    assert!(validate_host_pattern("*.svc_one", true).is_ok());
+    assert!(validate_host_with("svc_one", true).is_ok());
+    assert_eq!(validate_host("svc_one"), Err(Violation::Host));
+}
+
+// ---------- fast paths must be observationally identical ----------
+
+#[test]
+fn swar_word_check_is_exact_for_every_byte_value_in_every_lane() {
+    use super::h1::word_is_plain_for_tests as plain;
+    for lane in 0..8 {
+        for b in 0u8..=255 {
+            let mut w = [b'a'; 8];
+            w[lane] = b;
+            let expect = !(b < 0x20 || b == 0x7f);
+            assert_eq!(plain(u64::from_le_bytes(w)), expect, "byte {b:#04x} in lane {lane}");
+        }
+    }
+    assert!(plain(u64::from_le_bytes(*b"Host: ex")));
+    assert!(plain(u64::from_le_bytes([0x80, 0xff, b' ', b'~', b'!', 0xc3, 0xa9, b'a'])));
+    assert!(!plain(u64::from_le_bytes(*b"abc\tdefg")), "tab takes the exact path");
+}
+
+#[test]
+fn fast_scanner_matches_the_bytewise_reference_on_mutated_and_random_input() {
+    let mut rng = fastrand::Rng::with_seed(0xfa57);
+    let mut compared = 0u32;
+    for round in 0..80_000u32 {
+        let input: Vec<u8> = if round % 4 == 0 {
+            (0..rng.usize(0..300)).map(|_| rng.u8(..)).collect()
+        } else {
+            let seed = SEEDS[rng.usize(..SEEDS.len())];
+            mutate(&mut rng, seed)
+        };
+        for max in [64usize, 100, 16 * 1024] {
+            let (mut fast, mut slow) = (HeadScanner::default(), HeadScanner::default());
+            // Feed the same bytes in random-sized chunks to exercise carried state.
+            let mut rest = &input[..];
+            loop {
+                let n = rng.usize(1..40).min(rest.len());
+                let (chunk, tail) = rest.split_at(n);
+                let (a, b) = (fast.scan(chunk, max), slow.scan_reference(chunk, max));
+                assert_eq!(a, b, "result differs (max {max}) on {chunk:?} of {input:?}");
+                assert_eq!(fast.state(), slow.state(), "state differs after {chunk:?}");
+                compared += 1;
+                rest = tail;
+                if rest.is_empty() || !matches!(a, Ok(None)) {
+                    break;
+                }
+            }
+        }
+    }
+    assert!(compared > 200_000);
+}
+
+#[test]
+fn guard_reuses_its_buffers_across_keep_alive_requests() {
+    let mut g = H1Guard::new(limits());
+    let head = b"GET /keepalive HTTP/1.1\r\nHost: a\r\n\r\n";
+    // Heads split across reads force the withheld-head path every time.
+    let mut cap_after_warmup = 0;
+    for round in 0..200 {
+        let (a, b) = head.split_at(10 + round % 7);
+        assert_eq!(g.feed(a).unwrap().len, 0);
+        let rel = g.feed(b).unwrap();
+        assert_eq!(rel.carried, head.as_slice());
+        if round == 20 {
+            cap_after_warmup = g.head_capacity_for_tests();
+        }
+    }
+    assert!(cap_after_warmup > 0);
+    assert_eq!(g.head_capacity_for_tests(), cap_after_warmup, "no regrowth after warm-up");
+    // A pathological, huge head must not pin its memory for the connection's lifetime.
+    let big = format!("GET / HTTP/1.1\r\nHost: a\r\nX: {}\r\n\r\n", "a".repeat(15_000));
+    let mut g = H1Guard::new(H1Limits { max_head_bytes: 64 * 1024, ..limits() });
+    for chunk in big.as_bytes().chunks(4_000) {
+        g.feed(chunk).unwrap();
+    }
+    g.feed(b"GET / HTTP/1.1\r\nHost: a\r\n\r\n").unwrap();
+    assert!(g.head_capacity_for_tests() <= 16 * 1024, "{}", g.head_capacity_for_tests());
+}
+
+#[test]
+fn single_read_heads_never_touch_the_carry_path() {
+    let mut g = H1Guard::new(limits());
+    for _ in 0..50 {
+        let rel = g.feed(OK.as_bytes()).unwrap();
+        assert!(rel.carried.is_empty(), "no copy when the whole head arrives in one read");
+        assert_eq!((rel.skip, rel.len, rel.partial_head), (0, OK.len(), false));
+    }
+}
+
+#[test]
+fn hop_by_hop_stripping_handles_many_and_odd_connection_values() {
+    // More Connection header lines than the inline slots, with a nominated
+    // header hidden in the overflow, odd casing, junk tokens and empty tokens.
+    let mut h = HeaderMap::new();
+    for v in ["keep-alive", "X-One", "x-two", ",,  ,", "bad token!", "X-Three, X-FOUR", "x-five"] {
+        h.append("connection", HeaderValue::from_str(v).unwrap());
+    }
+    for k in ["x-one", "x-two", "x-three", "x-four", "x-five", "x-keep", "content-length", "host"] {
+        h.insert(http::HeaderName::from_bytes(k.as_bytes()).unwrap(), HeaderValue::from_static("1"));
+    }
+    h.insert("connection-ish", HeaderValue::from_static("untouched"));
+    strip_hop_by_hop(&mut h);
+    let mut left: Vec<_> = h.keys().map(|k| k.as_str().to_owned()).collect();
+    left.sort();
+    assert_eq!(left, ["connection-ish", "content-length", "host", "x-keep"]);
+    // Idempotent, and a no-op without a Connection header.
+    strip_hop_by_hop(&mut h);
+    assert_eq!(h.len(), 4);
+    // A Connection value that is not valid UTF-8 cannot nominate anything, and is still removed.
+    let mut h = HeaderMap::new();
+    h.insert("connection", HeaderValue::from_bytes(b"x-secret\xff").unwrap());
+    h.insert("x-secret", HeaderValue::from_static("s"));
+    strip_hop_by_hop(&mut h);
+    assert!(!h.contains_key("connection"));
+}
+
+#[test]
+fn forwarded_headers_with_long_existing_chains_spill_correctly() {
+    // > 256 bytes of existing X-Forwarded-For / Forwarded forces the heap spill path.
+    let trusted: Vec<ipnet::IpNet> = vec!["10.0.0.0/8".parse().unwrap()];
+    let chain: Vec<String> = (1..=30).map(|i| format!("10.1.1.{i}")).collect();
+    let xff = format!("198.51.100.7, {}", chain.join(", "));
+    let fwd: String = (0..14).map(|i| format!("for=10.9.9.{i};proto=https")).collect::<Vec<_>>().join(", ");
+    let mut h = hm(&[("x-forwarded-for", &xff), ("forwarded", &fwd)]);
+    let client = apply_forwarded_headers(&mut h, ip("10.2.2.2"), &trusted, "http", Some("example.com"));
+    assert_eq!(client, ip("198.51.100.7"));
+    assert_eq!(h["x-forwarded-for"].to_str().unwrap(), format!("{xff}, 10.2.2.2"));
+    let f = h["forwarded"].to_str().unwrap();
+    assert!(f.starts_with(&fwd) && f.ends_with("for=10.2.2.2;proto=http;host=\"example.com\""), "{f}");
+    assert!(f.len() > 256);
 }

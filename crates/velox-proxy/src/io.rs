@@ -13,8 +13,8 @@ use std::future::Future;
 use std::io;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::Arc;
-use std::task::{ready, Context, Poll};
+use std::sync::{Arc, Mutex, PoisonError};
+use std::task::{ready, Context, Poll, Waker};
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::time::{Instant, Sleep};
@@ -24,10 +24,16 @@ use velox_core::sanitize::{H1Guard, Violation};
 /// HTTP layer, which answers it with the matching status code.
 pub const REJECT_PATH: &str = "/__velox_reject__/";
 
-/// Counts requests currently being served on one connection.
+/// Counts requests currently being served on one connection, and wakes the
+/// connection's reader when the last one finishes.
+///
+/// The reader parks on idle/closed states that depend on this count; without
+/// the waker a read that observed `inflight > 0` would never be polled again
+/// once the request completed.
 #[derive(Debug, Default)]
 pub struct Activity {
     inflight: AtomicUsize,
+    waker: Mutex<Option<Waker>>,
 }
 
 impl Activity {
@@ -46,6 +52,23 @@ impl Activity {
     pub fn inflight(&self) -> usize {
         self.inflight.load(Ordering::Acquire)
     }
+
+    /// Ask to be woken when the in-flight count drops to zero. Call this
+    /// *before* re-reading [`Activity::inflight`] so a concurrent completion
+    /// cannot slip between the check and the registration.
+    pub fn register(&self, waker: &Waker) {
+        let mut slot = self.waker.lock().unwrap_or_else(PoisonError::into_inner);
+        if !slot.as_ref().is_some_and(|w| w.will_wake(waker)) {
+            *slot = Some(waker.clone());
+        }
+    }
+
+    fn wake(&self) {
+        let waker = self.waker.lock().unwrap_or_else(PoisonError::into_inner).take();
+        if let Some(w) = waker {
+            w.wake();
+        }
+    }
 }
 
 /// RAII token from [`Activity::begin`].
@@ -54,7 +77,9 @@ pub struct InflightGuard(Arc<Activity>);
 
 impl Drop for InflightGuard {
     fn drop(&mut self) {
-        self.0.inflight.fetch_sub(1, Ordering::AcqRel);
+        if self.0.inflight.fetch_sub(1, Ordering::AcqRel) == 1 {
+            self.0.wake();
+        }
     }
 }
 
@@ -86,6 +111,8 @@ pin_project! {
         write_stall: Duration,
         stall_armed: bool,
         pending: Option<Pending>,
+        // Recycled allocation for `Pending::bytes` (a head that spans reads).
+        spare: Vec<u8>,
         closed: bool,
     }
 }
@@ -117,6 +144,7 @@ impl<T> ConnIo<T> {
             write_stall: t.write_stall,
             stall_armed: false,
             pending: None,
+            spare: Vec::new(),
             closed: false,
         }
     }
@@ -134,7 +162,12 @@ impl<T: AsyncRead> AsyncRead for ConnIo<T> {
                     if p.close_after {
                         *this.closed = true;
                     }
-                    *this.pending = None;
+                    // Keep the allocation for the next head, unless it ballooned.
+                    if let Some(done) = this.pending.take() {
+                        if done.bytes.capacity() <= 16 * 1024 {
+                            *this.spare = done.bytes;
+                        }
+                    }
                 }
                 return Poll::Ready(Ok(()));
             }
@@ -143,8 +176,15 @@ impl<T: AsyncRead> AsyncRead for ConnIo<T> {
                 // as "client left" and would drop the 400 it is about to write.
                 // The injected `Connection: close` ends the connection; the idle
                 // timer is the backstop.
-                if this.activity.inflight() == 0 && this.idle.as_mut().poll(cx).is_ready() {
-                    return Poll::Ready(Ok(()));
+                this.activity.register(cx.waker());
+                if this.activity.inflight() == 0 {
+                    if this.idle.as_mut().poll(cx).is_ready() {
+                        return Poll::Ready(Ok(()));
+                    }
+                } else {
+                    // Busy: the idle clock restarts from the moment we go quiet,
+                    // and `register` above wakes us when the last request ends.
+                    this.idle.as_mut().reset(Instant::now() + *this.idle_timeout);
                 }
                 return Poll::Pending;
             }
@@ -160,7 +200,7 @@ impl<T: AsyncRead> AsyncRead for ConnIo<T> {
                     };
                     match guard.feed(&buf.filled()[before..]) {
                         Ok(rel) => {
-                            if guard.has_partial_head() {
+                            if rel.partial_head {
                                 if !*this.header_armed {
                                     this.header.as_mut().reset(Instant::now() + *this.header_timeout);
                                     *this.header_armed = true;
@@ -175,7 +215,9 @@ impl<T: AsyncRead> AsyncRead for ConnIo<T> {
                                 }
                                 return Poll::Ready(Ok(()));
                             }
-                            let mut bytes = rel.carried;
+                            let mut bytes = std::mem::take(this.spare);
+                            bytes.clear();
+                            bytes.extend_from_slice(rel.carried);
                             bytes.extend_from_slice(&buf.filled()[before + rel.skip..before + rel.len]);
                             buf.set_filled(before);
                             *this.pending = Some(Pending { bytes, pos: 0, close_after: false });
@@ -210,6 +252,7 @@ impl<T: AsyncRead> AsyncRead for ConnIo<T> {
                             )));
                         }
                     }
+                    this.activity.register(cx.waker());
                     let idle = this.activity.inflight() == 0 && this.guard.as_ref().is_none_or(H1Guard::is_idle);
                     if idle {
                         if this.idle.as_mut().poll(cx).is_ready() {
@@ -411,6 +454,48 @@ mod tests {
         // Now idle: expires after idle_timeout and reports EOF.
         let n = io.read(&mut buf).await.unwrap();
         assert_eq!(n, 0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn rejected_connection_is_woken_when_the_last_inflight_request_ends() {
+        // Regression: after a guard rejection `poll_read` parked on
+        // `inflight() > 0` with no waker, so the connection could hang forever
+        // once the request finished (idle timer already fired and was spent).
+        let (mut client, mut io, act) = io_pair(true);
+        client.write_all(b"GET / HTTP/1.1\nHost: a\n\n").await.unwrap();
+        let head = read_head(&mut io, 4096).await;
+        assert!(head.contains("bare-line-ending"));
+        let busy = act.begin(); // hyper is now "serving" the synthetic 400
+        let reader = tokio::spawn(async move {
+            let mut buf = [0u8; 8];
+            io.read(&mut buf).await.unwrap()
+        });
+        // Far beyond the idle timeout: must still be parked, not closed.
+        tokio::time::sleep(Duration::from_secs(60)).await;
+        assert!(!reader.is_finished(), "must not close while a request is in flight");
+        drop(busy);
+        // No further time passes: the drop itself has to wake the reader.
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+        }
+        assert!(reader.is_finished(), "reader must be woken by the last in-flight guard");
+        assert_eq!(reader.await.unwrap(), 0, "…and observes a clean EOF");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn idle_reader_with_inflight_request_wakes_when_it_finishes() {
+        let (_client, mut io, act) = io_pair(true);
+        let busy = act.begin();
+        let reader = tokio::spawn(async move {
+            let mut buf = [0u8; 8];
+            io.read(&mut buf).await.unwrap()
+        });
+        tokio::time::sleep(Duration::from_secs(30)).await;
+        assert!(!reader.is_finished());
+        drop(busy);
+        // idle clock restarts when the request ends; it must then expire normally.
+        tokio::time::sleep(Duration::from_secs(6)).await;
+        assert_eq!(reader.await.unwrap(), 0);
     }
 
     #[tokio::test(start_paused = true)]

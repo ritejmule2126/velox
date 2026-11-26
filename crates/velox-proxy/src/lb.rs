@@ -65,18 +65,19 @@ fn round_robin(group: &UpstreamGroup, ctx: &PickCtx, now: u64) -> Option<usize> 
         return None;
     }
     let cursor = group.rr_cursor.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    // Map the cursor onto the weight space, then find the owning backend.
-    let mut slot = cursor % group.total_weight;
-    let mut start = 0;
-    for (i, b) in group.backends.iter().enumerate() {
-        let w = u64::from(b.weight);
-        if slot < w {
-            start = i;
-            break;
-        }
-        slot -= w;
+    // O(1) for equal weights; O(log n) otherwise (binary search over the
+    // precomputed prefix sums). Never loops over the backends to find a slot.
+    let start = if group.uniform_weights {
+        (cursor % n as u64) as usize
+    } else {
+        let slot = cursor % group.total_weight;
+        group.cum_weights.partition_point(|&c| c <= slot).min(n - 1)
+    };
+    // Fast path: the slot's owner is usable. Otherwise walk forward.
+    if usable(&group.backends[start], start, ctx, now) {
+        return Some(start);
     }
-    (0..n).map(|off| (start + off) % n).find(|&i| usable(&group.backends[i], i, ctx, now))
+    (1..n).map(|off| (start + off) % n).find(|&i| usable(&group.backends[i], i, ctx, now))
 }
 
 /// Weight-normalised load: lower is better. Cross-multiplied to stay in integers.
@@ -107,6 +108,31 @@ fn least_conn(group: &UpstreamGroup, ctx: &PickCtx, now: u64) -> Option<usize> {
 
 fn p2c(group: &UpstreamGroup, ctx: &PickCtx, now: u64) -> Option<usize> {
     let n = group.backends.len();
+    match n {
+        0 => return None,
+        1 => return usable(&group.backends[0], 0, ctx, now).then_some(0),
+        _ => {}
+    }
+    // Healthy pool: two distinct random indices, O(1). Rejection sampling over
+    // *usable* candidates keeps the distribution identical to sampling from
+    // the usable subset, so degraded pools stay correct too.
+    for _ in 0..3 {
+        let a = fastrand::usize(..n);
+        let mut b = fastrand::usize(..n - 1);
+        if b >= a {
+            b += 1; // distinct without a retry loop
+        }
+        if usable(&group.backends[a], a, ctx, now) && usable(&group.backends[b], b, ctx, now) {
+            return Some(if load_score(&group.backends[b]) < load_score(&group.backends[a]) { b } else { a });
+        }
+    }
+    p2c_degraded(group, ctx, now)
+}
+
+/// Exact power-of-two-choices over the usable subset (O(n); only reached when
+/// several backends are unhealthy, drained, ejected or already tried).
+fn p2c_degraded(group: &UpstreamGroup, ctx: &PickCtx, now: u64) -> Option<usize> {
+    let n = group.backends.len();
     let usable_count = (0..n).filter(|&i| usable(&group.backends[i], i, ctx, now)).count();
     match usable_count {
         0 => return None,
@@ -116,7 +142,7 @@ fn p2c(group: &UpstreamGroup, ctx: &PickCtx, now: u64) -> Option<usize> {
     let r1 = fastrand::usize(..usable_count);
     let mut r2 = fastrand::usize(..usable_count - 1);
     if r2 >= r1 {
-        r2 += 1; // distinct without rejection sampling
+        r2 += 1;
     }
     let nth = |rank: usize| (0..n).filter(|&i| usable(&group.backends[i], i, ctx, now)).nth(rank);
     let (a, b) = (nth(r1)?, nth(r2)?);
@@ -263,6 +289,72 @@ mod tests {
         let h = HashOn::Header("x-user".into());
         assert_eq!(hash_key(&h, ip, "/", Some(b"u1")), hash_key(&h, ip, "/z", Some(b"u1")));
         assert_eq!(hash_key(&h, ip, "/", None), hash_key(&HashOn::Ip, ip, "/", None), "falls back to ip");
+    }
+
+    #[test]
+    fn round_robin_with_unequal_weights_survives_unavailable_owners() {
+        let g = group("round_robin", &[3, 1, 2]);
+        g.backends[0].set_draining(true); // owner of slots 0..3 is gone
+        let h = histogram(&g, 6000);
+        assert!(!h.contains_key(&0));
+        assert_eq!(h.values().sum::<usize>(), 6000, "every request still lands somewhere: {h:?}");
+        g.backends[1].set_healthy(false);
+        g.backends[2].set_healthy(false);
+        assert_eq!(pick(&g, &PickCtx::default()), None);
+    }
+
+    #[test]
+    fn round_robin_slot_mapping_matches_the_linear_definition() {
+        for weights in [&[1u32, 1, 1, 1][..], &[7, 1, 1], &[2, 9, 4, 1, 1], &[1000, 1]] {
+            let g = group("round_robin", weights);
+            let total: u64 = weights.iter().map(|&w| u64::from(w)).sum();
+            for slot in 0..total * 2 {
+                // reference: walk the weights
+                let mut s = slot % total;
+                let mut expect = 0;
+                for (i, &w) in weights.iter().enumerate() {
+                    if s < u64::from(w) {
+                        expect = i;
+                        break;
+                    }
+                    s -= u64::from(w);
+                }
+                let got = if g.uniform_weights {
+                    (slot % weights.len() as u64) as usize
+                } else {
+                    g.cum_weights.partition_point(|&c| c <= slot % total)
+                };
+                assert_eq!(got, expect, "weights {weights:?} slot {slot}");
+            }
+        }
+    }
+
+    #[test]
+    fn p2c_stays_correct_when_most_of_the_pool_is_down() {
+        let g = group("p2c", &[1; 16]);
+        for b in &g.backends[..14] {
+            b.set_healthy(false); // only 14 and 15 usable
+        }
+        let _busy: Vec<_> = (0..20).map(|_| g.backends[14].track()).collect();
+        let h = histogram(&g, 4000);
+        assert_eq!(h.len(), 1, "only the two live backends are ever candidates: {h:?}");
+        assert_eq!(h[&15], 4000, "with two candidates P2C always takes the lighter one: {h:?}");
+        // exclusion is honoured on the degraded path as well
+        let mut ctx = PickCtx::default();
+        ctx.exclude(15);
+        assert_eq!(pick(&g, &ctx), Some(14));
+        ctx.exclude(14);
+        assert_eq!(pick(&g, &ctx), None);
+    }
+
+    #[test]
+    fn p2c_distinct_pair_sampling_is_unbiased() {
+        // With all loads equal every backend must be equally likely.
+        let g = group("p2c", &[1; 5]);
+        let h = histogram(&g, 50_000);
+        for i in 0..5 {
+            assert!((8_000..12_000).contains(&h[&i]), "backend {i}: {h:?}");
+        }
     }
 
     #[test]

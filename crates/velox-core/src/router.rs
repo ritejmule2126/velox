@@ -18,6 +18,8 @@ pub struct Route {
     pub strip_prefix: bool,
     /// Redirect plain HTTP to HTTPS.
     pub redirect_https: bool,
+    /// Fixed host for the HTTPS redirect (instead of reflecting `Host`).
+    pub canonical_host: Option<Arc<str>>,
     /// Effective rate-limit policy (route override or global default).
     pub rate_limit: Option<RateLimitConfig>,
     /// Headers set on the upstream request.
@@ -48,6 +50,7 @@ impl Route {
             prefix,
             strip_prefix: cfg.strip_prefix,
             redirect_https: cfg.redirect_https,
+            canonical_host: cfg.canonical_host.as_deref().map(Arc::from),
             rate_limit,
             request_headers,
             timeout: cfg.timeout,

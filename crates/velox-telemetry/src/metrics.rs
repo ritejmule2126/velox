@@ -2,8 +2,10 @@
 
 use crate::TelemetryError;
 use prometheus::{
-    Encoder, HistogramOpts, HistogramVec, IntCounter, IntCounterVec, IntGauge, IntGaugeVec, Opts, Registry, TextEncoder,
+    Encoder, Histogram, HistogramOpts, HistogramVec, IntCounter, IntCounterVec, IntGauge, IntGaugeVec, Opts, Registry,
+    TextEncoder,
 };
+use std::sync::OnceLock;
 use velox_core::Snapshot;
 
 /// The client-facing protocol a request or connection used.
@@ -18,6 +20,15 @@ pub enum Protocol {
 }
 
 impl Protocol {
+    /// Dense index (0..3) for lookup tables.
+    pub const fn index(self) -> usize {
+        match self {
+            Self::H1 => 0,
+            Self::H2 => 1,
+            Self::H3 => 2,
+        }
+    }
+
     /// The metric label value (`h1`, `h2`, `h3`).
     pub fn as_str(self) -> &'static str {
         match self {
@@ -33,7 +44,10 @@ impl Protocol {
 pub struct Metrics {
     registry: Registry,
     requests_total: IntCounterVec,
-    request_duration: HistogramVec,
+    /// `request_duration` children, resolved once per protocol.
+    duration_by_protocol: [Histogram; 3],
+    /// `requests_total` children, resolved lazily per `(protocol, status)`.
+    status_counters: Box<[OnceLock<IntCounter>]>,
     upstream_responses: IntCounterVec,
     upstream_duration: HistogramVec,
     active_connections: IntGaugeVec,
@@ -50,6 +64,10 @@ pub struct Metrics {
     h3_enabled: IntGauge,
     connections_rejected: IntCounter,
 }
+
+/// Status codes 100..=599 get a cached counter slot.
+const STATUS_BASE: usize = 100;
+const STATUS_SLOTS: usize = 500;
 
 const LATENCY_BUCKETS: [f64; 14] =
     [0.0005, 0.001, 0.0025, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0];
@@ -85,18 +103,22 @@ impl Metrics {
             "Connections refused by the global or per-IP connection limit",
         )?;
         r.register(Box::new(connections_rejected.clone()))?;
+        let request_duration = histogram(
+            &r,
+            "http_request_duration_seconds",
+            "Time from request received to response headers ready",
+            &["protocol"],
+        )?;
+        let duration_by_protocol =
+            [Protocol::H1, Protocol::H2, Protocol::H3].map(|p| request_duration.with_label_values(&[p.as_str()]));
         Ok(Self {
+            duration_by_protocol,
+            status_counters: (0..3 * STATUS_SLOTS).map(|_| OnceLock::new()).collect(),
             requests_total: counter(
                 &r,
                 "http_requests_total",
                 "Client requests by protocol and status",
                 &["protocol", "status"],
-            )?,
-            request_duration: histogram(
-                &r,
-                "http_request_duration_seconds",
-                "Time from request received to response headers ready",
-                &["protocol"],
             )?,
             upstream_responses: counter(
                 &r,
@@ -158,10 +180,24 @@ impl Metrics {
     }
 
     /// Record a finished client request.
+    ///
+    /// Hot path: the histogram child is pre-resolved and the status counter is
+    /// cached after its first use, so steady-state cost is two atomic ops, with
+    /// no label hashing and no allocation.
     pub fn observe_request(&self, protocol: Protocol, status: u16, seconds: f64) {
-        let buf = itoa_status(status);
-        self.requests_total.with_label_values(&[protocol.as_str(), buf.as_str()]).inc();
-        self.request_duration.with_label_values(&[protocol.as_str()]).observe(seconds);
+        self.duration_by_protocol[protocol.index()].observe(seconds);
+        match usize::from(status).checked_sub(STATUS_BASE).filter(|i| *i < STATUS_SLOTS) {
+            Some(i) => self.status_counters[protocol.index() * STATUS_SLOTS + i]
+                .get_or_init(|| {
+                    let label = itoa_status(status);
+                    self.requests_total.with_label_values(&[protocol.as_str(), label.as_str()])
+                })
+                .inc(),
+            None => {
+                let label = itoa_status(status);
+                self.requests_total.with_label_values(&[protocol.as_str(), label.as_str()]).inc();
+            }
+        }
     }
 
     /// Record an upstream attempt (`status` is `None` when no response arrived).
@@ -322,6 +358,31 @@ mod tests {
             "velox_h3_enabled 1",
         ] {
             assert!(text.contains(needle), "missing `{needle}` in:\n{text}");
+        }
+    }
+
+    #[test]
+    fn cached_request_counters_are_exact_and_cover_unusual_statuses() {
+        let m = Metrics::new().unwrap();
+        for _ in 0..1000 {
+            m.observe_request(Protocol::H2, 204, 0.001);
+        }
+        m.observe_request(Protocol::H1, 204, 0.001);
+        m.observe_request(Protocol::H3, 599, 0.001);
+        m.observe_request(Protocol::H3, 100, 0.001);
+        m.observe_request(Protocol::H1, 99, 0.001); // outside the cached range
+        m.observe_request(Protocol::H1, 600, 0.001);
+        let t = m.render().unwrap();
+        for needle in [
+            "velox_http_requests_total{protocol=\"h2\",status=\"204\"} 1000",
+            "velox_http_requests_total{protocol=\"h1\",status=\"204\"} 1",
+            "velox_http_requests_total{protocol=\"h3\",status=\"599\"} 1",
+            "velox_http_requests_total{protocol=\"h3\",status=\"100\"} 1",
+            "velox_http_requests_total{protocol=\"h1\",status=\"99\"} 1",
+            "velox_http_requests_total{protocol=\"h1\",status=\"600\"} 1",
+            "velox_http_request_duration_seconds_count{protocol=\"h2\"} 1000",
+        ] {
+            assert!(t.contains(needle), "missing `{needle}`:\n{t}");
         }
     }
 

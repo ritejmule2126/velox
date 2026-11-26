@@ -100,6 +100,7 @@ preload            = false
 trusted_proxies    = []        # e.g. ["10.0.0.0/8", "fd00::/8"]
 nosniff            = true      # add X-Content-Type-Options: nosniff if the upstream did not
 hide_server_header = false
+allow_underscores_in_host = false   # '_' is not an RFC 1123 hostname character; enable for container service names
 [security.response_headers]    # added only when the upstream did not set them
 # "referrer-policy" = "no-referrer"
 
@@ -179,6 +180,8 @@ path_prefix   = "/"
 upstream      = "app"
 # strip_prefix   = false            # remove path_prefix before forwarding
 # redirect_https = false            # answer plain-HTTP requests with a 308 to https
+#                                   # (needs `hosts`, or `canonical_host`, so arbitrary Host headers are never reflected)
+# canonical_host = "example.com"    # fixed redirect target host
 # timeout        = "10s"            # override timeouts.upstream_response
 # request_headers = { "x-env" = "prod" }
 # rate_limit = { requests_per_second = 20.0, burst = 40, key = "header:x-api-key" }

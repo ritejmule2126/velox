@@ -4,6 +4,8 @@
 use crate::error::BoxError;
 use bytes::Bytes;
 use http_body::{Body, Frame, SizeHint};
+use http_body_util::combinators::UnsyncBoxBody;
+use http_body_util::BodyExt;
 use pin_project_lite::pin_project;
 use std::future::Future;
 use std::pin::Pin;
@@ -13,6 +15,79 @@ use std::task::{Context, Poll};
 use std::time::Duration;
 use tokio::sync::mpsc;
 use tokio::time::{Instant, Sleep};
+
+/// The body type flowing through the proxy.
+///
+/// `Empty` and `Full` carry no heap allocation, so body-less requests (the
+/// common `GET`) and small canned responses never touch the allocator; only
+/// genuinely streaming bodies are boxed.
+pub enum ProxyBody {
+    /// No content.
+    Empty,
+    /// One in-memory chunk, yielded once.
+    Full(Option<Bytes>),
+    /// A streaming body behind a trait object.
+    Boxed(UnsyncBoxBody<Bytes, BoxError>),
+}
+
+impl ProxyBody {
+    /// Box an arbitrary body.
+    pub fn boxed<B>(body: B) -> Self
+    where
+        B: Body<Data = Bytes> + Send + 'static,
+        B::Error: Into<BoxError>,
+    {
+        Self::Boxed(body.map_err(Into::into).boxed_unsync())
+    }
+
+    /// A complete in-memory body (empty input becomes [`ProxyBody::Empty`]).
+    pub fn full(data: Bytes) -> Self {
+        if data.is_empty() {
+            Self::Empty
+        } else {
+            Self::Full(Some(data))
+        }
+    }
+}
+
+impl std::fmt::Debug for ProxyBody {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Empty => f.write_str("ProxyBody::Empty"),
+            Self::Full(b) => write!(f, "ProxyBody::Full({} bytes)", b.as_ref().map_or(0, Bytes::len)),
+            Self::Boxed(_) => f.write_str("ProxyBody::Boxed(..)"),
+        }
+    }
+}
+
+impl Body for ProxyBody {
+    type Data = Bytes;
+    type Error = BoxError;
+
+    fn poll_frame(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Result<Frame<Bytes>, BoxError>>> {
+        match self.get_mut() {
+            Self::Empty => Poll::Ready(None),
+            Self::Full(slot) => Poll::Ready(slot.take().map(|b| Ok(Frame::data(b)))),
+            Self::Boxed(b) => Pin::new(b).poll_frame(cx),
+        }
+    }
+
+    fn is_end_stream(&self) -> bool {
+        match self {
+            Self::Empty => true,
+            Self::Full(slot) => slot.is_none(),
+            Self::Boxed(b) => b.is_end_stream(),
+        }
+    }
+
+    fn size_hint(&self) -> SizeHint {
+        match self {
+            Self::Empty => SizeHint::with_exact(0),
+            Self::Full(slot) => SizeHint::with_exact(slot.as_ref().map_or(0, Bytes::len) as u64),
+            Self::Boxed(b) => b.size_hint(),
+        }
+    }
+}
 
 /// Reasons a client request body failed, recorded out-of-band so the handler
 /// can pick the right status without digging through error chains.
@@ -78,6 +153,26 @@ pub enum BodyError {
     IdleTimeout,
 }
 
+/// A request body disagreed with its declared `Content-Length`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum LengthMismatch {
+    /// More bytes arrived than declared.
+    #[error("body is longer than its Content-Length")]
+    TooMuch,
+    /// The stream ended before the declared length.
+    #[error("body ended before its Content-Length")]
+    TooLittle,
+}
+
+/// Map a body error to the fault the handler should report: a stall is a
+/// `408`, anything else from the client side a `400`.
+fn classify(e: &BoxError) -> Fault {
+    match e.downcast_ref::<BodyError>() {
+        Some(BodyError::IdleTimeout) => Fault::IdleTimeout,
+        _ => Fault::ClientRead,
+    }
+}
+
 pin_project! {
     /// Caps the total bytes of a body.
     pub struct LimitBody<B> {
@@ -117,8 +212,9 @@ where
                 Poll::Ready(Some(Ok(frame)))
             }
             Poll::Ready(Some(Err(e))) => {
-                this.fault.set_if_unset(Fault::ClientRead);
-                Poll::Ready(Some(Err(e.into())))
+                let e: BoxError = e.into();
+                this.fault.set_if_unset(classify(&e));
+                Poll::Ready(Some(Err(e)))
             }
             Poll::Ready(None) => Poll::Ready(None),
             Poll::Pending => Poll::Pending,
@@ -135,23 +231,32 @@ where
 }
 
 pin_project! {
-    /// Fails the body if no frame arrives within `idle`.
-    pub struct IdleBody<B> {
+    /// Fails the body if no frame arrives within `idle`, and holds a guard
+    /// payload (in-flight counters, …) until the body finishes or is dropped.
+    pub struct IdleBody<B, G> {
         #[pin] inner: B,
         #[pin] sleep: Sleep,
         idle: Duration,
         fault: Option<Arc<BodyFault>>,
+        _guard: G,
     }
 }
 
-impl<B> IdleBody<B> {
+impl<B> IdleBody<B, ()> {
     /// Wrap `inner`; optionally record the timeout in `fault`.
     pub fn new(inner: B, idle: Duration, fault: Option<Arc<BodyFault>>) -> Self {
-        Self { inner, sleep: tokio::time::sleep(idle), idle, fault }
+        Self::with_guard(inner, idle, fault, ())
     }
 }
 
-impl<B> Body for IdleBody<B>
+impl<B, G> IdleBody<B, G> {
+    /// Like [`IdleBody::new`], also tying `guard`'s lifetime to the body.
+    pub fn with_guard(inner: B, idle: Duration, fault: Option<Arc<BodyFault>>, guard: G) -> Self {
+        Self { inner, sleep: tokio::time::sleep(idle), idle, fault, _guard: guard }
+    }
+}
+
+impl<B, G> Body for IdleBody<B, G>
 where
     B: Body<Data = Bytes>,
     B::Error: Into<BoxError>,
@@ -164,7 +269,15 @@ where
         match this.inner.poll_frame(cx) {
             Poll::Ready(item) => {
                 this.sleep.as_mut().reset(Instant::now() + *this.idle);
-                Poll::Ready(item.map(|r| r.map_err(Into::into)))
+                Poll::Ready(item.map(|r| {
+                    r.map_err(|e| {
+                        let e: BoxError = e.into();
+                        if let Some(f) = this.fault {
+                            f.set_if_unset(classify(&e));
+                        }
+                        e
+                    })
+                }))
             }
             Poll::Pending => match this.sleep.poll(cx) {
                 Poll::Ready(()) => {
@@ -289,6 +402,35 @@ mod tests {
             tx.send(Ok(Frame::data(Bytes::from_static(b"c")))).await.unwrap();
         });
         assert_eq!(body.collect().await.unwrap().to_bytes(), "abc");
+    }
+
+    #[tokio::test]
+    async fn proxy_body_variants_behave_like_bodies() {
+        let e = ProxyBody::Empty;
+        assert!(e.is_end_stream() && e.size_hint().exact() == Some(0));
+        assert!(e.collect().await.unwrap().to_bytes().is_empty());
+        let f = ProxyBody::full(Bytes::from_static(b"abc"));
+        assert_eq!(f.size_hint().exact(), Some(3));
+        assert!(!f.is_end_stream());
+        assert_eq!(f.collect().await.unwrap().to_bytes(), "abc");
+        assert!(matches!(ProxyBody::full(Bytes::new()), ProxyBody::Empty), "no allocation for empty");
+        let b = ProxyBody::boxed(Full::new(Bytes::from_static(b"xyz")).map_err(|e| match e {}));
+        assert_eq!(b.size_hint().exact(), Some(3));
+        assert_eq!(b.collect().await.unwrap().to_bytes(), "xyz");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn idle_body_holds_its_guard_until_it_is_dropped() {
+        let flag = Arc::new(());
+        let body = IdleBody::with_guard(
+            ProxyBody::full(Bytes::from_static(b"x")),
+            Duration::from_secs(5),
+            None,
+            Arc::clone(&flag),
+        );
+        assert_eq!(Arc::strong_count(&flag), 2);
+        assert_eq!(body.collect().await.unwrap().to_bytes(), "x");
+        assert_eq!(Arc::strong_count(&flag), 1, "guard released once the body is gone");
     }
 
     #[tokio::test]

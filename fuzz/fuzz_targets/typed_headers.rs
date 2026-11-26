@@ -26,7 +26,7 @@ fuzz_target!(|data: &[u8]| {
         }
         let uri: Uri = "/x".parse().expect("static uri");
         for v in [Version::HTTP_11, Version::HTTP_2, Version::HTTP_3] {
-            let _ = validate_request_headers(v, &headers, &uri);
+            let _ = validate_request_headers(v, &headers, &uri, false);
         }
         let _ = is_websocket_upgrade(&headers);
         apply_forwarded_headers(&mut headers, "203.0.113.7".parse().expect("ip"), &[], "https", Some("example.com"));

@@ -20,6 +20,7 @@ acme = ["dep:instant-acme", "dep:tokio", "dep:tokio-util", "dep:serde_json", "de
 velox-core.workspace = true
 arc-swap.workspace = true
 dashmap.workspace = true
+hashbrown.workspace = true
 http.workspace = true
 rcgen.workspace = true
 rustls.workspace = true

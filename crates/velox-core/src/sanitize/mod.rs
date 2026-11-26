@@ -17,8 +17,9 @@ pub use h1::{
     parse_request_head, BodyFraming, ChunkedDecoder, GuardError, H1Guard, H1Limits, HeadInfo, HeadScanner, Release,
 };
 pub use headers::{
-    apply_forwarded_headers, host_without_port, is_websocket_upgrade, request_id_from, resolve_client_ip,
-    strip_hop_by_hop, validate_host, validate_host_pattern, validate_request_headers, X_REQUEST_ID,
+    apply_forwarded_headers, apply_forwarded_headers_hv, host_without_port, is_websocket_upgrade, request_id_from,
+    resolve_client_ip, strip_hop_by_hop, validate_host, validate_host_pattern, validate_host_with,
+    validate_request_headers, X_REQUEST_ID,
 };
 pub use violation::Violation;
 

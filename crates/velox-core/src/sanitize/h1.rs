@@ -12,7 +12,7 @@
 //!   tracks message boundaries across keep-alive and pipelining.
 
 use super::violation::Violation;
-use super::{validate_host, MAX_PARSE_HEADERS};
+use super::{validate_host_with, MAX_PARSE_HEADERS};
 
 /// Limits enforced while scanning an HTTP/1 request head.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -23,11 +23,13 @@ pub struct H1Limits {
     pub max_headers: usize,
     /// Maximum request-target length.
     pub max_uri_bytes: usize,
+    /// Tolerate `_` in `Host` labels (off by default: not an RFC 1123 character).
+    pub allow_underscores_in_host: bool,
 }
 
 impl Default for H1Limits {
     fn default() -> Self {
-        Self { max_head_bytes: 16 * 1024, max_headers: 100, max_uri_bytes: 8 * 1024 }
+        Self { max_head_bytes: 16 * 1024, max_headers: 100, max_uri_bytes: 8 * 1024, allow_underscores_in_host: false }
     }
 }
 
@@ -62,43 +64,112 @@ pub struct HeadScanner {
     len: usize,
 }
 
+/// `true` if none of the eight bytes in `w` is a control character
+/// (`< 0x20`) or `0x7f` — i.e. all eight are "boring" header text.
+///
+/// Classic SWAR zero/less-than detection (exact for existence). Bytes >= 0x80
+/// (obs-text) and printable ASCII, including space, pass; tab does not (it is
+/// handled by the byte-wise path, where it is rare).
+#[inline]
+fn word_is_plain(w: u64) -> bool {
+    const ONES: u64 = 0x0101_0101_0101_0101;
+    const HIGH: u64 = 0x8080_8080_8080_8080;
+    let below_space = w.wrapping_sub(ONES * 0x20) & !w & HIGH;
+    let x = w ^ (ONES * 0x7f);
+    let is_del = x.wrapping_sub(ONES) & !x & HIGH;
+    (below_space | is_del) == 0
+}
+
+/// Test-only handle on [`word_is_plain`].
+#[cfg(test)]
+pub(crate) fn word_is_plain_for_tests(w: u64) -> bool {
+    word_is_plain(w)
+}
+
 impl HeadScanner {
     /// Forget all state (call between messages).
     pub fn reset(&mut self) {
         *self = Self::default();
     }
 
+    /// One byte of the strict state machine.
+    #[inline]
+    fn step(&mut self, b: u8, max_head_bytes: usize) -> Result<bool, Violation> {
+        self.len += 1;
+        if self.len > max_head_bytes {
+            return Err(Violation::HeadTooLarge);
+        }
+        let p = self.prev;
+        if self.len == 1 && (b == b'\r' || b == b'\n') {
+            return Err(Violation::Malformed);
+        }
+        if p == b'\r' && b != b'\n' {
+            return Err(Violation::BareLineEnding);
+        }
+        match b {
+            b'\n' if p != b'\r' => return Err(Violation::BareLineEnding),
+            b' ' | b'\t' if p == b'\n' => return Err(Violation::ObsFold),
+            b'\r' | b'\n' | b' ' | b'\t' => {}
+            0x00..=0x1f | 0x7f => return Err(Violation::ControlCharacter),
+            _ => {}
+        }
+        self.prev = b;
+        let mut end = false;
+        self.run = match (self.run, b) {
+            (1, b'\n') => 2,
+            (2, b'\r') => 3,
+            (3, b'\n') => {
+                end = true;
+                0
+            }
+            (_, b'\r') => 1,
+            _ => 0,
+        };
+        Ok(end)
+    }
+
     /// Scan `data`; returns `Some(n)` when the head ends after `data[..n]`.
+    ///
+    /// Runs of plain header text are skipped eight bytes at a time; anything
+    /// that could matter (CR, LF, tab, control bytes, a position right after a
+    /// line break) goes through the exact byte-wise state machine.
     pub fn scan(&mut self, data: &[u8], max_head_bytes: usize) -> Result<Option<usize>, Violation> {
-        for (i, &b) in data.iter().enumerate() {
-            self.len += 1;
-            if self.len > max_head_bytes {
-                return Err(Violation::HeadTooLarge);
+        let mut i = 0;
+        while i < data.len() {
+            if self.len > 0 && self.prev != b'\r' && self.prev != b'\n' && self.len + 8 <= max_head_bytes {
+                if let Some(chunk) = data.get(i..i + 8).and_then(|c| <[u8; 8]>::try_from(c).ok()) {
+                    if word_is_plain(u64::from_le_bytes(chunk)) {
+                        self.len += 8;
+                        self.prev = chunk[7];
+                        self.run = 0;
+                        i += 8;
+                        continue;
+                    }
+                }
             }
-            let p = self.prev;
-            if self.len == 1 && (b == b'\r' || b == b'\n') {
-                return Err(Violation::Malformed);
+            if self.step(data[i], max_head_bytes)? {
+                return Ok(Some(i + 1));
             }
-            if p == b'\r' && b != b'\n' {
-                return Err(Violation::BareLineEnding);
-            }
-            match b {
-                b'\n' if p != b'\r' => return Err(Violation::BareLineEnding),
-                b' ' | b'\t' if p == b'\n' => return Err(Violation::ObsFold),
-                b'\r' | b'\n' | b' ' | b'\t' => {}
-                0x00..=0x1f | 0x7f => return Err(Violation::ControlCharacter),
-                _ => {}
-            }
-            self.prev = b;
-            self.run = match (self.run, b) {
-                (1, b'\n') => 2,
-                (2, b'\r') => 3,
-                (3, b'\n') => return Ok(Some(i + 1)),
-                (_, b'\r') => 1,
-                _ => 0,
-            };
+            i += 1;
         }
         Ok(None)
+    }
+
+    /// The original byte-at-a-time scanner, kept as a test oracle.
+    #[cfg(test)]
+    pub(crate) fn scan_reference(&mut self, data: &[u8], max_head_bytes: usize) -> Result<Option<usize>, Violation> {
+        for (i, &b) in data.iter().enumerate() {
+            if self.step(b, max_head_bytes)? {
+                return Ok(Some(i + 1));
+            }
+        }
+        Ok(None)
+    }
+
+    /// Internal state, for equivalence tests.
+    #[cfg(test)]
+    pub(crate) fn state(&self) -> (u8, u8, usize) {
+        (self.prev, self.run, self.len)
     }
 }
 
@@ -217,7 +288,7 @@ pub fn parse_request_head(head: &[u8], limits: &H1Limits) -> Result<HeadInfo, Vi
         if name.eq_ignore_ascii_case("host") {
             host_count += 1;
             let s = std::str::from_utf8(trim_ows(value)).map_err(|_| Violation::Host)?;
-            validate_host(s)?;
+            validate_host_with(s, limits.allow_underscores_in_host)?;
         } else if name.eq_ignore_ascii_case("content-length") {
             cl_count += 1;
             content_length = Some(parse_content_length(value)?);
@@ -471,10 +542,15 @@ pub struct GuardError {
 /// `carried`). Anything after `len` is a request head still being received;
 /// the guard keeps a copy and releases it (as `carried` in a later call) only
 /// once the *complete* head has been validated.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct Release {
+///
+/// `carried` borrows a buffer owned (and reused) by the guard, so a head that
+/// spans several reads costs no allocation after the first one.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Release<'a> {
     /// Previously withheld head bytes that are now cleared for delivery.
-    pub carried: Vec<u8>,
+    pub carried: &'a [u8],
+    /// `true` while a request head is still incomplete after this chunk.
+    pub partial_head: bool,
     /// Leading bytes of the current chunk already contained in `carried`.
     pub skip: usize,
     /// End (exclusive) of the part of the current chunk cleared for delivery.
@@ -502,13 +578,25 @@ pub struct H1Guard {
     limits: H1Limits,
     state: GuardState,
     scanner: HeadScanner,
+    /// A request head still being received (withheld from the HTTP layer).
     head: Vec<u8>,
+    /// The last completed withheld head, lent out through [`Release`].
+    carry: Vec<u8>,
 }
+
+/// Buffers that grew beyond this are released instead of kept for reuse.
+const BUFFER_RETAIN_MAX: usize = 16 * 1024;
 
 impl H1Guard {
     /// Create a guard enforcing `limits`.
     pub fn new(limits: H1Limits) -> Self {
-        Self { limits, state: GuardState::Head, scanner: HeadScanner::default(), head: Vec::new() }
+        Self { limits, state: GuardState::Head, scanner: HeadScanner::default(), head: Vec::new(), carry: Vec::new() }
+    }
+
+    /// Capacity of the withheld-head buffer (for reuse tests).
+    #[cfg(test)]
+    pub(crate) fn head_capacity_for_tests(&self) -> usize {
+        self.head.capacity().max(self.carry.capacity())
     }
 
     /// `true` between messages with no partial request buffered.
@@ -527,10 +615,15 @@ impl H1Guard {
     }
 
     /// Inspect bytes received from the client.
-    pub fn feed(&mut self, data: &[u8]) -> Result<Release, GuardError> {
+    pub fn feed<'a>(&'a mut self, data: &[u8]) -> Result<Release<'a>, GuardError> {
+        // Whatever the previous call lent out is no longer borrowed.
+        self.carry.clear();
+        if self.carry.capacity() > BUFFER_RETAIN_MAX {
+            self.carry = Vec::new();
+        }
         let mut i = 0usize;
         let mut released = 0usize;
-        let mut carried: Vec<u8> = Vec::new();
+        let mut carried_head = false;
         let mut skip = 0usize;
         while i < data.len() {
             match &mut self.state {
@@ -544,7 +637,7 @@ impl H1Guard {
                         None => {
                             // Incomplete head: withhold it until it can be judged.
                             self.head.extend_from_slice(&data[i..]);
-                            return Ok(Release { carried, skip, len: released });
+                            return Ok(self.release(carried_head, skip, released, true));
                         }
                         Some(n) => {
                             let parsed = if self.head.is_empty() {
@@ -552,7 +645,14 @@ impl H1Guard {
                             } else {
                                 self.head.extend_from_slice(&data[i..i + n]);
                                 let r = parse_request_head(&self.head, &self.limits);
-                                carried = std::mem::take(&mut self.head);
+                                // Hand the completed head to `carry` and recycle the old
+                                // `carry` allocation as the next withheld-head buffer.
+                                std::mem::swap(&mut self.head, &mut self.carry);
+                                self.head.clear();
+                                if self.head.capacity() > BUFFER_RETAIN_MAX {
+                                    self.head = Vec::new();
+                                }
+                                carried_head = true;
                                 skip = n;
                                 r
                             };
@@ -593,6 +693,11 @@ impl H1Guard {
                 }
             }
         }
-        Ok(Release { carried, skip, len: released })
+        let partial = self.has_partial_head();
+        Ok(self.release(carried_head, skip, released, partial))
+    }
+
+    fn release(&self, carried_head: bool, skip: usize, len: usize, partial_head: bool) -> Release<'_> {
+        Release { carried: if carried_head { &self.carry } else { &[] }, partial_head, skip, len }
     }
 }

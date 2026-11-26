@@ -19,7 +19,7 @@ fn sanitize(c: &mut Criterion) {
     });
     g.bench_function("h1_guard_feed_one_request", |b| {
         let mut guard = H1Guard::new(limits);
-        b.iter(|| guard.feed(black_box(REQUEST)).unwrap());
+        b.iter(|| guard.feed(black_box(REQUEST)).map(|r| r.len).unwrap());
     });
     g.finish();
 

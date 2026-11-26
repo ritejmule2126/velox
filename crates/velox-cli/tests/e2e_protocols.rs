@@ -28,17 +28,24 @@ async fn start_tls_app(
     extra: &str,
     upstream: &Mock,
 ) -> (App, rustls::pki_types::CertificateDer<'static>, tempfile::TempDir) {
+    start_tls_app_with("", extra, upstream.addr).await
+}
+
+async fn start_tls_app_with(
+    upstream_extra: &str,
+    extra: &str,
+    backend: std::net::SocketAddr,
+) -> (App, rustls::pki_types::CertificateDer<'static>, tempfile::TempDir) {
     let dir = tempfile::tempdir().unwrap();
     let (cert, key, der) = write_cert(dir.path());
     let toml = format!(
         "[server]\nhttps_addr = \"127.0.0.1:0\"\nh3 = true\ndrain_timeout = \"2s\"\n\
          [admin]\naddr = \"127.0.0.1:0\"\n\
          [[tls.certs]]\ncert_file = \"{}\"\nkey_file = \"{}\"\n\
-         [[upstream]]\nname = \"app\"\nbackends = [{{ addr = \"{}\" }}]\n\
+         [[upstream]]\nname = \"app\"\n{upstream_extra}\nbackends = [{{ addr = \"{backend}\" }}]\n\
          [[route]]\nupstream = \"app\"\n{extra}",
         cert.display(),
         key.display(),
-        upstream.addr
     );
     let app = App::start(Config::from_toml_str(&toml).unwrap(), None).await.unwrap();
     (app, der, dir)
@@ -217,5 +224,129 @@ async fn tls_certificates_hot_reload_without_dropping_the_listener() {
     let tcp_stream = tokio::net::TcpStream::connect(tcp).await.unwrap();
     let c = tokio_rustls::TlsConnector::from(client_tls(&der1, &[b"h2"]));
     assert!(c.connect(rustls::pki_types::ServerName::try_from("localhost").unwrap(), tcp_stream).await.is_err());
+    assert!(app.shutdown().await);
+}
+
+// ---------------- HTTP/3 request-body regressions ----------------
+
+#[tokio::test]
+async fn h3_trailers_only_request_forwards_its_trailers() {
+    // Regression: when the first `recv_data()` is `None` (no data frames at
+    // all) the trailers that follow were never polled, so they were dropped.
+    let (backend, hits) = h2c_trailer_backend().await;
+    let (app, der, _dir) = start_tls_app_with("protocol = \"h2c\"", "", backend).await;
+    let mut client = h3_client(app.running.h3_addr.unwrap(), &der).await;
+    let req = http::Request::builder().method("POST").uri("https://localhost/t").body(()).unwrap();
+    let mut stream = client.send.send_request(req).await.unwrap();
+    let mut trailers = http::HeaderMap::new();
+    trailers.insert("x-checksum", "abc123".parse().unwrap());
+    stream.send_trailers(trailers).await.unwrap();
+    stream.finish().await.unwrap();
+    let (status, body) = h3_read_response(&mut stream).await;
+    let body = String::from_utf8_lossy(&body).into_owned();
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(body.contains("body=0"), "{body}");
+    assert!(body.contains("trailer x-checksum=abc123"), "trailers must reach the backend: {body}");
+    assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 1);
+    client.close().await;
+    assert!(app.shutdown().await);
+}
+
+#[tokio::test]
+async fn h3_data_then_trailers_are_both_forwarded() {
+    let (backend, _) = h2c_trailer_backend().await;
+    let (app, der, _dir) = start_tls_app_with("protocol = \"h2c\"", "", backend).await;
+    let mut client = h3_client(app.running.h3_addr.unwrap(), &der).await;
+    let req = http::Request::builder().method("POST").uri("https://localhost/t").body(()).unwrap();
+    let mut stream = client.send.send_request(req).await.unwrap();
+    stream.send_data(Bytes::from_static(b"hello")).await.unwrap();
+    let mut trailers = http::HeaderMap::new();
+    trailers.insert("x-end", "done".parse().unwrap());
+    stream.send_trailers(trailers).await.unwrap();
+    stream.finish().await.unwrap();
+    let (status, body) = h3_read_response(&mut stream).await;
+    let body = String::from_utf8_lossy(&body).into_owned();
+    assert_eq!(status, StatusCode::OK);
+    assert!(body.contains("body=5") && body.contains("trailer x-end=done"), "{body}");
+    client.close().await;
+    assert!(app.shutdown().await);
+}
+
+#[tokio::test]
+async fn h3_content_length_must_match_the_bytes_actually_sent() {
+    let backend = Mock::start(describe_request()).await;
+    let (app, der, _dir) = start_tls_app("", &backend).await;
+    let addr = app.running.h3_addr.unwrap();
+
+    for (declared, sent, label) in [(3usize, 10usize, "more bytes than declared"), (10, 4, "stream closed early")] {
+        let mut client = h3_client(addr, &der).await;
+        let req = http::Request::builder()
+            .method("POST")
+            .uri("https://localhost/len")
+            .header("content-length", declared.to_string())
+            .body(())
+            .unwrap();
+        let mut stream = client.send.send_request(req).await.unwrap();
+        stream.send_data(Bytes::from(vec![b'x'; sent])).await.unwrap();
+        stream.finish().await.unwrap();
+        let (status, _) = h3_read_response(&mut stream).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{label}: must fail cleanly, not silently truncate");
+        client.close().await;
+    }
+    assert_eq!(backend.hits(), 0, "a mismatched body must never be executed upstream");
+    // The honest request still works.
+    assert_eq!(http3(addr, &der, Method::POST, "/ok", Bytes::from_static(b"12345")).await.status, StatusCode::OK);
+    assert_eq!(backend.hits(), 1);
+    assert!(app.shutdown().await);
+}
+
+#[tokio::test]
+async fn h3_stalled_request_body_gets_a_408_instead_of_a_silent_drop() {
+    // Regression: the first body frame was awaited before the handler ran, and
+    // a stall ended the stream with no HTTP response at all.
+    let backend = Mock::start(describe_request()).await;
+    let (app, der, _dir) = start_tls_app("[timeouts]\nrequest_body_idle = \"300ms\"\n", &backend).await;
+    let mut client = h3_client(app.running.h3_addr.unwrap(), &der).await;
+    let req = http::Request::builder()
+        .method("POST")
+        .uri("https://localhost/slow-upload")
+        .header("content-length", "10")
+        .body(())
+        .unwrap();
+    let mut stream = client.send.send_request(req).await.unwrap();
+    // …and never send a single body byte.
+    let t0 = std::time::Instant::now();
+    let resp = tokio::time::timeout(std::time::Duration::from_secs(5), stream.recv_response())
+        .await
+        .expect("the server must answer, not leave the stream hanging")
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::REQUEST_TIMEOUT);
+    assert!(t0.elapsed() < std::time::Duration::from_secs(3), "answered promptly: {:?}", t0.elapsed());
+    assert_eq!(backend.hits(), 0);
+    client.close().await;
+    assert!(app.shutdown().await);
+}
+
+#[tokio::test]
+async fn h3_requests_are_routed_while_the_body_is_still_arriving() {
+    // The handler must not wait for the first body frame: an unroutable
+    // request is refused immediately even though its body never starts.
+    let backend = Mock::start(describe_request()).await;
+    let toml = "[limits]\nmax_request_body_bytes = 5\n";
+    let (app, der, _dir) = start_tls_app(toml, &backend).await;
+    let mut client = h3_client(app.running.h3_addr.unwrap(), &der).await;
+    let req = http::Request::builder()
+        .method("POST")
+        .uri("https://localhost/x")
+        .header("content-length", "50")
+        .body(())
+        .unwrap();
+    let mut stream = client.send.send_request(req).await.unwrap();
+    let resp = tokio::time::timeout(std::time::Duration::from_secs(2), stream.recv_response())
+        .await
+        .expect("413 is decided from the headers alone")
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    client.close().await;
     assert!(app.shutdown().await);
 }

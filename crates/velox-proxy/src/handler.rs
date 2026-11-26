@@ -4,9 +4,9 @@
 //! `Request<ProxyBody>` and call [`Proxy::handle`]. Every failure is a
 //! [`ProxyError`] mapped to a clean 4xx/5xx; nothing on this path unwraps.
 
-use crate::body::{BodyFault, Fault, IdleBody, KeepAlive, LimitBody};
-use crate::error::{empty, full, simple_response, ProxyBody, ProxyError};
-use crate::io::{Activity, REJECT_PATH};
+use crate::body::{BodyFault, Fault, IdleBody, LimitBody};
+use crate::error::{full, simple_response, ProxyBody, ProxyError};
+use crate::io::{Activity, InflightGuard, REJECT_PATH};
 use crate::lb::{self, PickCtx};
 use crate::shutdown::Shutdown;
 use crate::upstream::UpstreamClients;
@@ -24,11 +24,13 @@ use std::sync::Arc;
 use std::time::Instant;
 use tracing::Instrument;
 use velox_core::config::{Algorithm, Config};
+use velox_core::router::Route;
 use velox_core::sanitize::{
-    apply_forwarded_headers, host_without_port, is_websocket_upgrade, request_id_from, resolve_client_ip,
+    apply_forwarded_headers_hv, host_without_port, is_websocket_upgrade, request_id_from, resolve_client_ip,
     strip_hop_by_hop, validate_request_headers, Violation, X_REQUEST_ID,
 };
-use velox_core::Snapshot;
+use velox_core::upstream::ActiveGuard;
+use velox_core::{Snapshot, UpstreamGroup};
 use velox_health::{record_outcome, Outcome};
 use velox_security::ratelimit::{rate_key, Decision, RateLimiters};
 use velox_security::{ChallengeStore, ConnectionLimiter, ResponsePolicy};
@@ -67,18 +69,21 @@ impl Derived {
     }
 }
 
-/// Per-request facts collected for logs.
+/// Per-request facts collected for logs (borrowed from the snapshot, so
+/// recording them costs nothing).
 #[derive(Debug, Default)]
-struct Trace {
-    route: Option<Arc<str>>,
-    upstream: Option<Arc<str>>,
-    backend: Option<Arc<str>>,
+struct Trace<'s> {
+    route: Option<&'s str>,
+    upstream: Option<&'s str>,
+    backend: Option<&'s str>,
     client_ip: Option<IpAddr>,
     error: Option<String>,
 }
 
 enum ReqBody {
+    /// Fully buffered: can be sent again on another backend.
     Replay(Bytes),
+    /// Streams once.
     Stream(Option<ProxyBody>),
 }
 
@@ -108,6 +113,14 @@ fn is_idempotent(m: &Method) -> bool {
 
 fn content_length(h: &HeaderMap) -> Option<u64> {
     h.get(CONTENT_LENGTH)?.to_str().ok()?.parse().ok()
+}
+
+fn fault_to_error(fault: Option<&BodyFault>) -> ProxyError {
+    match fault.and_then(BodyFault::get) {
+        Some(Fault::TooLarge) => ProxyError::BodyTooLarge,
+        Some(Fault::IdleTimeout) => ProxyError::ClientTimeout,
+        _ => ProxyError::Rejected(Violation::Malformed),
+    }
 }
 
 impl Proxy {
@@ -202,31 +215,39 @@ impl Proxy {
         activity: Option<&Arc<Activity>>,
     ) -> Response<ProxyBody> {
         let started = Instant::now();
-        let inflight = activity.map(Activity::begin);
+        let mut inflight = activity.map(Activity::begin);
         let snap = self.state.load();
         let derived = self.derived(&snap);
         let request_id = request_id_from(req.headers());
-        let method = req.method().clone();
-        let uri = req.uri().clone();
+        // Only pay for log context when an access-log line will be written.
+        let access_log =
+            snap.config.telemetry.access_log && tracing::enabled!(target: "velox::access", tracing::Level::INFO);
+        let log_req = access_log.then(|| (req.method().clone(), req.uri().clone()));
         let mut trace = Trace::default();
 
-        let span = tracing::info_span!("request", request_id = %request_id);
-        let result = self.handle_inner(&snap, &derived, req, conn, &request_id, &mut trace).instrument(span).await;
+        let work = self.handle_inner(&snap, &derived, req, conn, &request_id, &mut trace, &mut inflight);
+        // No span (and no field formatting) unless something would record it.
+        let result = if tracing::enabled!(tracing::Level::INFO) {
+            work.instrument(tracing::info_span!("request", request_id = request_id.to_str().unwrap_or(""))).await
+        } else {
+            work.await
+        };
+        let rid = request_id.to_str().unwrap_or("");
         let mut resp = match result {
             Ok(r) => r,
             Err(e) => {
                 if e.status().is_server_error() {
-                    tracing::warn!(request_id = %request_id, error = %e, "request failed");
+                    tracing::warn!(request_id = rid, error = %e, "request failed");
                 }
-                trace.error = Some(e.to_string());
+                if access_log {
+                    trace.error = Some(e.to_string());
+                }
                 e.into_response()
             }
         };
 
         let headers = resp.headers_mut();
-        if let Ok(v) = HeaderValue::from_str(&request_id) {
-            headers.insert(X_REQUEST_ID, v);
-        }
+        headers.insert(X_REQUEST_ID, request_id.clone());
         derived.response.apply(headers, conn.tls);
         if conn.tls && conn.protocol != Protocol::H3 {
             if let Some(alt) = &derived.alt_svc {
@@ -236,10 +257,10 @@ impl Proxy {
         let elapsed = started.elapsed();
         let status = resp.status().as_u16();
         self.metrics.observe_request(conn.protocol, status, elapsed.as_secs_f64());
-        if snap.config.telemetry.access_log {
+        if let Some((method, uri)) = log_req {
             tracing::info!(
                 target: "velox::access",
-                request_id = %request_id,
+                request_id = rid,
                 method = %method,
                 host = uri.authority().map(http::uri::Authority::as_str),
                 path = uri.path(),
@@ -247,30 +268,31 @@ impl Proxy {
                 duration_ms = u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX),
                 protocol = conn.protocol.as_str(),
                 client_ip = %trace.client_ip.unwrap_or_else(|| conn.peer.ip()),
-                route = trace.route.as_deref(),
-                upstream = trace.upstream.as_deref(),
-                backend = trace.backend.as_deref(),
+                route = trace.route,
+                upstream = trace.upstream,
+                backend = trace.backend,
                 error = trace.error.as_deref(),
                 "request"
             );
         }
-        match inflight {
-            Some(g) => resp.map(|b| KeepAlive::new(b, g).boxed_unsync()),
-            None => resp,
-        }
+        // `inflight` moves into the response body when streaming; a canned
+        // response (already complete) simply releases it here.
+        drop(inflight.take());
+        resp
     }
 
-    #[allow(clippy::too_many_lines)]
-    async fn handle_inner(
+    #[allow(clippy::too_many_lines, clippy::too_many_arguments)]
+    async fn handle_inner<'s>(
         &self,
-        snap: &Arc<Snapshot>,
+        snap: &'s Snapshot,
         derived: &Derived,
         mut req: Request<ProxyBody>,
         conn: ConnMeta,
-        request_id: &str,
-        trace: &mut Trace,
+        request_id: &HeaderValue,
+        trace: &mut Trace<'s>,
+        inflight: &mut Option<InflightGuard>,
     ) -> Result<Response<ProxyBody>, ProxyError> {
-        let cfg = &snap.config;
+        let cfg: &'s Config = &snap.config;
 
         // ---- strict validation (defence in depth; wire-level checks ran earlier) ----
         if let Some(slug) = req.uri().path().strip_prefix(REJECT_PATH) {
@@ -278,7 +300,9 @@ impl Proxy {
             self.metrics.rejected(v.slug());
             return Err(v.into());
         }
-        if let Err(v) = validate_request_headers(req.version(), req.headers(), req.uri()) {
+        if let Err(v) =
+            validate_request_headers(req.version(), req.headers(), req.uri(), cfg.security.allow_underscores_in_host)
+        {
             self.metrics.rejected(v.slug());
             return Err(v.into());
         }
@@ -287,12 +311,15 @@ impl Proxy {
             return Err(Violation::TooManyHeaders.into());
         }
 
-        let authority: String = match (req.uri().authority(), req.headers().get(HOST)) {
-            (Some(a), _) => a.as_str().to_owned(),
-            (None, Some(h)) => h.to_str().map_err(|_| Violation::Host)?.to_owned(),
-            (None, None) => String::new(), // HTTP/1.0 without Host
+        // The Host as a ref-counted header value: for HTTP/1 this is a clone of
+        // the inbound header (no allocation); only HTTP/2/3 build one from :authority.
+        let host_hv: Option<HeaderValue> = match (req.headers().get(HOST), req.uri().authority()) {
+            (Some(h), _) => Some(h.clone()),
+            (None, Some(a)) => Some(HeaderValue::from_str(a.as_str()).map_err(|_| Violation::Host)?),
+            (None, None) => None, // HTTP/1.0 without Host
         };
-        let host = host_without_port(&authority).to_owned();
+        let authority: &str = host_hv.as_ref().and_then(|h| h.to_str().ok()).unwrap_or("");
+        let host = host_without_port(authority);
 
         // ---- ACME HTTP-01 on the plain listener ----
         if !conn.tls {
@@ -303,14 +330,14 @@ impl Proxy {
             }
         }
 
-        // ---- route ----
-        let route = Arc::clone(snap.router.find(&host, req.uri().path()).ok_or(ProxyError::NoRoute)?);
-        trace.route = Some(Arc::clone(&route.id));
-        trace.upstream = Some(Arc::clone(&route.upstream.name));
-        let group = Arc::clone(&route.upstream);
+        // ---- route (borrowed from the snapshot: no Arc traffic) ----
+        let route: &'s Route = snap.router.find(host, req.uri().path()).ok_or(ProxyError::NoRoute)?;
+        let group: &'s UpstreamGroup = &route.upstream;
+        trace.route = Some(&route.id);
+        trace.upstream = Some(&group.name);
 
         if route.redirect_https && !conn.tls {
-            return Ok(redirect_to_https(&host, derived.https_port, req.uri()));
+            return redirect_to_https(route.canonical_host.as_deref().unwrap_or(host), derived.https_port, req.uri());
         }
 
         // ---- client identity + rate limit ----
@@ -335,19 +362,18 @@ impl Proxy {
         let ws_proto = ws.then(|| req.headers().get(UPGRADE).cloned()).flatten();
         let (mut parts, body) = req.into_parts();
 
-        let fault = BodyFault::new();
+        let idle = cfg.timeouts.request_body_idle;
         let known_empty = body.is_end_stream() || body.size_hint().exact() == Some(0);
-        let limited: ProxyBody = if known_empty {
-            body
-        } else {
-            let body =
-                if max_body > 0 { LimitBody::new(body, max_body, Arc::clone(&fault)).boxed_unsync() } else { body };
-            IdleBody::new(body, cfg.timeouts.request_body_idle, Some(Arc::clone(&fault))).boxed_unsync()
-        };
-        let fault_to_error = |fault: &BodyFault| match fault.get() {
-            Some(Fault::TooLarge) => ProxyError::BodyTooLarge,
-            Some(Fault::IdleTimeout) => ProxyError::ClientTimeout,
-            _ => ProxyError::Rejected(Violation::Malformed),
+        // Bodies that are already complete need no fault tracking, no timers, no boxing.
+        let fault = (!known_empty).then(BodyFault::new);
+        let limited: ProxyBody = match &fault {
+            None => ProxyBody::Empty,
+            Some(f) if max_body > 0 => ProxyBody::boxed(IdleBody::new(
+                LimitBody::new(body, max_body, Arc::clone(f)),
+                idle,
+                Some(Arc::clone(f)),
+            )),
+            Some(f) => ProxyBody::boxed(IdleBody::new(body, idle, Some(Arc::clone(f)))),
         };
         let retries = group.config.retries;
         let size = limited.size_hint().exact();
@@ -356,7 +382,7 @@ impl Proxy {
         } else if retries > 0 && size.is_some_and(|n| n <= cfg.limits.retry_body_buffer_bytes) {
             match limited.collect().await {
                 Ok(c) => ReqBody::Replay(c.to_bytes()),
-                Err(_) => return Err(fault_to_error(&fault)),
+                Err(_) => return Err(fault_to_error(fault.as_deref())),
             }
         } else {
             ReqBody::Stream(Some(limited))
@@ -372,23 +398,21 @@ impl Proxy {
                 headers.insert(UPGRADE, u);
             }
         }
-        let scheme = if conn.tls { "https" } else { "http" };
-        apply_forwarded_headers(
+        apply_forwarded_headers_hv(
             &mut headers,
             conn.peer.ip(),
             &cfg.security.trusted_proxies,
-            scheme,
-            (!authority.is_empty()).then_some(authority.as_str()),
+            if conn.tls { "https" } else { "http" },
+            host_hv.as_ref(),
+            client_ip,
         );
         for (k, v) in &route.request_headers {
             headers.insert(k.clone(), v.clone());
         }
-        if let Ok(v) = HeaderValue::from_str(request_id) {
-            headers.insert(X_REQUEST_ID, v);
-        }
-        if !headers.contains_key(HOST) && !authority.is_empty() {
-            if let Ok(v) = HeaderValue::from_str(&authority) {
-                headers.insert(HOST, v);
+        headers.insert(X_REQUEST_ID, request_id.clone());
+        if !headers.contains_key(HOST) {
+            if let Some(h) = &host_hv {
+                headers.insert(HOST, h.clone());
             }
         }
 
@@ -415,59 +439,81 @@ impl Proxy {
         };
 
         // ---- attempt loop (failover across backends) ----
+        //
+        // One deadline covers *every* attempt: `retries = 2` can never turn a
+        // 30 s upstream timeout into 90 s of client-visible latency.
+        let response_timeout = route.timeout.unwrap_or(cfg.timeouts.upstream_response);
+        let deadline = tokio::time::Instant::now() + response_timeout;
         let max_attempts = 1 + if replayable { retries } else { 0 };
         let idempotent = is_idempotent(&parts.method);
-        let client = self.clients.get(&group, cfg.timeouts.upstream_connect, cfg.server.tcp_nodelay);
-        let response_timeout = route.timeout.unwrap_or(cfg.timeouts.upstream_response);
+        let client = self.clients.get(group, cfg.timeouts.upstream_connect, cfg.server.tcp_nodelay);
         let mut ctx = PickCtx { hash, exclude: 0 };
         let mut last_err: Option<ProxyError> = None;
+        let (mut method, mut pq, mut hdrs) = (Some(parts.method), Some(path_and_query), Some(headers));
         for attempt in 0..max_attempts {
-            let Some(idx) = lb::pick(&group, &ctx) else { break };
+            if attempt > 0 && tokio::time::Instant::now() >= deadline {
+                last_err = Some(ProxyError::UpstreamTimeout);
+                break;
+            }
+            let Some(idx) = lb::pick(group, &ctx) else { break };
             ctx.exclude(idx);
-            let backend = Arc::clone(&group.backends[idx]);
-            trace.backend = Some(Arc::clone(&backend.name));
+            let backend = &group.backends[idx];
+            trace.backend = Some(&backend.name);
             let active = backend.track();
 
+            // Clone request parts only when a retry is actually possible;
+            // otherwise they are moved (the single-attempt fast path).
+            let may_retry = attempt + 1 < max_attempts
+                && (group.backends.len() > 128 || group.backends.len() > ctx.exclude.count_ones() as usize);
+            let (m, p, h) = if may_retry {
+                (method.clone(), pq.clone(), hdrs.clone())
+            } else {
+                (method.take(), pq.take(), hdrs.take())
+            };
+            let (Some(m), Some(p), Some(h)) = (m, p, h) else { break };
+
             let body = match &mut req_body {
-                ReqBody::Replay(b) => full(b.clone()),
-                ReqBody::Stream(slot) => slot.take().unwrap_or_else(empty),
+                ReqBody::Replay(b) => ProxyBody::full(b.clone()),
+                ReqBody::Stream(slot) => slot.take().unwrap_or(ProxyBody::Empty),
             };
             let uri = Uri::builder()
                 .scheme("http")
                 .authority(backend.authority.clone())
-                .path_and_query(path_and_query.clone())
+                .path_and_query(p)
                 .build()
                 .map_err(|e| ProxyError::Internal(e.to_string()))?;
             let mut ureq = Request::new(body);
-            *ureq.method_mut() = parts.method.clone();
+            *ureq.method_mut() = m;
             *ureq.uri_mut() = uri;
             *ureq.version_mut() = Version::HTTP_11;
-            *ureq.headers_mut() =
-                if attempt + 1 == max_attempts { std::mem::take(&mut headers) } else { headers.clone() };
+            *ureq.headers_mut() = h;
 
             let t0 = Instant::now();
-            let result = tokio::time::timeout(response_timeout, client.request(ureq)).await;
+            let result = tokio::time::timeout_at(deadline, client.request(ureq)).await;
             let secs = t0.elapsed().as_secs_f64();
             let (err, connect_failed) = match result {
                 Ok(Ok(resp)) => {
                     let status = resp.status().as_u16();
                     self.metrics.observe_upstream(&group.name, Some(status), secs);
-                    if record_outcome(&group, &backend, Outcome::Response { status }) {
+                    if record_outcome(group, backend, Outcome::Response { status }) {
                         self.metrics.backend_ejected(&group.name, &backend.name);
                     }
-                    return self.finish_response(resp, active, ws, client_upgrade, cfg);
+                    return self.finish_response(resp, active, inflight.take(), ws, client_upgrade, cfg);
                 }
                 Ok(Err(e)) => {
-                    if matches!(fault.get(), Some(Fault::TooLarge | Fault::IdleTimeout | Fault::ClientRead)) {
+                    if matches!(
+                        fault.as_deref().and_then(BodyFault::get),
+                        Some(Fault::TooLarge | Fault::IdleTimeout | Fault::ClientRead)
+                    ) {
                         // The *client* failed; the backend is blameless.
-                        return Err(fault_to_error(&fault));
+                        return Err(fault_to_error(fault.as_deref()));
                     }
                     (ProxyError::UpstreamConnect(e.to_string()), e.is_connect())
                 }
                 Err(_) => (ProxyError::UpstreamTimeout, false),
             };
             self.metrics.observe_upstream(&group.name, None, secs);
-            if record_outcome(&group, &backend, Outcome::TransportError) {
+            if record_outcome(group, backend, Outcome::TransportError) {
                 self.metrics.backend_ejected(&group.name, &backend.name);
             }
             last_err = Some(err);
@@ -482,7 +528,8 @@ impl Proxy {
     fn finish_response(
         &self,
         mut resp: Response<hyper::body::Incoming>,
-        active: velox_core::upstream::ActiveGuard,
+        active: ActiveGuard,
+        inflight: Option<InflightGuard>,
         ws: bool,
         client_upgrade: Option<hyper::upgrade::OnUpgrade>,
         cfg: &Config,
@@ -499,6 +546,7 @@ impl Proxy {
             let upstream_upgrade = hyper::upgrade::on(&mut resp);
             let (mut parts, _) = resp.into_parts();
             parts.headers.insert(CONNECTION, HeaderValue::from_static("upgrade"));
+            drop(inflight); // a tunnel is not an in-flight HTTP request
             let kill = self.shutdown.kill.clone();
             self.shutdown.tasks.spawn(async move {
                 let _active = active;
@@ -520,7 +568,7 @@ impl Proxy {
                     () = kill.cancelled() => {}
                 }
             });
-            return Ok(Response::from_parts(parts, empty()));
+            return Ok(Response::from_parts(parts, ProxyBody::Empty));
         }
 
         let (mut parts, body) = resp.into_parts();
@@ -530,21 +578,63 @@ impl Proxy {
             // connection, so it must not be reused for further requests.
             parts.headers.insert(CONNECTION, HeaderValue::from_static("close"));
         }
-        let body = IdleBody::new(body, cfg.timeouts.upstream_body_idle, None).boxed_unsync();
-        Ok(Response::from_parts(parts, KeepAlive::new(body, active).boxed_unsync()))
+        // One wrapper, one box: idle timeout + both in-flight guards.
+        let body = IdleBody::with_guard(body, cfg.timeouts.upstream_body_idle, None, (active, inflight));
+        Ok(Response::from_parts(parts, ProxyBody::boxed(body)))
     }
 }
 
-fn redirect_to_https(host: &str, https_port: Option<u16>, uri: &Uri) -> Response<ProxyBody> {
+/// Build the 308 to HTTPS.
+///
+/// * An empty host (HTTP/1.0 without `Host`) is refused: there is nothing safe
+///   to put in `Location`.
+/// * The `*` target of `OPTIONS *` becomes `/`.
+/// * `host` is either a validated, route-constrained request host or the
+///   route's configured `canonical_host`; it never contains CR/LF or `/`.
+fn redirect_to_https(host: &str, https_port: Option<u16>, uri: &Uri) -> Result<Response<ProxyBody>, ProxyError> {
+    if host.is_empty() {
+        return Err(Violation::Host.into());
+    }
     let host = if host.contains(':') { format!("[{host}]") } else { host.to_owned() };
     let port = match https_port {
         Some(p) if p != 443 => format!(":{p}"),
         _ => String::new(),
     };
-    let pq = uri.path_and_query().map_or("/", PathAndQuery::as_str);
+    let pq = match uri.path_and_query().map(PathAndQuery::as_str) {
+        None | Some("*") => "/",
+        Some(p) => p,
+    };
+    let location = HeaderValue::from_str(&format!("https://{host}{port}{pq}"))
+        .map_err(|_| ProxyError::Rejected(Violation::Target))?;
     let mut resp = simple_response(StatusCode::PERMANENT_REDIRECT, "redirecting to https");
-    if let Ok(v) = HeaderValue::from_str(&format!("https://{host}{port}{pq}")) {
-        resp.headers_mut().insert(LOCATION, v);
+    resp.headers_mut().insert(LOCATION, location);
+    Ok(resp)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn loc(r: &Response<ProxyBody>) -> &str {
+        r.headers()[LOCATION].to_str().unwrap()
     }
-    resp
+
+    #[test]
+    fn redirect_rules() {
+        let uri: Uri = "/a/b?x=1".parse().unwrap();
+        let r = redirect_to_https("example.com", Some(8443), &uri).unwrap();
+        assert_eq!((r.status().as_u16(), loc(&r)), (308, "https://example.com:8443/a/b?x=1"));
+        let r = redirect_to_https("example.com", Some(443), &uri).unwrap();
+        assert_eq!(loc(&r), "https://example.com/a/b?x=1");
+        let r = redirect_to_https("::1", None, &uri).unwrap();
+        assert_eq!(loc(&r), "https://[::1]/a/b?x=1");
+        // `OPTIONS *` must not produce `https://host*`.
+        let star: Uri = "*".parse().unwrap();
+        let r = redirect_to_https("example.com", None, &star).unwrap();
+        assert_eq!(loc(&r), "https://example.com/");
+        // No host → nothing safe to redirect to.
+        assert!(matches!(redirect_to_https("", None, &uri), Err(ProxyError::Rejected(Violation::Host))));
+        // Header injection attempts never make it into Location.
+        assert!(redirect_to_https("evil\r\nSet-Cookie: x", None, &uri).is_err());
+    }
 }

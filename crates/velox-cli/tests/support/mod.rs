@@ -292,3 +292,78 @@ where
     }
     panic!("timed out waiting for: {what}");
 }
+
+/// A low-level HTTP/3 client for tests that need to control the stream.
+pub struct H3Client {
+    pub send: h3::client::SendRequest<h3_quinn::OpenStreams, Bytes>,
+    conn: quinn::Connection,
+    endpoint: quinn::Endpoint,
+    driver: tokio::task::JoinHandle<()>,
+}
+
+pub async fn h3_client(addr: SocketAddr, der: &CertificateDer<'static>) -> H3Client {
+    let tls = client_tls(der, &[b"h3"]);
+    let quic = quinn::crypto::rustls::QuicClientConfig::try_from(tls).unwrap();
+    let mut endpoint = quinn::Endpoint::client("127.0.0.1:0".parse().unwrap()).unwrap();
+    endpoint.set_default_client_config(quinn::ClientConfig::new(Arc::new(quic)));
+    let conn = endpoint.connect(addr, "localhost").unwrap().await.unwrap();
+    let (mut driver, send) = h3::client::new(h3_quinn::Connection::new(conn.clone())).await.unwrap();
+    let driver = tokio::spawn(async move {
+        let _ = std::future::poll_fn(|cx| driver.poll_close(cx)).await;
+    });
+    H3Client { send, conn, endpoint, driver }
+}
+
+impl H3Client {
+    pub async fn close(self) {
+        self.conn.close(0u32.into(), b"done");
+        self.driver.abort();
+        self.endpoint.wait_idle().await;
+    }
+}
+
+/// Read a whole HTTP/3 response (status + body).
+pub async fn h3_read_response<S>(stream: &mut h3::client::RequestStream<S, Bytes>) -> (StatusCode, Bytes)
+where
+    S: h3::quic::RecvStream,
+{
+    let resp = stream.recv_response().await.unwrap();
+    let mut out = BytesMut::new();
+    while let Some(mut chunk) = stream.recv_data().await.unwrap() {
+        out.extend_from_slice(&chunk.copy_to_bytes(chunk.remaining()));
+    }
+    (resp.status(), out.freeze())
+}
+
+/// A cleartext HTTP/2 (h2c) backend that reports the request's trailers.
+pub async fn h2c_trailer_backend() -> (SocketAddr, Arc<AtomicUsize>) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let hits = Arc::new(AtomicUsize::new(0));
+    let hits2 = Arc::clone(&hits);
+    tokio::spawn(async move {
+        loop {
+            let Ok((stream, _)) = listener.accept().await else { return };
+            let hits = Arc::clone(&hits2);
+            tokio::spawn(async move {
+                let svc = service_fn(move |req: Request<Incoming>| {
+                    let hits = Arc::clone(&hits);
+                    async move {
+                        hits.fetch_add(1, Ordering::SeqCst);
+                        let collected = req.into_body().collect().await.unwrap();
+                        let trailers = collected.trailers().cloned().unwrap_or_default();
+                        let mut out = format!("body={}\n", collected.to_bytes().len());
+                        for (k, v) in &trailers {
+                            out.push_str(&format!("trailer {k}={}\n", v.to_str().unwrap_or("?")));
+                        }
+                        Ok::<_, Infallible>(text(out))
+                    }
+                });
+                let _ = hyper::server::conn::http2::Builder::new(TokioExecutor::new())
+                    .serve_connection(TokioIo::new(stream), svc)
+                    .await;
+            });
+        }
+    });
+    (addr, hits)
+}

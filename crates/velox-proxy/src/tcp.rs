@@ -4,7 +4,7 @@ use crate::error::{BoxError, ProxyBody};
 use crate::handler::{ConnMeta, Proxy};
 use crate::io::{Activity, ConnIo, IoTimeouts};
 use crate::socket;
-use http_body_util::BodyExt;
+use http_body::Body as _;
 use hyper::body::Incoming;
 use hyper::service::service_fn;
 use hyper_util::rt::{TokioExecutor, TokioIo, TokioTimer};
@@ -130,7 +130,8 @@ fn io_timeouts(cfg: &Config) -> IoTimeouts {
 }
 
 fn to_proxy_request(req: hyper::Request<Incoming>) -> hyper::Request<ProxyBody> {
-    req.map(|b| b.map_err(|e| Box::new(e) as BoxError).boxed_unsync())
+    // Body-less requests (the common GET) skip the trait-object allocation.
+    req.map(|b| if b.is_end_stream() { ProxyBody::Empty } else { ProxyBody::boxed(b) })
 }
 
 async fn serve_h1<T>(io: T, peer: SocketAddr, tls: bool, proxy: &Arc<Proxy>, cfg: &Config)
@@ -143,6 +144,7 @@ where
         max_head_bytes: cfg.limits.max_header_bytes,
         max_headers: cfg.limits.max_headers,
         max_uri_bytes: cfg.limits.max_uri_bytes,
+        allow_underscores_in_host: cfg.security.allow_underscores_in_host,
     });
     let io = TokioIo::new(Box::pin(ConnIo::new(io, Some(guard), Arc::clone(&activity), io_timeouts(cfg))));
     let meta = ConnMeta { peer, protocol: Protocol::H1, tls };

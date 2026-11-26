@@ -264,6 +264,10 @@ pub struct SecurityConfig {
     pub response_headers: BTreeMap<String, String>,
     /// Remove the upstream `Server` header from responses.
     pub hide_server_header: bool,
+    /// Accept `_` in `Host` labels (e.g. `my_service`). Off by default because
+    /// underscores are not valid hostname characters (RFC 1123) and lenient
+    /// parsing invites host-confusion bugs.
+    pub allow_underscores_in_host: bool,
 }
 
 impl Default for SecurityConfig {
@@ -273,6 +277,7 @@ impl Default for SecurityConfig {
             nosniff: true,
             response_headers: BTreeMap::new(),
             hide_server_header: false,
+            allow_underscores_in_host: false,
         }
     }
 }
@@ -715,8 +720,16 @@ pub struct RouteConfig {
     #[serde(default)]
     pub strip_prefix: bool,
     /// Answer plain-HTTP requests with a 308 redirect to HTTPS.
+    ///
+    /// The redirect target host is the request's `Host` unless `canonical_host`
+    /// is set. A catch-all route (`hosts = []`) must set `canonical_host`,
+    /// otherwise any `Host` header would be reflected into `Location` (open
+    /// redirect).
     #[serde(default)]
     pub redirect_https: bool,
+    /// Fixed host used in the HTTPS redirect `Location` (no port, no wildcard).
+    #[serde(default)]
+    pub canonical_host: Option<String>,
     /// Per-route rate limit (overrides the global policy; `enabled=false` opts out).
     #[serde(default)]
     pub rate_limit: Option<RateLimitConfig>,
@@ -920,8 +933,19 @@ impl Config {
             if !r.path_prefix.starts_with('/') {
                 errs.push(format!("route `{id}`: path_prefix must start with `/`"));
             }
+            if r.redirect_https && r.hosts.is_empty() && r.canonical_host.is_none() {
+                errs.push(format!(
+                    "route `{id}`: `redirect_https` on a catch-all route (no `hosts`) would reflect arbitrary Host \
+                     headers into the redirect (open redirect); set `hosts` or `canonical_host`"
+                ));
+            }
+            if let Some(ch) = &r.canonical_host {
+                if ch.starts_with("*.") || validate_host_pattern(ch, self.security.allow_underscores_in_host).is_err() {
+                    errs.push(format!("route `{id}`: canonical_host `{ch}` must be a plain host name"));
+                }
+            }
             for h in &r.hosts {
-                if let Err(e) = validate_host_pattern(h) {
+                if let Err(e) = validate_host_pattern(h, self.security.allow_underscores_in_host) {
                     errs.push(format!("route `{id}`: host `{h}`: {e}"));
                 }
             }
@@ -955,7 +979,7 @@ impl Config {
         }
         for (i, c) in self.tls.certs.iter().enumerate() {
             for n in &c.server_names {
-                if let Err(e) = validate_host_pattern(n) {
+                if let Err(e) = validate_host_pattern(n, self.security.allow_underscores_in_host) {
                     errs.push(format!("tls.certs[{i}]: server name `{n}`: {e}"));
                 }
             }
@@ -1045,6 +1069,24 @@ mod tests {
         let cfg = Config::from_toml_str(&text).unwrap();
         assert_eq!(cfg.timeouts.header_read, Duration::from_secs(2));
         assert_eq!(cfg.timeouts.upstream_connect, Duration::from_millis(500));
+    }
+
+    #[test]
+    fn catch_all_https_redirect_needs_a_canonical_host() {
+        // Regression: `redirect_https` on a catch-all route reflected any Host.
+        let bad =
+            MINIMAL.replace("upstream = \"app\"\n    ", "upstream = \"app\"\n        redirect_https = true\n    ");
+        let err = Config::from_toml_str(&bad).unwrap_err().to_string();
+        assert!(err.contains("open redirect"), "{err}");
+        let ok =
+            bad.replace("redirect_https = true", "redirect_https = true\n        canonical_host = \"example.com\"");
+        assert!(Config::from_toml_str(&ok).is_ok());
+        let with_hosts =
+            bad.replace("redirect_https = true", "redirect_https = true\n        hosts = [\"*.example.com\"]");
+        assert!(Config::from_toml_str(&with_hosts).is_ok(), "explicit hosts constrain what can be reflected");
+        let wildcard =
+            bad.replace("redirect_https = true", "redirect_https = true\n        canonical_host = \"*.example.com\"");
+        assert!(Config::from_toml_str(&wildcard).is_err());
     }
 
     #[test]

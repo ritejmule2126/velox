@@ -13,11 +13,14 @@ authors = ["Velox contributors"]
 
 [profile.release]
 opt-level = 3
-lto = "thin"
+lto = "fat"
 codegen-units = 1
 strip = "symbols"
-# `panic = "unwind"` (the default) is deliberate: a bug in one request task
-# must never take down every other connection.
+# A panic is a bug we want to see loudly and recover from by restarting the
+# process (under a supervisor / orchestrator), not a state we try to limp
+# through. It also removes the unwinding tables, shrinking and speeding up the
+# binary. `cargo test`/`cargo bench` ignore this setting.
+panic = "abort"
 
 [profile.dev]
 # Dependencies dominate test time (TLS, QUIC); optimise them even in debug.
@@ -72,6 +75,7 @@ toml = "0.8"
 humantime-serde = "1"
 arc-swap = "1"
 dashmap = "6"
+hashbrown = { version = "0.17", default-features = false }
 ipnet = { version = "2", features = ["serde"] }
 
 # errors / observability

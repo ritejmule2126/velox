@@ -2,14 +2,12 @@
 
 use bytes::Bytes;
 use http::{header, HeaderValue, Response, StatusCode};
-use http_body_util::{BodyExt, Full};
 use std::time::Duration;
 use velox_core::sanitize::Violation;
 
 /// Boxed error used for streaming bodies.
 pub type BoxError = Box<dyn std::error::Error + Send + Sync>;
-/// The body type flowing through the proxy.
-pub type ProxyBody = http_body_util::combinators::UnsyncBoxBody<Bytes, BoxError>;
+pub use crate::body::ProxyBody;
 
 /// Everything that can go wrong while serving a request. Each variant maps to
 /// exactly one status code; none of them can panic the request path.
@@ -109,14 +107,14 @@ pub fn simple_response(status: StatusCode, message: &str) -> Response<ProxyBody>
     resp
 }
 
-/// A complete in-memory body.
+/// A complete in-memory body (allocation-free).
 pub fn full(data: Bytes) -> ProxyBody {
-    Full::new(data).map_err(|never| match never {}).boxed_unsync()
+    ProxyBody::full(data)
 }
 
-/// An empty body.
+/// An empty body (allocation-free).
 pub fn empty() -> ProxyBody {
-    full(Bytes::new())
+    ProxyBody::Empty
 }
 
 #[cfg(test)]

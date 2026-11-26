@@ -2236,6 +2236,7 @@ version = "0.1.0"
 dependencies = [
  "arc-swap",
  "dashmap",
+ "hashbrown 0.17.2",
  "http",
  "instant-acme",
  "rcgen 0.13.2",

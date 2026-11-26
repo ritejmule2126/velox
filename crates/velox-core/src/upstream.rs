@@ -266,6 +266,11 @@ pub struct UpstreamGroup {
     pub rr_cursor: AtomicU64,
     /// Sum of backend weights.
     pub total_weight: u64,
+    /// Running sums of the weights (`cum_weights[i]` = weights of `0..=i`), so
+    /// a weighted slot maps to its backend with a binary search.
+    pub cum_weights: Vec<u64>,
+    /// `true` when every backend has the same weight (slot → index is `% n`).
+    pub uniform_weights: bool,
 }
 
 impl UpstreamGroup {
@@ -281,6 +286,14 @@ impl UpstreamGroup {
             .collect();
         let ring = (cfg.algorithm == Algorithm::ConsistentHash).then(|| HashRing::new(&backends));
         let total_weight = backends.iter().map(|b| u64::from(b.weight)).sum();
+        let cum_weights: Vec<u64> = backends
+            .iter()
+            .scan(0u64, |acc, b| {
+                *acc += u64::from(b.weight);
+                Some(*acc)
+            })
+            .collect();
+        let uniform_weights = backends.windows(2).all(|w| w[0].weight == w[1].weight);
         Self {
             name: Arc::from(cfg.name.as_str()),
             config: cfg.clone(),
@@ -288,6 +301,8 @@ impl UpstreamGroup {
             ring,
             rr_cursor: AtomicU64::new(0),
             total_weight,
+            cum_weights,
+            uniform_weights,
         }
     }
 
@@ -382,6 +397,41 @@ mod tests {
         assert_eq!(b.authority.as_str(), a);
         let t = Backend::new(&BackendConfig { addr: "[::1]:8080".parse().unwrap(), weight: 1 });
         assert_eq!(t.authority.as_str(), "[::1]:8080");
+    }
+
+    #[test]
+    fn weight_tables_are_consistent() {
+        let g = |ws: &[u32]| {
+            let cfg = velox_test_cfg(ws);
+            UpstreamGroup::build(&cfg, None)
+        };
+        let a = g(&[1, 1, 1]);
+        assert!(a.uniform_weights);
+        assert_eq!(a.cum_weights, [1, 2, 3]);
+        let b = g(&[5, 3, 1]);
+        assert!(!b.uniform_weights);
+        assert_eq!(b.cum_weights, [5, 8, 9]);
+        assert_eq!(b.total_weight, 9);
+        assert!(g(&[4, 4]).uniform_weights);
+        assert!(g(&[]).uniform_weights && g(&[]).cum_weights.is_empty());
+    }
+
+    fn velox_test_cfg(ws: &[u32]) -> UpstreamConfig {
+        UpstreamConfig {
+            name: "t".into(),
+            algorithm: Algorithm::RoundRobin,
+            hash_on: crate::config::HashOn::Ip,
+            protocol: crate::config::UpstreamProtocol::Http1,
+            retries: 0,
+            backends: ws
+                .iter()
+                .enumerate()
+                .map(|(i, w)| BackendConfig { addr: format!("10.0.0.{i}:80").parse().unwrap(), weight: *w })
+                .collect(),
+            health: None,
+            outlier: Default::default(),
+            pool: Default::default(),
+        }
     }
 
     #[test]
