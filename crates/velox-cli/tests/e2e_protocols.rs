@@ -350,3 +350,228 @@ async fn h3_requests_are_routed_while_the_body_is_still_arriving() {
     client.close().await;
     assert!(app.shutdown().await);
 }
+
+// ---------------- HTTP/3 body fast paths ----------------
+
+#[tokio::test]
+async fn h3_content_length_zero_spawns_no_body_pump() {
+    let backend = Mock::start(describe_request()).await;
+    // A long idle timeout: a lingering pump would outlive the whole test.
+    let (app, der, _dir) = start_tls_app("[timeouts]\nrequest_body_idle = \"60s\"\n", &backend).await;
+    let mut client = h3_client(app.running.h3_addr.unwrap(), &der).await;
+    // Make sure the connection-level tasks exist before taking the baseline.
+    let tasks = app.proxy.shutdown().tasks.clone();
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    let baseline = tasks.len();
+
+    for round in 0..3 {
+        let req = http::Request::builder()
+            .method("POST")
+            .uri("https://localhost/zero")
+            .header("content-length", "0")
+            .body(())
+            .unwrap();
+        let mut stream = client.send.send_request(req).await.unwrap();
+        // Deliberately do NOT finish the stream: the server must neither wait for
+        // a FIN nor park a task on it.
+        let (status, body) = h3_read_response(&mut stream).await;
+        let body = String::from_utf8_lossy(&body).into_owned();
+        assert_eq!(status, StatusCode::OK, "round {round}: {body}");
+        assert!(body.contains("POST /zero body=0"), "{body}");
+        assert!(body.contains("content-length: 0"), "an empty body is framed explicitly: {body}");
+        eventually(3, "request task to finish", || {
+            let tasks = tasks.clone();
+            async move { tasks.len() == baseline }
+        })
+        .await;
+    }
+    assert_eq!(backend.hits(), 3);
+    client.close().await;
+    assert!(app.shutdown().await);
+}
+
+#[tokio::test]
+async fn h3_bodyless_get_and_streaming_uploads_are_not_delayed_or_mangled() {
+    let backend = Mock::start(describe_request()).await;
+    let (app, der, _dir) = start_tls_app("", &backend).await;
+    let addr = app.running.h3_addr.unwrap();
+
+    // GET / HEAD / DELETE without Content-Length: forwarded with no body framing at all.
+    for m in [Method::GET, Method::DELETE, Method::OPTIONS] {
+        let r = http3(addr, &der, m.clone(), "/probe", Bytes::new()).await;
+        assert_eq!(r.status, StatusCode::OK, "{m}");
+        let body = String::from_utf8_lossy(&r.body).into_owned();
+        assert!(body.contains("body=0") && !body.contains("transfer-encoding"), "{m}: {body}");
+    }
+
+    // A POST with no Content-Length streams: a slow second chunk (longer than
+    // any grace period) still arrives intact, in order, and the request is
+    // forwarded chunked.
+    let mut client = h3_client(addr, &der).await;
+    let req = http::Request::builder().method("POST").uri("https://localhost/stream").body(()).unwrap();
+    let mut stream = client.send.send_request(req).await.unwrap();
+    stream.send_data(Bytes::from_static(b"first-")).await.unwrap();
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    stream.send_data(Bytes::from_static(b"second")).await.unwrap();
+    stream.finish().await.unwrap();
+    let (status, body) = h3_read_response(&mut stream).await;
+    let body = String::from_utf8_lossy(&body).into_owned();
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(body.contains("POST /stream body=12"), "{body}");
+    assert!(body.contains("transfer-encoding: chunked"), "{body}");
+    client.close().await;
+
+    // A POST that really has no body at all (FIN with the headers) still works.
+    let r = http3(addr, &der, Method::POST, "/empty", Bytes::new()).await;
+    assert_eq!(r.status, StatusCode::OK);
+    assert!(String::from_utf8_lossy(&r.body).contains("POST /empty body=0"));
+    assert!(app.shutdown().await);
+}
+
+// ---------------- PROXY protocol in front of TLS ----------------
+
+#[tokio::test]
+async fn proxy_protocol_header_precedes_the_tls_handshake() {
+    use velox_proxy::proxy_protocol::{encode_v1, encode_v2};
+    let backend = Mock::start(describe_request()).await;
+    let dir = tempfile::tempdir().unwrap();
+    let (cert, key, der) = write_cert(dir.path());
+    let toml = format!(
+        "[server]\nhttps_addr = \"127.0.0.1:0\"\nh3 = false\ndrain_timeout = \"2s\"\n\
+         proxy_protocol = true\nproxy_protocol_trusted = [\"127.0.0.0/8\"]\n[admin]\naddr = \"127.0.0.1:0\"\n\
+         [[tls.certs]]\ncert_file = \"{}\"\nkey_file = \"{}\"\n\
+         [[upstream]]\nname = \"app\"\nbackends = [{{ addr = \"{}\" }}]\n[[route]]\nupstream = \"app\"\n",
+        cert.display(),
+        key.display(),
+        backend.addr
+    );
+    let app = App::start(Config::from_toml_str(&toml).unwrap(), None).await.unwrap();
+    let addr = app.running.https_addr.unwrap();
+
+    let request = |header: Vec<u8>, alpn: &'static [u8]| {
+        let der = der.clone();
+        async move {
+            let mut tcp = tokio::net::TcpStream::connect(addr).await.unwrap();
+            tcp.write_all(&header).await.unwrap();
+            let connector = tokio_rustls::TlsConnector::from(client_tls(&der, &[alpn]));
+            let mut tls = connector
+                .connect(rustls::pki_types::ServerName::try_from("localhost").unwrap(), tcp)
+                .await
+                .map_err(|e| e.to_string())?;
+            tls.write_all(b"GET /tls HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n").await.unwrap();
+            let mut out = String::new();
+            let _ = tls.read_to_string(&mut out).await;
+            Ok::<_, String>(out)
+        }
+    };
+    let (client, server) = ("203.0.113.77:40000".parse().unwrap(), "10.0.0.1:443".parse().unwrap());
+    for (label, header) in [("v2", encode_v2(client, server, &[])), ("v1", encode_v1(client, server))] {
+        let out = request(header, b"http/1.1").await.unwrap();
+        assert!(out.starts_with("HTTP/1.1 200"), "{label}: {out}");
+        assert!(out.contains("x-real-ip: 203.0.113.77"), "{label}: the real client reaches the backend: {out}");
+        assert!(out.contains("x-forwarded-proto: https"), "{label}: {out}");
+    }
+    // Without the header, the TLS ClientHello is not a PROXY header: refused before any handshake.
+    assert!(request(Vec::new(), b"http/1.1").await.is_err(), "unframed TLS must be refused");
+    assert!(app.metrics.render().unwrap().contains("velox_proxy_protocol_errors_total{reason=\"invalid\"}"));
+    assert!(app.shutdown().await);
+}
+
+// ---------------- response compression on every protocol ----------------
+
+fn json_doc() -> Vec<u8> {
+    "{\"id\": 42, \"name\": \"velox\", \"tags\": [\"edge\", \"proxy\"]}\n".repeat(400).into_bytes()
+}
+
+fn decode_body(encoding: &str, data: &[u8]) -> Vec<u8> {
+    use std::io::Read;
+    let mut out = Vec::new();
+    match encoding {
+        "gzip" => flate2::read::GzDecoder::new(data).read_to_end(&mut out).unwrap(),
+        "br" => brotli::Decompressor::new(data, 4096).read_to_end(&mut out).unwrap(),
+        "zstd" => zstd::stream::read::Decoder::new(data).unwrap().read_to_end(&mut out).unwrap(),
+        other => panic!("unexpected encoding {other}"),
+    };
+    out
+}
+
+#[tokio::test]
+async fn compression_works_identically_over_http1_http2_and_http3() {
+    let doc = json_doc();
+    let served = doc.clone();
+    let backend = Mock::start(handler(move |_| {
+        let served = served.clone();
+        async move {
+            let mut r = text(String::from_utf8(served).unwrap());
+            r.headers_mut().insert("content-type", "application/json".parse().unwrap());
+            r
+        }
+    }))
+    .await;
+    let dir = tempfile::tempdir().unwrap();
+    let (cert, key, der) = write_cert(dir.path());
+    let toml = format!(
+        "[server]\nhttps_addr = \"127.0.0.1:0\"\nh3 = true\ndrain_timeout = \"2s\"\n[admin]\naddr = \"127.0.0.1:0\"\n\
+         [compression]\nenabled = true\n\
+         [[tls.certs]]\ncert_file = \"{}\"\nkey_file = \"{}\"\n\
+         [[upstream]]\nname = \"app\"\nbackends = [{{ addr = \"{}\" }}]\n[[route]]\nupstream = \"app\"\n",
+        cert.display(),
+        key.display(),
+        backend.addr
+    );
+    let app = App::start(Config::from_toml_str(&toml).unwrap(), None).await.unwrap();
+    let (tcp_addr, h3_addr) = (app.running.https_addr.unwrap(), app.running.h3_addr.unwrap());
+
+    // HTTP/2
+    let mut h2 = h2_connection(tcp_addr, &der).await;
+    for (accept, expect) in [("zstd, br, gzip", "zstd"), ("br, gzip", "br"), ("gzip", "gzip")] {
+        let req = http::Request::builder()
+            .uri("https://localhost/data.json")
+            .header("accept-encoding", accept)
+            .body(http_body_util::Full::new(Bytes::new()))
+            .unwrap();
+        let resp = h2.send_request(req).await.unwrap();
+        assert_eq!(resp.version(), Version::HTTP_2);
+        assert_eq!(resp.headers()["content-encoding"], expect);
+        assert_eq!(resp.headers()["vary"], "Accept-Encoding");
+        assert!(!resp.headers().contains_key("content-length"));
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        assert_eq!(decode_body(expect, &body), doc, "h2 {expect}");
+    }
+
+    // HTTP/3
+    let mut client = h3_client(h3_addr, &der).await;
+    for (accept, expect) in [("br", "br"), ("zstd", "zstd")] {
+        let req = http::Request::builder()
+            .uri("https://localhost/data.json")
+            .header("accept-encoding", accept)
+            .body(())
+            .unwrap();
+        let mut stream = client.send.send_request(req).await.unwrap();
+        stream.finish().await.unwrap();
+        let resp = stream.recv_response().await.unwrap();
+        assert_eq!(resp.headers()["content-encoding"], expect);
+        let mut body = bytes::BytesMut::new();
+        while let Some(mut chunk) = stream.recv_data().await.unwrap() {
+            use bytes::Buf;
+            body.extend_from_slice(&chunk.copy_to_bytes(chunk.remaining()));
+        }
+        assert_eq!(decode_body(expect, &body), doc, "h3 {expect}");
+    }
+    client.close().await;
+
+    // HTTP/1.1 over TLS, with and without a usable Accept-Encoding.
+    let r = https1(tcp_addr, &der, Method::GET, "/data.json", Bytes::new()).await;
+    assert!(!r.headers.contains_key("content-encoding"), "no Accept-Encoding ⇒ identity");
+    assert_eq!(r.headers["vary"], "Accept-Encoding");
+    assert_eq!(r.body, doc);
+
+    let metrics = app.metrics.render().unwrap();
+    for enc in ["zstd", "br", "gzip"] {
+        assert!(
+            metrics.contains(&format!("velox_compression_responses_total{{encoding=\"{enc}\"}}")),
+            "{enc}: {metrics}"
+        );
+    }
+    assert!(app.shutdown().await);
+}

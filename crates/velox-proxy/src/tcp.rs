@@ -3,6 +3,7 @@
 use crate::error::{BoxError, ProxyBody};
 use crate::handler::{ConnMeta, Proxy};
 use crate::io::{Activity, ConnIo, IoTimeouts};
+use crate::proxy_protocol;
 use crate::socket;
 use http_body::Body as _;
 use hyper::body::Incoming;
@@ -29,7 +30,11 @@ pub enum Mode {
 }
 
 /// Accept connections until the drain signal fires.
-pub async fn accept_loop(listener: Arc<TcpListener>, mode: Mode, proxy: Arc<Proxy>) {
+///
+/// With `proxy_protocol`, every connection must open with a PROXY v1/v2 header
+/// from a `server.proxy_protocol_trusted` peer; the client address it carries
+/// replaces the TCP peer for limits, logs, rate limiting and `X-Forwarded-*`.
+pub async fn accept_loop(listener: Arc<TcpListener>, mode: Mode, proxy: Arc<Proxy>, proxy_protocol: bool) {
     let sd = proxy.shutdown().clone();
     let mut backoff = Duration::from_millis(10);
     loop {
@@ -53,6 +58,57 @@ pub async fn accept_loop(listener: Arc<TcpListener>, mode: Mode, proxy: Arc<Prox
         };
         let snap = proxy.state().load();
         let limits = &snap.config.limits;
+        if proxy_protocol {
+            // Only the load balancer may speak first; everyone else is turned
+            // away before a single byte is read.
+            if !proxy_protocol::is_trusted(peer.ip(), &snap.config.server.proxy_protocol_trusted) {
+                tracing::debug!(%peer, "connection on a PROXY-protocol listener from an untrusted peer");
+                proxy.metrics().proxy_protocol_error("untrusted_peer");
+                continue;
+            }
+            // Bound the not-yet-identified connections by the global cap only:
+            // all of them share the load balancer's address.
+            let Ok(pending) = proxy.conn_limiter().try_acquire(peer.ip(), limits.max_connections, 0) else {
+                proxy.metrics().connection_rejected();
+                continue;
+            };
+            socket::tune_accepted(&stream, snap.config.server.tcp_nodelay);
+            let header_timeout = snap.config.timeouts.header_read;
+            drop(snap);
+            let proxy = Arc::clone(&proxy);
+            let mode = mode.clone();
+            sd.tasks.spawn(async move {
+                let mut stream = stream;
+                let client = match proxy_protocol::read_header(&mut stream, header_timeout).await {
+                    // `LOCAL` / `UNKNOWN`: the load balancer's own probe.
+                    Ok(h) => h.client.unwrap_or(peer),
+                    Err(e) => {
+                        tracing::debug!(%peer, error = %e, "PROXY header rejected");
+                        proxy.metrics().proxy_protocol_error(e.reason());
+                        return;
+                    }
+                };
+                drop(pending);
+                let snap = proxy.state().load();
+                let limits = &snap.config.limits;
+                let permit = match proxy.conn_limiter().try_acquire(
+                    client.ip(),
+                    limits.max_connections,
+                    limits.max_connections_per_ip,
+                ) {
+                    Ok(p) => p,
+                    Err(why) => {
+                        tracing::debug!(%client, reason = %why, "connection refused");
+                        proxy.metrics().connection_rejected();
+                        return;
+                    }
+                };
+                drop(snap);
+                let _permit = permit;
+                serve(stream, client, mode, proxy).await;
+            });
+            continue;
+        }
         let permit =
             match proxy.conn_limiter().try_acquire(peer.ip(), limits.max_connections, limits.max_connections_per_ip) {
                 Ok(p) => p,

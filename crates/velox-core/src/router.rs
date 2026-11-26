@@ -26,6 +26,8 @@ pub struct Route {
     pub request_headers: Vec<(HeaderName, HeaderValue)>,
     /// Per-route override of the upstream response timeout.
     pub timeout: Option<Duration>,
+    /// Per-route override of `compression.enabled` (`None` = follow the global switch).
+    pub compress: Option<bool>,
     /// Target pool.
     pub upstream: Arc<UpstreamGroup>,
 }
@@ -54,6 +56,7 @@ impl Route {
             rate_limit,
             request_headers,
             timeout: cfg.timeout,
+            compress: cfg.compress,
             upstream,
         }
     }

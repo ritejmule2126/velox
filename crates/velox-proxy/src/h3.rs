@@ -165,11 +165,37 @@ async fn serve_connection(conn: quinn::Connection, peer: SocketAddr, proxy: Arc<
     conn.close(quinn::VarInt::from_u32(0), b"bye");
 }
 
-/// How long a request that declared no `Content-Length` waits for its first
-/// body event (data, trailers or FIN) before it is treated as a streaming
-/// upload. A body-less `GET` delivers its FIN together with the headers, so in
-/// practice this is one scheduler hop.
-const FIRST_EVENT_GRACE: Duration = Duration::from_millis(50);
+/// How many scheduler turns a body-less-looking request (`GET`, `HEAD`, …
+/// without `Content-Length`) gives the body pump to report that the stream
+/// already ended. A request without a body delivers its FIN together with the
+/// headers, so the answer is normally ready after one turn; if it is not, the
+/// body is treated as a stream. Nothing here sleeps.
+const PROBE_TURNS: u32 = 4;
+
+/// How a request's body is handled, decided from the head alone.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BodyPlan {
+    /// `Content-Length: 0`: there is no body. No pump task is started.
+    None,
+    /// A body is expected (declared length, or a method that carries one): stream
+    /// it immediately, never delay the request waiting to find out.
+    Stream,
+    /// A method that normally has no body and no declared length: take a
+    /// non-blocking look at whether the stream has already ended.
+    Probe,
+}
+
+fn body_plan(method: &Method, declared: Option<u64>) -> BodyPlan {
+    match declared {
+        Some(0) => BodyPlan::None,
+        Some(_) => BodyPlan::Stream,
+        None if matches!(*method, Method::GET | Method::HEAD | Method::DELETE | Method::OPTIONS | Method::TRACE) => {
+            BodyPlan::Probe
+        }
+        // POST / PUT / PATCH / extension methods: assume a streaming upload.
+        None => BodyPlan::Stream,
+    }
+}
 
 /// What the body pump learned first about a request with unknown length.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -195,10 +221,10 @@ async fn pump_request_body(
     tx: BodyTx,
     declared: Option<u64>,
     idle: Duration,
-    first: oneshot::Sender<FirstEvent>,
+    first: Option<oneshot::Sender<FirstEvent>>,
 ) {
     use h3::error::Code;
-    let mut first = Some(first);
+    let mut first = first;
     let announce = |first: &mut Option<oneshot::Sender<FirstEvent>>, ev| {
         if let Some(f) = first.take() {
             let _ = f.send(ev);
@@ -284,18 +310,48 @@ async fn serve_request(
         .and_then(|v| v.to_str().ok())
         .and_then(|v| v.parse::<u64>().ok());
 
-    // The pump starts immediately and never blocks the handler: routing, rate
-    // limiting and size checks proceed while the body streams in.
-    let (tx, channel_body) = ChannelBody::new(declared);
-    let (first_tx, first_rx) = oneshot::channel();
-    proxy.shutdown().tasks.spawn(pump_request_body(recv, tx, declared, cfg.timeouts.request_body_idle, first_tx));
-    let body: ProxyBody = match declared {
-        Some(0) => empty(),
-        Some(_) => ProxyBody::boxed(channel_body),
-        None => match tokio::time::timeout(FIRST_EVENT_GRACE, first_rx).await {
-            Ok(Ok(FirstEvent::Empty)) => empty(),
-            _ => ProxyBody::boxed(channel_body),
-        },
+    let body: ProxyBody = match body_plan(&parts.method, declared) {
+        BodyPlan::None => {
+            // Nothing to read: no pump task, no channel. Tell the peer we are
+            // not interested in anything further on this stream.
+            let mut recv = recv;
+            recv.stop_sending(h3::error::Code::H3_NO_ERROR);
+            empty()
+        }
+        plan => {
+            // The pump starts immediately and never blocks the handler:
+            // routing, rate limiting and size checks proceed while the body
+            // streams in.
+            let (tx, channel_body) = ChannelBody::new(declared);
+            let (first_tx, mut first_rx) = oneshot::channel();
+            let probe = plan == BodyPlan::Probe;
+            proxy.shutdown().tasks.spawn(pump_request_body(
+                recv,
+                tx,
+                declared,
+                cfg.timeouts.request_body_idle,
+                probe.then_some(first_tx),
+            ));
+            let mut empty_body = false;
+            if probe {
+                for _ in 0..PROBE_TURNS {
+                    tokio::task::yield_now().await;
+                    match first_rx.try_recv() {
+                        Ok(FirstEvent::Empty) => {
+                            empty_body = true;
+                            break;
+                        }
+                        Ok(FirstEvent::Body) | Err(oneshot::error::TryRecvError::Closed) => break,
+                        Err(oneshot::error::TryRecvError::Empty) => {}
+                    }
+                }
+            }
+            if empty_body {
+                empty()
+            } else {
+                ProxyBody::boxed(channel_body)
+            }
+        }
     };
 
     let request = Request::from_parts(parts, body);
@@ -338,4 +394,26 @@ async fn write_response(
     }
     send.finish().await?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn body_plan_follows_length_and_method() {
+        // Declared lengths decide everything, whatever the method.
+        for m in [Method::GET, Method::POST, Method::PUT] {
+            assert_eq!(body_plan(&m, Some(0)), BodyPlan::None, "{m}");
+            assert_eq!(body_plan(&m, Some(1)), BodyPlan::Stream, "{m}");
+        }
+        // Unknown length: methods that normally carry a body are never delayed…
+        for m in [Method::POST, Method::PUT, Method::PATCH, Method::from_bytes(b"PROPFIND").unwrap()] {
+            assert_eq!(body_plan(&m, None), BodyPlan::Stream, "{m}");
+        }
+        // …methods that normally do not are probed without waiting.
+        for m in [Method::GET, Method::HEAD, Method::DELETE, Method::OPTIONS] {
+            assert_eq!(body_plan(&m, None), BodyPlan::Probe, "{m}");
+        }
+    }
 }

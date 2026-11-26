@@ -4,6 +4,7 @@
 //! * [`connlimit`]: global and per-IP connection caps with RAII permits.
 //! * [`tls`]: `rustls` configuration, SNI certificate selection with hot
 //!   reload, and development self-signed certificates.
+//! * [`upstream_tls`]: client-side TLS / mTLS for `https://` backends.
 //! * [`headers`]: HSTS and response-header policy.
 //! * `acme` (feature `acme`): HTTP-01 certificate issuance and renewal.
 
@@ -17,9 +18,11 @@ pub mod connlimit;
 pub mod headers;
 pub mod ratelimit;
 pub mod tls;
+pub mod upstream_tls;
 
 pub use challenge::ChallengeStore;
 pub use connlimit::{ConnectionLimiter, ConnectionPermit};
 pub use headers::ResponsePolicy;
 pub use ratelimit::{rate_key, Decision, RateKey, RateLimiter, RateLimiters};
 pub use tls::{SniResolver, TlsError};
+pub use upstream_tls::UpstreamTlsRegistry;

@@ -67,14 +67,20 @@ fn bind_workers(addr: SocketAddr, cfg: &Config) -> Result<(SocketAddr, Vec<Arc<T
     Ok((bound, listeners))
 }
 
-fn spawn_accept(listeners: &[Arc<TcpListener>], workers: usize, mode: &tcp::Mode, proxy: &Arc<Proxy>) {
+fn spawn_accept(
+    listeners: &[Arc<TcpListener>],
+    workers: usize,
+    mode: &tcp::Mode,
+    proxy: &Arc<Proxy>,
+    proxy_protocol: bool,
+) {
     let tasks = &proxy.shutdown().tasks;
     // One loop per distinct listener; if a single listener is shared, run
     // `workers` loops over it.
     let per_listener = if listeners.len() == 1 { workers.max(1) } else { 1 };
     for l in listeners {
         for _ in 0..per_listener {
-            tasks.spawn(tcp::accept_loop(Arc::clone(l), mode.clone(), Arc::clone(proxy)));
+            tasks.spawn(tcp::accept_loop(Arc::clone(l), mode.clone(), Arc::clone(proxy), proxy_protocol));
         }
     }
 }
@@ -98,7 +104,7 @@ pub async fn start(proxy: Arc<Proxy>, tls: Option<Arc<SniResolver>>) -> Result<R
     if let Some(addr) = cfg.server.http_addr {
         let (bound, listeners) = bind_workers(addr, &cfg)?;
         running.http_addr = Some(bound);
-        spawn_accept(&listeners, workers, &tcp::Mode::Plain, &proxy);
+        spawn_accept(&listeners, workers, &tcp::Mode::Plain, &proxy, cfg.server.proxy_protocol);
     }
 
     if let Some(addr) = cfg.server.https_addr {
@@ -107,7 +113,7 @@ pub async fn start(proxy: Arc<Proxy>, tls: Option<Arc<SniResolver>>) -> Result<R
         let (bound, listeners) = bind_workers(addr, &cfg)?;
         running.https_addr = Some(bound);
         proxy.set_bound_ports(Some(bound.port()), None);
-        spawn_accept(&listeners, workers, &tcp::Mode::Tls(acceptor), &proxy);
+        spawn_accept(&listeners, workers, &tcp::Mode::Tls(acceptor), &proxy, cfg.server.proxy_protocol);
 
         if cfg.server.h3 {
             let udp_addr = cfg.server.h3_addr.unwrap_or_else(|| {

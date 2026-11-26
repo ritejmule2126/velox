@@ -29,8 +29,12 @@ impl PickCtx {
     }
 }
 
+/// A backend the balancer may choose: not already tried, healthy, not drained
+/// or ejected, and below its `max_inflight` circuit-breaker cap. (The cap
+/// check here is a cheap hint; [`Backend::try_track`] makes the exact decision
+/// when the request commits to the backend.)
 fn usable(b: &Backend, idx: usize, ctx: &PickCtx, now: u64) -> bool {
-    (idx >= 128 || ctx.exclude & (1u128 << idx) == 0) && b.is_available_at(now)
+    (idx >= 128 || ctx.exclude & (1u128 << idx) == 0) && b.is_available_at(now) && !b.is_saturated()
 }
 
 /// Compute the consistent-hash key for a request.
@@ -364,5 +368,52 @@ mod tests {
             g.backends.iter().for_each(|b| b.set_healthy(false));
             assert_eq!(pick(&g, &PickCtx::default()), None, "{algo}");
         }
+    }
+
+    fn capped_group(algo: &str, n: usize, cap: u32) -> Arc<UpstreamGroup> {
+        let backends: Vec<String> = (0..n).map(|i| format!("{{ addr = \"10.0.0.{i}:80\" }}")).collect();
+        let text = format!(
+            "[server]\nhttp_addr = \"127.0.0.1:1\"\n[[upstream]]\nname = \"a\"\nalgorithm = \"{algo}\"\n\
+             max_inflight = {cap}\nbackends = [{}]\n",
+            backends.join(",")
+        );
+        let s = SharedState::new(Config::from_toml_str(&text).unwrap()).unwrap();
+        Arc::clone(&s.load().upstreams["a"])
+    }
+
+    #[test]
+    fn every_algorithm_skips_saturated_backends_and_reports_total_saturation() {
+        for algo in ["round_robin", "least_conn", "p2c", "consistent_hash"] {
+            let g = capped_group(algo, 4, 1);
+            let ctx = PickCtx { hash: 12345, exclude: 0 };
+            // Fill backend 0: it must never be picked while at its cap.
+            let held0 = g.backends[0].try_track().unwrap();
+            for _ in 0..500 {
+                let i = pick(&g, &PickCtx { hash: fastrand::u64(..), exclude: 0 }).unwrap();
+                assert_ne!(i, 0, "{algo}: picked a saturated backend");
+            }
+            // Fill the rest: nothing is pickable, and the group says why.
+            let held: Vec<_> = (1..4).map(|i| g.backends[i].try_track().unwrap()).collect();
+            assert_eq!(pick(&g, &ctx), None, "{algo}");
+            assert!(g.any_saturated(), "{algo}");
+            // Capacity returns as soon as a request finishes.
+            drop(held0);
+            for _ in 0..50 {
+                assert_eq!(pick(&g, &ctx), Some(0), "{algo}");
+            }
+            drop(held);
+            assert!(!g.any_saturated());
+        }
+    }
+
+    #[test]
+    fn saturation_is_not_confused_with_being_down() {
+        let g = capped_group("round_robin", 2, 1);
+        g.backends[0].set_healthy(false);
+        let _held = g.backends[1].try_track().unwrap();
+        assert!(g.any_saturated(), "backend 1 is up but full");
+        g.backends[1].set_healthy(false);
+        assert!(!g.any_saturated(), "nothing is up at all: that is an outage, not saturation");
+        assert_eq!(pick(&g, &PickCtx::default()), None);
     }
 }

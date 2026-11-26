@@ -17,6 +17,9 @@ velox-telemetry.workspace = true
 velox-security.workspace = true
 velox-health.workspace = true
 bytes.workspace = true
+brotli.workspace = true
+flate2.workspace = true
+zstd.workspace = true
 fastrand.workspace = true
 futures-util.workspace = true
 h3.workspace = true
@@ -26,6 +29,7 @@ http-body.workspace = true
 http-body-util.workspace = true
 hyper.workspace = true
 hyper-util.workspace = true
+ipnet.workspace = true
 pin-project-lite.workspace = true
 quinn.workspace = true
 arc-swap.workspace = true
@@ -42,6 +46,7 @@ dashmap.workspace = true
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }
 criterion.workspace = true
+proptest.workspace = true
 tempfile.workspace = true
 
 [[bench]]

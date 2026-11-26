@@ -5,6 +5,7 @@
 //! [`ProxyError`] mapped to a clean 4xx/5xx; nothing on this path unwraps.
 
 use crate::body::{BodyFault, Fault, IdleBody, LimitBody};
+use crate::compress;
 use crate::error::{full, simple_response, ProxyBody, ProxyError};
 use crate::io::{Activity, InflightGuard, REJECT_PATH};
 use crate::lb::{self, PickCtx};
@@ -12,8 +13,8 @@ use crate::shutdown::Shutdown;
 use crate::upstream::UpstreamClients;
 use arc_swap::ArcSwap;
 use bytes::Bytes;
-use http::header::{ALT_SVC, CONNECTION, CONTENT_LENGTH, HOST, LOCATION, UPGRADE};
-use http::uri::PathAndQuery;
+use http::header::{ACCEPT_ENCODING, ALT_SVC, CONNECTION, CONTENT_LENGTH, HOST, LOCATION, UPGRADE};
+use http::uri::{PathAndQuery, Scheme};
 use http::{HeaderMap, HeaderValue, Method, Request, Response, StatusCode, Uri, Version};
 use http_body::Body;
 use http_body_util::BodyExt;
@@ -23,11 +24,11 @@ use std::sync::atomic::{AtomicU16, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 use tracing::Instrument;
-use velox_core::config::{Algorithm, Config};
+use velox_core::config::{Algorithm, CompressionConfig, Config};
 use velox_core::router::Route;
 use velox_core::sanitize::{
-    apply_forwarded_headers_hv, host_without_port, is_websocket_upgrade, request_id_from, resolve_client_ip,
-    strip_hop_by_hop, validate_request_headers, Violation, X_REQUEST_ID,
+    apply_forwarded_headers_hv, host_without_port, is_https_via_trusted_proxy, is_websocket_upgrade, request_id_from,
+    resolve_client_ip, strip_hop_by_hop, validate_request_headers, Violation, X_REQUEST_ID,
 };
 use velox_core::upstream::ActiveGuard;
 use velox_core::{Snapshot, UpstreamGroup};
@@ -78,6 +79,34 @@ struct Trace<'s> {
     backend: Option<&'s str>,
     client_ip: Option<IpAddr>,
     error: Option<String>,
+}
+
+/// What response compression needs to know about the request.
+struct CompressCtx<'a> {
+    cfg: &'a CompressionConfig,
+    accept: Option<HeaderValue>,
+    head: bool,
+}
+
+/// Per-request context `finish_response` needs from the request side.
+struct ResponseCtx<'a> {
+    /// The request was a WebSocket upgrade.
+    ws: bool,
+    client_upgrade: Option<hyper::upgrade::OnUpgrade>,
+    compress: Option<CompressCtx<'a>>,
+}
+
+/// The request's `Accept-Encoding` as one value (several header lines are joined).
+fn accept_encoding(h: &HeaderMap) -> Option<HeaderValue> {
+    let mut lines = h.get_all(ACCEPT_ENCODING).iter();
+    let first = lines.next()?;
+    let Some(second) = lines.next() else { return Some(first.clone()) };
+    let mut joined = Vec::from(first.as_bytes());
+    for v in std::iter::once(second).chain(lines) {
+        joined.extend_from_slice(b", ");
+        joined.extend_from_slice(v.as_bytes());
+    }
+    HeaderValue::from_bytes(&joined).ok()
 }
 
 enum ReqBody {
@@ -135,11 +164,11 @@ impl Proxy {
         let generation = state.load().generation;
         Arc::new(Self {
             state,
+            clients: UpstreamClients::new(Arc::clone(&metrics)),
             metrics,
             limiters: RateLimiters::new(),
             conn_limiter: ConnectionLimiter::new(),
             challenges,
-            clients: UpstreamClients::default(),
             derived: ArcSwap::from_pointee((generation, derived)),
             bound_https: AtomicU16::new(0),
             bound_h3: AtomicU16::new(0),
@@ -190,7 +219,7 @@ impl Proxy {
                 .iter()
                 .map(String::as_str),
         );
-        self.clients.retain(snap.upstreams.keys().map(String::as_str));
+        self.clients.retain(snap.upstreams.values().map(|g| &**g));
     }
 
     fn derived(&self, snap: &Snapshot) -> Arc<Derived> {
@@ -336,7 +365,12 @@ impl Proxy {
         trace.route = Some(&route.id);
         trace.upstream = Some(&group.name);
 
-        if route.redirect_https && !conn.tls {
+        // A TLS-terminating load balancer in front of us has already done the
+        // upgrade: redirecting its plain-HTTP hop again would loop forever.
+        if route.redirect_https
+            && !conn.tls
+            && !is_https_via_trusted_proxy(req.headers(), conn.peer.ip(), &cfg.security.trusted_proxies)
+        {
             return redirect_to_https(route.canonical_host.as_deref().unwrap_or(host), derived.https_port, req.uri());
         }
 
@@ -361,6 +395,11 @@ impl Proxy {
         let client_upgrade = ws.then(|| hyper::upgrade::on(&mut req));
         let ws_proto = ws.then(|| req.headers().get(UPGRADE).cloned()).flatten();
         let (mut parts, body) = req.into_parts();
+        let compress = route.compress.unwrap_or(cfg.compression.enabled).then(|| CompressCtx {
+            cfg: &cfg.compression,
+            accept: accept_encoding(&parts.headers),
+            head: parts.method == Method::HEAD,
+        });
 
         let idle = cfg.timeouts.request_body_idle;
         let known_empty = body.is_end_stream() || body.size_hint().exact() == Some(0);
@@ -446,20 +485,34 @@ impl Proxy {
         let deadline = tokio::time::Instant::now() + response_timeout;
         let max_attempts = 1 + if replayable { retries } else { 0 };
         let idempotent = is_idempotent(&parts.method);
-        let client = self.clients.get(group, cfg.timeouts.upstream_connect, cfg.server.tcp_nodelay);
+        let client = self
+            .clients
+            .get(group, cfg.timeouts.upstream_connect, cfg.server.tcp_nodelay)
+            .map_err(|e| ProxyError::BadGateway(format!("upstream TLS configuration: {e}")))?;
         let mut ctx = PickCtx { hash, exclude: 0 };
         let mut last_err: Option<ProxyError> = None;
+        let mut saturated = false;
         let (mut method, mut pq, mut hdrs) = (Some(parts.method), Some(path_and_query), Some(headers));
         for attempt in 0..max_attempts {
             if attempt > 0 && tokio::time::Instant::now() >= deadline {
                 last_err = Some(ProxyError::UpstreamTimeout);
                 break;
             }
-            let Some(idx) = lb::pick(group, &ctx) else { break };
-            ctx.exclude(idx);
+            // Choose a backend and commit to it atomically against its
+            // `max_inflight` cap. `pick` already skips backends that look full;
+            // `try_track` catches the race where another request took the last
+            // slot in between, and we simply move on to the next candidate.
+            let admitted = loop {
+                let Some(idx) = lb::pick(group, &ctx) else { break None };
+                ctx.exclude(idx);
+                match group.backends[idx].try_track() {
+                    Some(active) => break Some((idx, active)),
+                    None => saturated = true,
+                }
+            };
+            let Some((idx, active)) = admitted else { break };
             let backend = &group.backends[idx];
             trace.backend = Some(&backend.name);
-            let active = backend.track();
 
             // Clone request parts only when a retry is actually possible;
             // otherwise they are moved (the single-attempt fast path).
@@ -477,7 +530,7 @@ impl Proxy {
                 ReqBody::Stream(slot) => slot.take().unwrap_or(ProxyBody::Empty),
             };
             let uri = Uri::builder()
-                .scheme("http")
+                .scheme(if backend.tls { Scheme::HTTPS } else { Scheme::HTTP })
                 .authority(backend.authority.clone())
                 .path_and_query(p)
                 .build()
@@ -498,7 +551,13 @@ impl Proxy {
                     if record_outcome(group, backend, Outcome::Response { status }) {
                         self.metrics.backend_ejected(&group.name, &backend.name);
                     }
-                    return self.finish_response(resp, active, inflight.take(), ws, client_upgrade, cfg);
+                    return self.finish_response(
+                        resp,
+                        active,
+                        inflight.take(),
+                        ResponseCtx { ws, client_upgrade, compress },
+                        cfg,
+                    );
                 }
                 Ok(Err(e)) => {
                     if matches!(
@@ -522,7 +581,16 @@ impl Proxy {
                 break;
             }
         }
-        Err(last_err.unwrap_or(ProxyError::NoHealthyUpstream))
+        Err(last_err.unwrap_or_else(|| {
+            // No backend was usable at all. Distinguish "all full" (shed load,
+            // the pool is fine) from "all down" (an outage).
+            if saturated || group.any_saturated() {
+                self.metrics.upstream_saturated(&group.name);
+                ProxyError::UpstreamSaturated
+            } else {
+                ProxyError::NoHealthyUpstream
+            }
+        }))
     }
 
     fn finish_response(
@@ -530,10 +598,10 @@ impl Proxy {
         mut resp: Response<hyper::body::Incoming>,
         active: ActiveGuard,
         inflight: Option<InflightGuard>,
-        ws: bool,
-        client_upgrade: Option<hyper::upgrade::OnUpgrade>,
+        ctx: ResponseCtx<'_>,
         cfg: &Config,
     ) -> Result<Response<ProxyBody>, ProxyError> {
+        let ResponseCtx { ws, client_upgrade, compress } = ctx;
         if resp.status() == StatusCode::SWITCHING_PROTOCOLS {
             let accepted = ws
                 && resp
@@ -578,9 +646,18 @@ impl Proxy {
             // connection, so it must not be reused for further requests.
             parts.headers.insert(CONNECTION, HeaderValue::from_static("close"));
         }
+        // A body that is already complete (`Content-Length: 0`, `HEAD`, …) has
+        // nothing to compress.
+        let ended = body.is_end_stream();
         // One wrapper, one box: idle timeout + both in-flight guards.
         let body = IdleBody::with_guard(body, cfg.timeouts.upstream_body_idle, None, (active, inflight));
-        Ok(Response::from_parts(parts, ProxyBody::boxed(body)))
+        let mut body = ProxyBody::boxed(body);
+        if let Some(c) = compress.as_ref().filter(|c| !ended || c.head) {
+            if let Some(algo) = compress::plan(c.cfg, c.accept.as_ref(), c.head, parts.status, &mut parts.headers) {
+                body = compress::wrap(body, algo, c.cfg.level, Arc::clone(&self.metrics));
+            }
+        }
+        Ok(Response::from_parts(parts, body))
     }
 }
 

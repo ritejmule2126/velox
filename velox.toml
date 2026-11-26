@@ -33,6 +33,18 @@ tcp_nodelay    = true
 backlog        = 1024
 drain_timeout  = "30s"      # SIGTERM/SIGINT: wait this long for in-flight requests
 
+# Behind an L4 load balancer (AWS NLB, HAProxy `send-proxy-v2`, ...): read the
+# PROXY protocol v1/v2 header it prepends to every connection, so logs, rate
+# limits, connection limits and X-Forwarded-* see the real client instead of the
+# load balancer. Applies to http_addr, https_addr and [[tcp_proxy]] with
+# `proxy_protocol = true`; HTTP/3 (UDP) cannot carry it. Needs a restart.
+#
+# Only `proxy_protocol_trusted` peers may send a header: anyone else is refused
+# before a byte is read, so a client can never forge its own address. The header
+# is mandatory on such a listener - plain HTTP/TLS without it is dropped.
+# proxy_protocol         = true
+# proxy_protocol_trusted = ["10.0.0.0/8"]     # your load balancer's addresses (required)
+
 # -----------------------------------------------------------------------------
 # DoS hardening: hard bounds on every dimension of a request
 # -----------------------------------------------------------------------------
@@ -130,21 +142,57 @@ access_log  = true          # one line per request with request_id, status, late
 # metrics_addr = "0.0.0.0:9100"
 
 # -----------------------------------------------------------------------------
+# Response compression (opt-in)
+# -----------------------------------------------------------------------------
+# Streams zstd / brotli / gzip according to Accept-Encoding (q-values honoured,
+# `algorithms` order breaks ties). Adds `Vary: Accept-Encoding`, drops
+# Content-Length, weakens strong ETags. Never touches: responses that are
+# already encoded, bodies under `min_size`, types not in `content_types`,
+# text/event-stream, gRPC, `Cache-Control: no-transform`, 206/204/304, HEAD.
+# Output is flushed whenever the upstream pauses, so streamed responses are not
+# held back. Per-route override: `compress = true|false`.
+[compression]
+enabled      = false
+# algorithms = ["zstd", "br", "gzip"]
+# min_size   = 1024                  # bytes; only when Content-Length is known
+# level      = "default"             # "fast" | "default" | "best"
+# content_types = ["text/*", "application/json", "application/*+json", "application/javascript",
+#                  "application/xml", "application/*+xml", "application/wasm", "application/x-ndjson",
+#                  "image/svg+xml"]
+
+# -----------------------------------------------------------------------------
 # Upstreams
 # -----------------------------------------------------------------------------
 [[upstream]]
 name      = "app"
 # round_robin | least_conn | p2c (power of two choices) | consistent_hash
 algorithm = "p2c"
-# protocol: "http1" (default) or "h2c" (HTTP/2 prior knowledge, multiplexed)
+# protocol: "http1" (default); "h2c" (HTTP/2 prior knowledge, cleartext);
+#           "h2" (HTTP/2 everywhere: prior knowledge on http://, ALPN on https://)
 protocol  = "http1"
 retries   = 1               # extra attempts on *another* backend (connect failures; idempotent requests on timeouts)
+# Circuit breaker: at most this many in-flight requests per backend. A full
+# backend is skipped by the balancer; if every backend is full the client gets
+# an immediate 503 + Retry-After (no queueing, no cascading overload).
+# A backend can override it: { addr = "...", max_inflight = 50 }
+# max_inflight = 200
 # hash_on = "ip"            # for consistent_hash: "ip", "path" or "header:x-user-id"
 backends = [
   { addr = "127.0.0.1:3000", weight = 1 },
   { addr = "127.0.0.1:3001", weight = 1 },
   # { addr = "unix:/run/app/web.sock" },   # Unix domain sockets work too
+  # { addr = "https://app.internal:8443" },  # TLS to the backend (default port 443)
 ]
+
+# TLS to `https://` backends (zero-trust / multi-cloud / Kubernetes). Optional:
+# the defaults verify against the bundled Mozilla roots and send SNI = backend host.
+# [upstream.tls]
+# server_name = "app.internal"             # SNI + certificate name (default: the backend's host)
+# ca_file     = "/etc/velox/backend-ca.pem" # trust ONLY this CA bundle (private PKI)
+# client_cert_file = "/etc/velox/client.crt"  # mTLS: identity presented to the backend
+# client_key_file  = "/etc/velox/client.key"
+# reload_interval  = "5s"                  # files are re-checked; rotation needs no reload
+# insecure_skip_verify = false             # DANGEROUS: accept any certificate
 
 # Active health checks: probes with jitter and hysteresis.
 [upstream.health]
@@ -182,6 +230,10 @@ upstream      = "app"
 # redirect_https = false            # answer plain-HTTP requests with a 308 to https
 #                                   # (needs `hosts`, or `canonical_host`, so arbitrary Host headers are never reflected)
 # canonical_host = "example.com"    # fixed redirect target host
+#                                   # (a request a *trusted proxy* already received over https - X-Forwarded-Proto
+#                                   #  or Forwarded: proto=https - is never redirected, so TLS-terminating load
+#                                   #  balancers cannot cause a redirect loop)
+# compress       = true             # override [compression].enabled for this route
 # timeout        = "10s"            # override timeouts.upstream_response
 # request_headers = { "x-env" = "prod" }
 # rate_limit = { requests_per_second = 20.0, burst = 40, key = "header:x-api-key" }
@@ -194,3 +246,4 @@ upstream      = "app"
 # listen       = "0.0.0.0:5433"
 # upstream     = "postgres"
 # idle_timeout = "10m"
+# proxy_protocol = true            # expect a PROXY header (see [server].proxy_protocol_trusted)

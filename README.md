@@ -160,7 +160,8 @@ Smuggling needs two parties to disagree about where a request ends. Velox remove
 * **Strict `Host` labels.** Labels are RFC 1123 (`[A-Za-z0-9-]`, no leading/trailing hyphen); `_` is rejected unless you set `security.allow_underscores_in_host = true` (useful for container service names; it relaxes *only* `_`). The switch applies to the HTTP/1 wire guard, the HTTP/2/3 typed check and route/SNI host patterns.
 * **No open redirects.** `redirect_https` on a catch-all route (`hosts = []`) would reflect whatever `Host` the client sent into `Location`, so validation **refuses** that configuration unless the route sets `canonical_host`. A request with no host at all (HTTP/1.0) gets a `400` rather than a redirect, and `OPTIONS *` redirects to `/`.
 * **One deadline for all retry attempts.** Failover attempts share a single `upstream_response` (or per-route `timeout`) budget, so `retries = 2` can no longer triple the worst-case latency. The trade-off is deliberate: an attempt that burns the whole budget on a *hung* backend ends the request with `504` instead of trying another node; connect failures (the common failover case) are still retried immediately, and hung backends are removed from rotation by outlier detection and health checks.
-* **HTTP/3 bodies.** The body is pumped on its own task, so routing and `413`/`429` decisions never wait for the first frame. `Content-Length` is enforced against the bytes that actually arrive (too many *or* too few ⇒ `400`, never a silent truncation), trailers — including trailers-only requests — are forwarded, and a stalled body gets a real `408`. (An HTTP/3 request whose *headers* never arrive has no stream to answer on, so it is reset.)
+* **No redirect loops behind a TLS-terminating load balancer.** When a request arrives on the plain listener from a peer in `security.trusted_proxies` that says the client used HTTPS (`X-Forwarded-Proto: https`, or `Forwarded: …;proto=https`; for a comma list the client-most entry counts), `redirect_https` does **not** redirect — otherwise the load balancer would follow the `308` straight back to the same plain hop forever. The claim is honoured only from trusted peers, so an ordinary client cannot use the header to skip the redirect; the upstream sees the normalised `X-Forwarded-Proto: https`.
+* **HTTP/3 bodies.** `Content-Length: 0` spawns no body task at all (nothing lingers on the stream), and a `GET`/`HEAD`/`DELETE`/`OPTIONS` without a length gets a non-blocking look at whether its stream already ended instead of a timed wait; `POST`/`PUT`/`PATCH` streams are forwarded immediately. Otherwise the body is pumped on its own task, so routing and `413`/`429` decisions never wait for the first frame. `Content-Length` is enforced against the bytes that actually arrive (too many *or* too few ⇒ `400`, never a silent truncation), trailers — including trailers-only requests — are forwarded, and a stalled body gets a real `408`. (An HTTP/3 request whose *headers* never arrive has no stream to answer on, so it is reset.)
 
 ### Denial of service
 
@@ -192,7 +193,56 @@ upstream = "app"
 rate_limit = { requests_per_second = 20.0, burst = 40, key = "header:x-api-key" }
 ```
 
-**What reloads live?** Routes, upstreams (including backend sets/weights/algorithms), health and outlier settings, rate limits, limits and timeouts for *new* connections/requests, response headers, trusted proxies, TLS certificates. **What needs a restart?** Listener addresses (`http_addr`, `https_addr`, `h3`, `h3_addr`, `[[tcp_proxy]]` listeners). A reload that changes them applies everything else and logs a warning.
+### HTTPS and mTLS to backends
+
+An `https://host[:port]` backend address (default port 443) makes Velox originate TLS (`rustls`, TLS 1.2/1.3):
+
+```toml
+[[upstream]]
+name     = "payments"
+protocol = "h2"                        # ALPN h2 over TLS (or "http1" for http/1.1)
+backends = [{ addr = "https://payments.internal:8443" }, { addr = "https://10.1.0.7:8443" }]
+max_inflight = 100
+[upstream.tls]
+ca_file          = "/etc/velox/internal-ca.pem"   # trust only your private CA
+client_cert_file = "/etc/velox/client.crt"        # mTLS identity
+client_key_file  = "/etc/velox/client.key"
+server_name      = "payments.internal"            # SNI + name checked (default: the backend host)
+```
+
+* **Verified by default**: public web PKI (bundled Mozilla roots) unless `ca_file` is given, in which case *only* that bundle is trusted. Names are checked against DNS or IP SANs; a mismatch is a `502` and counts in `velox_upstream_tls_errors_total`. `insecure_skip_verify = true` exists for lab use and is off unless you ask for it.
+* **Rotation without a reload**: `ca_file` and the client certificate/key are re-checked every `reload_interval` (default 5 s). New connections use the new identity; a half-written rotation keeps the last good configuration instead of taking traffic down.
+* One pool may mix `https://`, `host:port` and `unix:` backends. Active health checks complete the TLS handshake first (a `tcp` check on an `https://` backend therefore proves the TLS service is up, not only the port). HTTP probes speak HTTP/1.1; for an HTTP/2-only TLS backend use `kind = "tcp"`.
+* `[[tcp_proxy]]` relays bytes and does not originate TLS, so its upstreams cannot contain `https://` backends (rejected at validation).
+
+### Per-backend circuit breaker (`max_inflight`)
+
+`max_inflight` on an upstream (default for every backend) or on a single backend caps its concurrent requests. The cap is enforced with one atomic compare-and-swap, so concurrent requests can never overshoot it. A full backend is skipped by every algorithm (round-robin, least-conn, P2C, consistent-hash walk to the next ring owner); when **all** eligible backends are full the client gets an immediate `503` with `Retry-After: 1` and `velox_upstream_saturated_total` counts it. An outage ("nothing healthy") is reported separately as `no healthy upstream`, so alerts can tell overload from failure. Caps apply on reload to backends that keep their runtime state; the admin API shows `max_inflight` and `saturated` per backend.
+
+### PROXY protocol (v1 and v2)
+
+```toml
+[server]
+http_addr  = "0.0.0.0:80"
+https_addr = "0.0.0.0:443"
+proxy_protocol         = true
+proxy_protocol_trusted = ["10.0.0.0/8"]      # the NLB / HAProxy addresses; required
+```
+
+The header is read **before** TLS or HTTP, consuming exactly its bytes (a `ClientHello` in the same segment is untouched). The client address it carries replaces the TCP peer everywhere: access logs, rate limiting, per-IP connection limits (the load balancer's own address is only subject to the global cap while the header is pending), `X-Forwarded-For`/`X-Real-IP`. Safety properties: peers outside `proxy_protocol_trusted` are refused immediately; the header is mandatory (unframed HTTP/TLS is dropped, never interpreted); v1 is capped at 107 bytes and v2 at 1 KiB of payload; the whole read is bounded by `timeouts.header_read`; v2 `LOCAL` and v1 `UNKNOWN` (load-balancer health probes) fall back to the TCP peer; v2 TLVs are skipped. Because the real client is *not* itself a trusted proxy, its own `X-Forwarded-*` headers are discarded as usual. Counted in `velox_proxy_protocol_errors_total{reason}`. `[[tcp_proxy]]` listeners take `proxy_protocol = true` too (the header is consumed, not forwarded). HTTP/3 runs on UDP, which PROXY protocol does not cover. Changing it requires a restart.
+
+### Response compression
+
+```toml
+[compression]
+enabled = true            # opt-in; per-route override with `compress = true|false`
+algorithms = ["zstd", "br", "gzip"]
+min_size = 1024
+```
+
+`Accept-Encoding` is negotiated per RFC 9110 (`q` values, `*`, `identity`; your `algorithms` order breaks ties). Responses are compressed **as a stream** in 32 KiB slices: memory per response is bounded, and the encoder is flushed whenever the upstream pauses (and every 256 KiB regardless), so NDJSON/long-poll style bodies are not held back. The response gets `Content-Encoding`, `Vary: Accept-Encoding` (also on responses that *could* have been compressed but went out identity, so shared caches stay correct), no `Content-Length`, a weak `ETag`, and no `Accept-Ranges`. Skipped — and left byte-for-byte untouched — for already-encoded bodies (never double-compressed), bodies smaller than `min_size`, types outside `content_types`, `text/event-stream`, `application/grpc*`, `Cache-Control: no-transform`, `206`/`Content-Range`, `1xx`/`204`/`304`, and `HEAD` (which only gets `Vary`). Works identically over HTTP/1.1, HTTP/2 and HTTP/3; `velox_compression_responses_total` and `velox_compression_bytes_total{direction}` report the savings. gzip and brotli are pure Rust; zstd uses `libzstd` through the `zstd` crate (the one C dependency besides `ring`). Each in-flight compressed response holds a live encoder whose size depends on the algorithm and level (the zstd and brotli windows are the largest; brotli's is capped at 1 MiB), so on small instances serving very many concurrent large responses prefer `level = "fast"` or drop `br`/`zstd` from `algorithms`. Measure with your own traffic before enabling it broadly.
+
+**What reloads live?** Routes, upstreams (including backend sets/weights/algorithms), health and outlier settings, rate limits, limits and timeouts for *new* connections/requests, response headers, trusted proxies, TLS certificates. **What needs a restart?** Listener addresses and PROXY-protocol listener settings (`http_addr`, `https_addr`, `h3`, `h3_addr`, `server.proxy_protocol`, `[[tcp_proxy]]` listeners and their `proxy_protocol`). A reload that changes them applies everything else and logs a warning.
 
 Backends that are unchanged across a reload keep their runtime state (health, drain flag, in-flight counters, ejection history) — a reload never "forgets" a drained or ejected node.
 
@@ -291,7 +341,9 @@ cargo fmt --all -- --check
 | **Unit** (others) | Load-balancer distribution (exact weighted RR, least-conn, P2C bias, hash minimal-disruption); GCRA bucket maths incl. 8-thread contention; connection limits; TLS SNI/reload; outlier back-off; probes; `ConnIo` timers (paused-time tests). |
 | **Data plane** (`velox-proxy/tests`) | Real sockets: header rewriting, every attack in the smuggling list vs. a backend hit-counter (**must stay 0**), round-robin and failover, outlier ejection, 429, body limits, WebSocket tunnel, graceful drain, Slowloris, idle reaping, per-IP limits, Unix-socket upstream, 504. |
 | **End-to-end** (`velox-cli/tests`) | **HTTP/1.1, HTTP/2 and HTTP/3** with real TLS/QUIC clients (incl. 100 KB uploads, 50 multiplexed streams, `Alt-Svc`, protocol metrics, cert hot-reload); failover + active-health recovery; passive ejection + admin reset; **zero-failure reconfiguration under load** (8 keep-alive connections across API edits, file reload and a rejected bad reload, with an in-flight request straddling the cut-over); consistent-hash pinning + drain; L4 proxy; and the **real `velox` binary** under `SIGTERM` (in-flight request completes, exit 0), `SIGINT`, `SIGHUP`, `velox reload`, `velox validate`. |
-| **Fuzz targets** (`fuzz/`) | `cargo-fuzz` targets for the request head, the guard stream, chunked framing and typed headers, with a smuggling seed corpus in `fuzz/seeds/`. CI runs them weekly for 3 minutes each on nightly. |
+| **Backend TLS / mTLS** (`velox-cli/tests/e2e_upstream_tls.rs`) | A real TLS backend: custom-CA verification, SNI and name mismatch, untrusted certificate ⇒ `502` with no request sent, `insecure_skip_verify`, mTLS (anonymous client refused, identity seen by the backend), **live certificate rotation** and a broken rotation, ALPN `h2` vs `http/1.1`, mixed TLS/cleartext pools, TLS health probes flipping a backend down and up. |
+| **Circuit breaker, PROXY protocol, compression** (`velox-proxy`) | `max_inflight`: exact cap under 16-thread contention, every balancer skips full backends, `503` fast-shed vs. outage; PROXY v1/v2: parser unit + property tests (every prefix is `Incomplete`), exact-consumption on real sockets, trust list, mandatory header, per-real-client limits, TLS and L4 behind it; compression: negotiation matrix, eligibility matrix, round-trips for each codec/level/frame shape, streaming flush latency, pass-through cases, and h1/h2/h3. |
+| **Fuzz targets** (`fuzz/`) | `cargo-fuzz` targets for the request head, the guard stream, chunked framing, typed headers, the PROXY protocol parser and `Accept-Encoding` negotiation, with a smuggling seed corpus in `fuzz/seeds/`. CI runs them weekly for 3 minutes each on nightly. |
 
 Run coverage-guided fuzzing locally:
 
@@ -340,7 +392,9 @@ Why: a sampling profile of the proxy under this load shows ~84 % of samples are 
 ## Known limitations
 
 * **Listener addresses need a restart**; everything else reloads live (see above).
-* **No TLS to upstreams** (by design of the brief: pooled h1/h2c over TCP/Unix). Terminate TLS at the backend's sidecar or use a private network.
+* **Upstream TLS** covers client-auth and custom CAs but not certificate pinning, OCSP stapling checks or CRLs; `[[tcp_proxy]]` does not originate TLS.
+* **Compression** buffers at most one encoder window per response, but it does cost CPU on the worker threads that also serve traffic; there is no separate compression pool and no pre-compressed (`.gz`/`.br`) file serving, as Velox serves no files.
+* **PROXY protocol** is inbound only (Velox does not add one towards backends) and not available for HTTP/3.
 * **DNS names** in `backends` are resolved by the OS resolver on each *new* upstream connection; there is no background DNS refresh or SRV discovery. IP literals and Unix sockets are the fast path.
 * **HTTP/2 upstream uses `:authority` = backend address** (the original host travels in `X-Forwarded-Host`); HTTP/1 upstreams receive the original `Host`.
 * **HTTP/2 over cleartext (h2c) on the client side** is not served — HTTP/2 is negotiated via ALPN on the TLS listener.

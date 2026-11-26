@@ -14,8 +14,9 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpStream, UnixStream};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
-use velox_core::config::{BackendAddr, HealthConfig, HealthKind};
+use velox_core::config::{BackendAddr, HealthConfig, HealthKind, UpstreamTlsConfig};
 use velox_core::{Backend, SharedState};
+use velox_security::upstream_tls::{server_name, UpstreamTlsRegistry};
 
 /// Why a probe failed.
 #[derive(Debug, thiserror::Error)]
@@ -32,6 +33,18 @@ pub enum ProbeError {
     /// Status outside the accepted range.
     #[error("unexpected status {0}")]
     Status(u16),
+    /// The TLS configuration for an `https://` backend is unusable.
+    #[error("TLS configuration: {0}")]
+    TlsConfig(String),
+}
+
+/// TLS settings for probing an `https://` backend.
+#[derive(Debug, Clone)]
+pub struct TlsProbe {
+    /// The client configuration (trust roots, optional client certificate, ALPN).
+    pub config: Arc<rustls::ClientConfig>,
+    /// The upstream's `tls` table (for the SNI / verification name override).
+    pub settings: Option<UpstreamTlsConfig>,
 }
 
 /// Supervises background probe tasks.
@@ -39,6 +52,7 @@ pub enum ProbeError {
 pub struct HealthChecker {
     state: Arc<SharedState>,
     cancel: CancellationToken,
+    tls: Arc<UpstreamTlsRegistry>,
 }
 
 type TaskKey = (String, String);
@@ -46,7 +60,7 @@ type TaskKey = (String, String);
 impl HealthChecker {
     /// Create a checker over `state`; tasks stop when `cancel` fires.
     pub fn new(state: Arc<SharedState>, cancel: CancellationToken) -> Self {
-        Self { state, cancel }
+        Self { state, cancel, tls: Arc::new(UpstreamTlsRegistry::new()) }
     }
 
     /// Spawn the supervisor on the current runtime.
@@ -85,8 +99,13 @@ impl HealthChecker {
                     continue;
                 }
                 let weak = Arc::downgrade(&backend);
-                let handle =
-                    tokio::spawn(probe_loop(Arc::clone(&self.state), key.0.clone(), backend, self.cancel.clone()));
+                let handle = tokio::spawn(probe_loop(
+                    Arc::clone(&self.state),
+                    key.0.clone(),
+                    backend,
+                    self.cancel.clone(),
+                    Arc::clone(&self.tls),
+                ));
                 tasks.insert(key, (weak, handle));
             }
         }
@@ -96,7 +115,13 @@ impl HealthChecker {
     }
 }
 
-async fn probe_loop(state: Arc<SharedState>, upstream: String, backend: Arc<Backend>, cancel: CancellationToken) {
+async fn probe_loop(
+    state: Arc<SharedState>,
+    upstream: String,
+    backend: Arc<Backend>,
+    cancel: CancellationToken,
+    tls: Arc<UpstreamTlsRegistry>,
+) {
     let mut ok_streak = 0u32;
     let mut fail_streak = 0u32;
     loop {
@@ -107,9 +132,22 @@ async fn probe_loop(state: Arc<SharedState>, upstream: String, backend: Arc<Back
         if !group.backends.iter().any(|b| Arc::ptr_eq(b, &backend)) {
             return;
         }
+        let tls_settings = group.config.tls.clone();
+        let h2 = group.config.protocol.is_h2();
         drop(snap);
 
-        let result = probe(&backend.addr, &cfg).await;
+        // Resolved every cycle so rotated CA / client certificates apply.
+        let tls_probe: Result<Option<TlsProbe>, ProbeError> = match &backend.addr {
+            BackendAddr::Tls { .. } => tls
+                .client_config(tls_settings.as_ref(), h2)
+                .map(|config| Some(TlsProbe { config, settings: tls_settings }))
+                .map_err(|e| ProbeError::TlsConfig(e.to_string())),
+            _ => Ok(None),
+        };
+        let result = match tls_probe {
+            Ok(t) => probe_with(&backend.addr, &cfg, t.as_ref()).await,
+            Err(e) => Err(e),
+        };
         match &result {
             Ok(()) => {
                 ok_streak += 1;
@@ -147,15 +185,34 @@ pub fn jittered(interval: Duration, jitter: f64) -> Duration {
     interval.mul_f64(factor.max(0.0))
 }
 
-/// Run a single probe against `addr` according to `cfg`.
+/// Run a single probe against a cleartext or Unix-socket `addr`.
+///
+/// `https://` backends need [`probe_with`] and a [`TlsProbe`].
 pub async fn probe(addr: &BackendAddr, cfg: &HealthConfig) -> Result<(), ProbeError> {
-    tokio::time::timeout(cfg.timeout, probe_inner(addr, cfg)).await.map_err(|_| ProbeError::Timeout)?
+    probe_with(addr, cfg, None).await
 }
 
-async fn probe_inner(addr: &BackendAddr, cfg: &HealthConfig) -> Result<(), ProbeError> {
+/// Run a single probe against `addr`, completing a TLS handshake first when
+/// `addr` is `https://` (a `tcp` probe then proves the TLS service is up, not
+/// merely that the port accepts connections).
+pub async fn probe_with(addr: &BackendAddr, cfg: &HealthConfig, tls: Option<&TlsProbe>) -> Result<(), ProbeError> {
+    tokio::time::timeout(cfg.timeout, probe_inner(addr, cfg, tls)).await.map_err(|_| ProbeError::Timeout)?
+}
+
+async fn probe_inner(addr: &BackendAddr, cfg: &HealthConfig, tls: Option<&TlsProbe>) -> Result<(), ProbeError> {
     match addr {
         BackendAddr::Tcp { host, port } => {
             let stream = TcpStream::connect((BackendAddr::connect_host(host), *port)).await?;
+            match cfg.kind {
+                HealthKind::Tcp => Ok(()),
+                HealthKind::Http => http_probe(stream, cfg).await,
+            }
+        }
+        BackendAddr::Tls { host, port } => {
+            let tls = tls.ok_or_else(|| ProbeError::TlsConfig("no TLS configuration supplied".into()))?;
+            let stream = TcpStream::connect((BackendAddr::connect_host(host), *port)).await?;
+            let name = server_name(tls.settings.as_ref(), host).map_err(|e| ProbeError::TlsConfig(e.to_string()))?;
+            let stream = tokio_rustls::TlsConnector::from(Arc::clone(&tls.config)).connect(name, stream).await?;
             match cfg.kind {
                 HealthKind::Tcp => Ok(()),
                 HealthKind::Http => http_probe(stream, cfg).await,

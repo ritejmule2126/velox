@@ -2,6 +2,7 @@
 
 use crate::handler::Proxy;
 use crate::lb::{self, PickCtx};
+use crate::proxy_protocol;
 use crate::socket;
 use crate::upstream::connect_backend;
 use pin_project_lite::pin_project;
@@ -73,6 +74,44 @@ pub async fn run(cfg: TcpProxyConfig, listener: TcpListener, proxy: Arc<Proxy>) 
         };
         let snap = proxy.state().load();
         let limits = &snap.config.limits;
+        if cfg.proxy_protocol {
+            if !proxy_protocol::is_trusted(peer.ip(), &snap.config.server.proxy_protocol_trusted) {
+                proxy.metrics().proxy_protocol_error("untrusted_peer");
+                continue;
+            }
+            let Ok(pending) = proxy.conn_limiter().try_acquire(peer.ip(), limits.max_connections, 0) else {
+                proxy.metrics().connection_rejected();
+                continue;
+            };
+            socket::tune_accepted(&client, snap.config.server.tcp_nodelay);
+            let header_timeout = snap.config.timeouts.header_read;
+            drop(snap);
+            let (proxy, cfg) = (Arc::clone(&proxy), cfg.clone());
+            sd.tasks.spawn(async move {
+                let mut client = client;
+                let real = match proxy_protocol::read_header(&mut client, header_timeout).await {
+                    Ok(h) => h.client.unwrap_or(peer),
+                    Err(e) => {
+                        tracing::debug!(%peer, error = %e, "PROXY header rejected");
+                        proxy.metrics().proxy_protocol_error(e.reason());
+                        return;
+                    }
+                };
+                drop(pending);
+                let snap = proxy.state().load();
+                let limits = &snap.config.limits;
+                let Ok(permit) =
+                    proxy.conn_limiter().try_acquire(real.ip(), limits.max_connections, limits.max_connections_per_ip)
+                else {
+                    proxy.metrics().connection_rejected();
+                    return;
+                };
+                drop(snap);
+                let _permit = permit;
+                forward(client, real, &cfg, &proxy).await;
+            });
+            continue;
+        }
         let Ok(permit) =
             proxy.conn_limiter().try_acquire(peer.ip(), limits.max_connections, limits.max_connections_per_ip)
         else {

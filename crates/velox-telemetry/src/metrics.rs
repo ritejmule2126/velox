@@ -63,6 +63,11 @@ pub struct Metrics {
     config_generation: IntGauge,
     h3_enabled: IntGauge,
     connections_rejected: IntCounter,
+    upstream_saturated: IntCounterVec,
+    upstream_tls_errors: IntCounterVec,
+    proxy_protocol_errors: IntCounterVec,
+    compression_responses: IntCounterVec,
+    compression_bytes: IntCounterVec,
 }
 
 /// Status codes 100..=599 get a cached counter slot.
@@ -172,6 +177,36 @@ impl Metrics {
                 "Passive ejections",
                 &["upstream", "backend"],
             )?,
+            upstream_saturated: counter(
+                &r,
+                "upstream_saturated_total",
+                "Requests refused (503) because every eligible backend was at its max_inflight cap",
+                &["upstream"],
+            )?,
+            upstream_tls_errors: counter(
+                &r,
+                "upstream_tls_errors_total",
+                "Failed TLS handshakes to https:// backends",
+                &["upstream", "reason"],
+            )?,
+            proxy_protocol_errors: counter(
+                &r,
+                "proxy_protocol_errors_total",
+                "Connections refused on a PROXY-protocol listener",
+                &["reason"],
+            )?,
+            compression_responses: counter(
+                &r,
+                "compression_responses_total",
+                "Responses compressed, by content-coding",
+                &["encoding"],
+            )?,
+            compression_bytes: counter(
+                &r,
+                "compression_bytes_total",
+                "Body bytes through the compressor (`in` = uncompressed, `out` = compressed)",
+                &["encoding", "direction"],
+            )?,
             config_generation,
             h3_enabled,
             connections_rejected,
@@ -228,6 +263,28 @@ impl Metrics {
     /// Count a failed handshake.
     pub fn tls_handshake_error(&self, transport: &str, reason: &str) {
         self.tls_handshake_errors.with_label_values(&[transport, reason]).inc();
+    }
+
+    /// Count a request refused because every eligible backend was at its cap.
+    pub fn upstream_saturated(&self, upstream: &str) {
+        self.upstream_saturated.with_label_values(&[upstream]).inc();
+    }
+
+    /// Count a failed TLS handshake to a backend.
+    pub fn upstream_tls_error(&self, upstream: &str, reason: &str) {
+        self.upstream_tls_errors.with_label_values(&[upstream, reason]).inc();
+    }
+
+    /// Count a connection refused by PROXY-protocol handling.
+    pub fn proxy_protocol_error(&self, reason: &str) {
+        self.proxy_protocol_errors.with_label_values(&[reason]).inc();
+    }
+
+    /// Record a finished compressed response.
+    pub fn compressed(&self, encoding: &str, bytes_in: u64, bytes_out: u64) {
+        self.compression_responses.with_label_values(&[encoding]).inc();
+        self.compression_bytes.with_label_values(&[encoding, "in"]).inc_by(bytes_in);
+        self.compression_bytes.with_label_values(&[encoding, "out"]).inc_by(bytes_out);
     }
 
     /// Count a 429.

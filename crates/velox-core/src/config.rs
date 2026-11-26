@@ -28,6 +28,8 @@ pub struct Config {
     pub tls: TlsConfig,
     /// Header hygiene and trusted proxy settings.
     pub security: SecurityConfig,
+    /// Streaming response compression (opt-in).
+    pub compression: CompressionConfig,
     /// Default rate-limit policy applied to every route (routes may override).
     pub rate_limit: Option<RateLimitConfig>,
     /// Localhost-only admin API.
@@ -73,6 +75,14 @@ pub struct ServerConfig {
     /// Maximum time to wait for in-flight requests on shutdown.
     #[serde(with = "humantime_serde")]
     pub drain_timeout: Duration,
+    /// Expect a PROXY protocol v1/v2 header on every `http_addr` / `https_addr`
+    /// connection (AWS NLB, HAProxy, …) and take the client address from it.
+    /// Requires `proxy_protocol_trusted`. Not applicable to HTTP/3 (UDP).
+    pub proxy_protocol: bool,
+    /// The only peers allowed to send a PROXY header. Connections from anyone
+    /// else on a PROXY-protocol listener are refused, so a client can never
+    /// forge its own address.
+    pub proxy_protocol_trusted: Vec<IpNet>,
 }
 
 impl Default for ServerConfig {
@@ -88,6 +98,8 @@ impl Default for ServerConfig {
             tcp_nodelay: true,
             backlog: 1024,
             drain_timeout: Duration::from_secs(30),
+            proxy_protocol: false,
+            proxy_protocol_trusted: Vec::new(),
         }
     }
 }
@@ -399,13 +411,21 @@ impl Default for TelemetryConfig {
     }
 }
 
-/// Where a backend lives.
+/// Where a backend lives: `host:port`, `http://host[:port]`, `https://host[:port]`
+/// or `unix:/path`.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(try_from = "String", into = "String")]
 pub enum BackendAddr {
     /// A TCP endpoint (`host:port`; IPv6 hosts keep their brackets).
     Tcp {
         /// Host name or IP literal.
+        host: String,
+        /// TCP port.
+        port: u16,
+    },
+    /// A TCP endpoint spoken to over TLS (`https://host[:port]`, default port 443).
+    Tls {
+        /// Host name or IP literal (also the default SNI / verification name).
         host: String,
         /// TCP port.
         port: u16,
@@ -430,9 +450,21 @@ impl FromStr for BackendAddr {
             }
             return Ok(Self::Unix(PathBuf::from(path)));
         }
-        let (host, port) =
-            s.rsplit_once(':').ok_or_else(|| format!("backend `{s}` must be host:port or unix:/path"))?;
-        let port: u16 = port.parse().map_err(|_| format!("backend `{s}` has an invalid port"))?;
+        // `https://host[:port]` (TLS, default 443) and `http://host[:port]`
+        // (cleartext, default 80) are accepted next to the bare `host:port`.
+        let (tls, rest, default_port) = if let Some(r) = s.strip_prefix("https://") {
+            (true, r, Some(443))
+        } else if let Some(r) = s.strip_prefix("http://") {
+            (false, r, Some(80))
+        } else {
+            (false, s, None)
+        };
+        let (host, port) = match rest.rsplit_once(':') {
+            Some((h, p)) if !p.ends_with(']') => {
+                (h, p.parse::<u16>().map_err(|_| format!("backend `{s}` has an invalid port"))?)
+            }
+            _ => (rest, default_port.ok_or_else(|| format!("backend `{s}` must be host:port or unix:/path"))?),
+        };
         let bare = Self::connect_host(host);
         let ok = !bare.is_empty()
             && (host.starts_with('[') == host.ends_with(']'))
@@ -440,7 +472,8 @@ impl FromStr for BackendAddr {
         if !ok {
             return Err(format!("backend `{s}` has an invalid host"));
         }
-        Ok(Self::Tcp { host: host.to_owned(), port })
+        let host = host.to_owned();
+        Ok(if tls { Self::Tls { host, port } } else { Self::Tcp { host, port } })
     }
 }
 
@@ -448,6 +481,7 @@ impl fmt::Display for BackendAddr {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Tcp { host, port } => write!(f, "{host}:{port}"),
+            Self::Tls { host, port } => write!(f, "https://{host}:{port}"),
             Self::Unix(p) => write!(f, "unix:{}", p.display()),
         }
     }
@@ -490,6 +524,99 @@ pub enum UpstreamProtocol {
     Http1,
     /// HTTP/2 with prior knowledge (cleartext, multiplexed).
     H2c,
+    /// HTTP/2 everywhere: prior knowledge on cleartext backends, ALPN `h2` on
+    /// `https://` backends.
+    H2,
+}
+
+impl UpstreamProtocol {
+    /// Does this protocol speak HTTP/2 to the backend?
+    pub fn is_h2(self) -> bool {
+        matches!(self, Self::H2c | Self::H2)
+    }
+}
+
+/// A response content-coding Velox can produce.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum CompressionAlgorithm {
+    /// Zstandard (`zstd`).
+    Zstd,
+    /// Brotli (`br`).
+    #[serde(alias = "br")]
+    Brotli,
+    /// Gzip (`gzip`).
+    Gzip,
+}
+
+impl CompressionAlgorithm {
+    /// The `Content-Encoding` / `Accept-Encoding` token.
+    pub fn token(self) -> &'static str {
+        match self {
+            Self::Zstd => "zstd",
+            Self::Brotli => "br",
+            Self::Gzip => "gzip",
+        }
+    }
+}
+
+/// CPU / ratio trade-off for response compression.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum CompressionLevel {
+    /// Lowest CPU cost.
+    Fast,
+    /// A balanced default.
+    #[default]
+    Default,
+    /// Best ratio that is still practical for on-the-fly compression.
+    Best,
+}
+
+/// Streaming response compression.
+///
+/// Compression is skipped for responses that are already encoded, too small,
+/// not compressible by `content_types`, `text/event-stream`, `no-transform`,
+/// partial (`206`) or bodyless.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct CompressionConfig {
+    /// Master switch (routes may override with `compress`).
+    pub enabled: bool,
+    /// Offered encodings in server preference order (used to break `q` ties).
+    pub algorithms: Vec<CompressionAlgorithm>,
+    /// Do not compress bodies known to be smaller than this many bytes.
+    pub min_size: u64,
+    /// CPU / ratio trade-off.
+    pub level: CompressionLevel,
+    /// Compressible media types: `type/subtype`, `type/*`, or a `*` glob in
+    /// the subtype (`application/*+json`).
+    pub content_types: Vec<String>,
+}
+
+impl Default for CompressionConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            algorithms: vec![CompressionAlgorithm::Zstd, CompressionAlgorithm::Brotli, CompressionAlgorithm::Gzip],
+            min_size: 1024,
+            level: CompressionLevel::Default,
+            content_types: [
+                "text/*",
+                "application/json",
+                "application/*+json",
+                "application/javascript",
+                "application/xml",
+                "application/*+xml",
+                "application/wasm",
+                "application/x-ndjson",
+                "image/svg+xml",
+            ]
+            .iter()
+            .map(|s| (*s).to_owned())
+            .collect(),
+        }
+    }
 }
 
 /// A single backend in a pool.
@@ -501,6 +628,10 @@ pub struct BackendConfig {
     /// Relative weight (≥ 1).
     #[serde(default = "default_weight")]
     pub weight: u32,
+    /// Circuit breaker: at most this many requests in flight on this backend
+    /// (overrides the upstream's `max_inflight`; `None` inherits it).
+    #[serde(default)]
+    pub max_inflight: Option<u32>,
 }
 
 fn default_weight() -> u32 {
@@ -692,6 +823,52 @@ pub struct UpstreamConfig {
     /// Connection pool tuning.
     #[serde(default)]
     pub pool: PoolConfig,
+    /// Default per-backend in-flight cap (circuit breaker). A saturated backend
+    /// is skipped by the balancer; when every backend is saturated the request
+    /// is answered `503` immediately instead of queueing. `None` = unlimited.
+    #[serde(default)]
+    pub max_inflight: Option<u32>,
+    /// TLS settings for `https://` backends (trust roots, SNI, mTLS client
+    /// certificate). Optional: the defaults verify against the public web PKI.
+    #[serde(default)]
+    pub tls: Option<UpstreamTlsConfig>,
+}
+
+/// TLS used to reach `https://` backends.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct UpstreamTlsConfig {
+    /// Name sent as SNI and checked against the backend certificate. Defaults
+    /// to the backend's host (which may be an IP, verified against IP SANs).
+    pub server_name: Option<String>,
+    /// PEM bundle of trusted CA certificates. When set it is the *only* trust
+    /// anchor set (private PKI / zero-trust); when absent the bundled Mozilla
+    /// roots (`webpki-roots`) are used.
+    pub ca_file: Option<PathBuf>,
+    /// Do not verify the backend certificate at all. Dangerous: any
+    /// on-path attacker can impersonate the backend. Default `false`.
+    pub insecure_skip_verify: bool,
+    /// PEM client certificate chain presented to the backend (mTLS).
+    pub client_cert_file: Option<PathBuf>,
+    /// PEM private key for `client_cert_file`.
+    pub client_key_file: Option<PathBuf>,
+    /// How often the CA / client-certificate files are checked for rotation.
+    /// Rotated material applies to new connections without a reload.
+    #[serde(with = "humantime_serde")]
+    pub reload_interval: Duration,
+}
+
+impl Default for UpstreamTlsConfig {
+    fn default() -> Self {
+        Self {
+            server_name: None,
+            ca_file: None,
+            insecure_skip_verify: false,
+            client_cert_file: None,
+            client_key_file: None,
+            reload_interval: Duration::from_secs(5),
+        }
+    }
 }
 
 fn default_hash_on() -> HashOn {
@@ -739,6 +916,9 @@ pub struct RouteConfig {
     /// Override of `timeouts.upstream_response` for this route.
     #[serde(default, with = "humantime_serde::option")]
     pub timeout: Option<Duration>,
+    /// Override of `compression.enabled` for this route.
+    #[serde(default)]
+    pub compress: Option<bool>,
 }
 
 fn default_prefix() -> String {
@@ -756,6 +936,10 @@ pub struct TcpProxyConfig {
     /// Close connections idle for this long (`None` = never).
     #[serde(default, with = "humantime_serde::option")]
     pub idle_timeout: Option<Duration>,
+    /// Expect a PROXY protocol v1/v2 header from `server.proxy_protocol_trusted`
+    /// peers and use the client address it carries.
+    #[serde(default)]
+    pub proxy_protocol: bool,
 }
 
 impl Config {
@@ -803,6 +987,14 @@ impl Config {
                 }
             }
         }
+        for u in &self.upstreams {
+            let Some(t) = &u.tls else { continue };
+            for p in [&t.ca_file, &t.client_cert_file, &t.client_key_file].into_iter().flatten() {
+                if !p.is_file() {
+                    errs.push(format!("upstream `{}`: tls file {} does not exist", u.name, p.display()));
+                }
+            }
+        }
         if errs.is_empty() {
             Ok(())
         } else {
@@ -830,6 +1022,18 @@ impl Config {
         }
         if s.h3 && s.h3_addr.is_some() && s.https_addr.is_none() {
             errs.push("server.h3_addr requires https_addr (TLS material)".into());
+        }
+        if s.proxy_protocol {
+            if s.proxy_protocol_trusted.is_empty() {
+                errs.push(
+                    "server.proxy_protocol requires `proxy_protocol_trusted` (the load balancer addresses allowed to \
+                     send a PROXY header); without it any client could forge its address"
+                        .into(),
+                );
+            }
+            if s.http_addr.is_none() && s.https_addr.is_none() {
+                errs.push("server.proxy_protocol needs `http_addr` or `https_addr`".into());
+            }
         }
     }
 
@@ -916,6 +1120,29 @@ impl Config {
             if u.retries > 5 {
                 errs.push(format!("upstream `{n}`: retries must be <= 5"));
             }
+            if u.max_inflight == Some(0) || u.backends.iter().any(|b| b.max_inflight == Some(0)) {
+                errs.push(format!("upstream `{n}`: max_inflight must be >= 1 (omit it for no limit)"));
+            }
+            let has_tls = u.backends.iter().any(|b| matches!(b.addr, BackendAddr::Tls { .. }));
+            if let Some(t) = &u.tls {
+                if !has_tls {
+                    errs.push(format!("upstream `{n}`: `tls` is set but no backend uses https://"));
+                }
+                if t.client_cert_file.is_some() != t.client_key_file.is_some() {
+                    errs.push(format!("upstream `{n}`: tls.client_cert_file and tls.client_key_file go together"));
+                }
+                if t.insecure_skip_verify && t.ca_file.is_some() {
+                    errs.push(format!("upstream `{n}`: tls.ca_file is meaningless with insecure_skip_verify"));
+                }
+                if t.reload_interval < Duration::from_millis(50) {
+                    errs.push(format!("upstream `{n}`: tls.reload_interval must be at least 50ms"));
+                }
+                if let Some(name) = &t.server_name {
+                    if validate_host_pattern(name, true).is_err() || name.starts_with("*.") {
+                        errs.push(format!("upstream `{n}`: tls.server_name `{name}` is not a valid host name"));
+                    }
+                }
+            }
         }
     }
 
@@ -992,10 +1219,39 @@ impl Config {
                 errs.push("tls.acme: wildcard domains need DNS-01, which is not supported".into());
             }
         }
-        let upstream_names: HashSet<&str> = self.upstreams.iter().map(|u| u.name.as_str()).collect();
         for t in &self.tcp_proxies {
-            if !upstream_names.contains(t.upstream.as_str()) {
-                errs.push(format!("tcp_proxy {}: unknown upstream `{}`", t.listen, t.upstream));
+            match self.upstreams.iter().find(|u| u.name == t.upstream) {
+                None => errs.push(format!("tcp_proxy {}: unknown upstream `{}`", t.listen, t.upstream)),
+                Some(u) if u.backends.iter().any(|b| matches!(b.addr, BackendAddr::Tls { .. })) => errs.push(format!(
+                    "tcp_proxy {}: upstream `{}` has https:// backends; L4 proxies relay bytes and do not originate TLS",
+                    t.listen, t.upstream
+                )),
+                Some(_) => {}
+            }
+            if t.proxy_protocol && self.server.proxy_protocol_trusted.is_empty() {
+                errs.push(format!("tcp_proxy {}: proxy_protocol requires server.proxy_protocol_trusted", t.listen));
+            }
+        }
+        let c = &self.compression;
+        if c.enabled || !c.algorithms.is_empty() {
+            let mut seen = HashSet::new();
+            if c.enabled && c.algorithms.is_empty() {
+                errs.push("compression.algorithms must not be empty when compression is enabled".into());
+            }
+            if c.algorithms.iter().any(|a| !seen.insert(*a)) {
+                errs.push("compression.algorithms lists an encoding twice".into());
+            }
+        }
+        for ct in &c.content_types {
+            let ok = ct.split_once('/').is_some_and(|(t, sub)| {
+                !t.is_empty()
+                    && !sub.is_empty()
+                    && !t.contains('*')
+                    && sub.matches('*').count() <= 1
+                    && ct.bytes().all(|b| b.is_ascii_alphanumeric() || b"/*+-.".contains(&b))
+            });
+            if !ok {
+                errs.push(format!("compression.content_types: `{ct}` must look like `type/subtype` or `type/*`"));
             }
         }
         if self.telemetry.log_level.trim().is_empty() {
@@ -1110,5 +1366,104 @@ mod tests {
         let json = serde_json::to_string(&cfg).unwrap();
         let back: Config = serde_json::from_str(&json).unwrap();
         assert_eq!(cfg, back);
+    }
+
+    #[test]
+    fn https_backend_addresses_parse_and_round_trip() {
+        let a: BackendAddr = "https://app.internal:8443".parse().unwrap();
+        assert_eq!(a, BackendAddr::Tls { host: "app.internal".into(), port: 8443 });
+        assert_eq!(a.to_string(), "https://app.internal:8443");
+        // Default ports, IPv6, and `http://` normalising to the plain variant.
+        assert_eq!("https://app.internal".parse::<BackendAddr>().unwrap().to_string(), "https://app.internal:443");
+        assert_eq!("https://[::1]".parse::<BackendAddr>().unwrap().to_string(), "https://[::1]:443");
+        assert_eq!("https://[::1]:9443".parse::<BackendAddr>().unwrap().to_string(), "https://[::1]:9443");
+        assert_eq!("http://app.internal".parse::<BackendAddr>().unwrap().to_string(), "app.internal:80");
+        for bad in ["https://", "https://:443", "https://a/b", "https://a b:1", "https://a:99999", "ftp://a:1", "a"] {
+            assert!(bad.parse::<BackendAddr>().is_err(), "{bad}");
+        }
+        // Serde uses the same text form.
+        let json = serde_json::to_string(&a).unwrap();
+        assert_eq!(json, "\"https://app.internal:8443\"");
+        assert_eq!(serde_json::from_str::<BackendAddr>(&json).unwrap(), a);
+    }
+
+    #[test]
+    fn upstream_tls_and_inflight_validation() {
+        let base = |upstream_extra: &str, backend: &str| {
+            format!(
+                "[server]\nhttp_addr = \"127.0.0.1:8080\"\n[[upstream]]\nname = \"app\"\n{upstream_extra}\n\
+                 backends = [{{ addr = \"{backend}\" }}]\n[[route]]\nupstream = \"app\"\n"
+            )
+        };
+        assert!(Config::from_toml_str(&base("", "https://127.0.0.1:8443")).is_ok());
+        let err = |text: String| Config::from_toml_str(&text).unwrap_err().to_string();
+        // A `tls` table is pointless without an https:// backend.
+        assert!(err(base("tls = {}", "127.0.0.1:80")).contains("no backend uses https://"));
+        // mTLS needs both halves; skip-verify and a CA are contradictory.
+        assert!(err(base("tls = { client_cert_file = \"c.pem\" }", "https://h:1")).contains("go together"));
+        assert!(err(base("tls = { insecure_skip_verify = true, ca_file = \"ca.pem\" }", "https://h:1"))
+            .contains("meaningless"));
+        assert!(err(base("tls = { server_name = \"bad name\" }", "https://h:1")).contains("server_name"));
+        // Verification is on unless explicitly disabled.
+        let cfg = Config::from_toml_str(&base("tls = { server_name = \"svc.internal\" }", "https://h:1")).unwrap();
+        assert!(!cfg.upstreams[0].tls.as_ref().unwrap().insecure_skip_verify);
+        // Caps: positive, per upstream or per backend.
+        assert!(err(base("max_inflight = 0", "127.0.0.1:80")).contains("max_inflight"));
+        assert!(Config::from_toml_str(&base("max_inflight = 10", "127.0.0.1:80")).is_ok());
+        let per_backend = base("", "127.0.0.1:80")
+            .replace("{ addr = \"127.0.0.1:80\" }", "{ addr = \"127.0.0.1:80\", max_inflight = 0 }");
+        assert!(err(per_backend).contains("max_inflight"));
+        // validate_files catches missing PEMs.
+        let cfg = Config::from_toml_str(&base("tls = { ca_file = \"/nonexistent/ca.pem\" }", "https://h:1")).unwrap();
+        assert!(cfg.validate_files().unwrap_err().to_string().contains("/nonexistent/ca.pem"));
+        // L4 proxies cannot originate TLS.
+        let l4 =
+            format!("{}\n[[tcp_proxy]]\nlisten = \"127.0.0.1:9000\"\nupstream = \"app\"\n", base("", "https://h:1"));
+        assert!(err(l4).contains("do not originate TLS"));
+    }
+
+    #[test]
+    fn proxy_protocol_requires_an_explicit_trust_list() {
+        let off = MINIMAL.to_owned();
+        assert!(!Config::from_toml_str(&off).unwrap().server.proxy_protocol);
+        let no_trust = MINIMAL.replace("[server]", "[server]\nproxy_protocol = true");
+        let e = Config::from_toml_str(&no_trust).unwrap_err().to_string();
+        assert!(e.contains("proxy_protocol_trusted") && e.contains("forge"), "{e}");
+        let ok = MINIMAL.replace(
+            "[server]",
+            "[server]\nproxy_protocol = true\nproxy_protocol_trusted = [\"10.0.0.0/8\", \"::1/128\"]",
+        );
+        let cfg = Config::from_toml_str(&ok).unwrap();
+        assert_eq!(cfg.server.proxy_protocol_trusted.len(), 2);
+        // L4 listeners reuse the same trust list.
+        let l4 = format!(
+            "{MINIMAL}\n[[tcp_proxy]]\nlisten = \"127.0.0.1:9000\"\nupstream = \"app\"\nproxy_protocol = true\n"
+        );
+        assert!(Config::from_toml_str(&l4).unwrap_err().to_string().contains("proxy_protocol_trusted"));
+    }
+
+    #[test]
+    fn compression_config_defaults_and_validation() {
+        let cfg = Config::from_toml_str(MINIMAL).unwrap();
+        assert!(!cfg.compression.enabled, "compression is opt-in");
+        assert_eq!(cfg.compression.algorithms[0], CompressionAlgorithm::Zstd);
+        let on = format!("{MINIMAL}\n[compression]\nenabled = true\nalgorithms = [\"br\", \"gzip\"]\nmin_size = 256\nlevel = \"fast\"\n");
+        let cfg = Config::from_toml_str(&on).unwrap();
+        assert_eq!(cfg.compression.algorithms, [CompressionAlgorithm::Brotli, CompressionAlgorithm::Gzip]);
+        assert_eq!(cfg.compression.level, CompressionLevel::Fast);
+        let err = |extra: &str| {
+            Config::from_toml_str(&format!("{MINIMAL}\n[compression]\n{extra}\n")).unwrap_err().to_string()
+        };
+        assert!(err("enabled = true\nalgorithms = []").contains("must not be empty"));
+        assert!(err("algorithms = [\"gzip\", \"gzip\"]").contains("twice"));
+        assert!(err("content_types = [\"nonsense\"]").contains("content_types"));
+        assert!(err("content_types = [\"*/json\"]").contains("content_types"));
+        assert!(Config::from_toml_str(&format!(
+            "{MINIMAL}\n[compression]\ncontent_types = [\"application/*+json\", \"text/*\"]\n"
+        ))
+        .is_ok());
+        // Per-route override.
+        let route = MINIMAL.replace("upstream = \"app\"\n    ", "upstream = \"app\"\n        compress = true\n    ");
+        assert_eq!(Config::from_toml_str(&route).unwrap().routes[0].compress, Some(true));
     }
 }

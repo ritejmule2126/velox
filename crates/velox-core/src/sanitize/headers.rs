@@ -341,6 +341,48 @@ fn forwarded_values_safe(headers: &HeaderMap) -> bool {
     headers.get_all(FORWARDED).iter().all(|v| v.len() <= 2048 && v.as_bytes().iter().all(|b| (0x20..0x7f).contains(b)))
 }
 
+/// The protocol a *trusted* proxy says the client used: the first
+/// (client-most) token of `X-Forwarded-Proto`, else the first element of
+/// `Forwarded` (RFC 7239) that carries `proto=`. Anything but `http`/`https`
+/// is ignored. The caller must already have established that the peer is
+/// trusted.
+fn forwarded_proto(headers: &HeaderMap) -> Option<&'static str> {
+    fn scheme(v: &[u8]) -> Option<&'static str> {
+        let v = v.trim_ascii();
+        if v.eq_ignore_ascii_case(b"https") {
+            Some("https")
+        } else if v.eq_ignore_ascii_case(b"http") {
+            Some("http")
+        } else {
+            None
+        }
+    }
+    if let Some(v) = headers.get(X_FORWARDED_PROTO) {
+        return scheme(v.as_bytes().split(|&b| b == b',').next().unwrap_or(&[]));
+    }
+    let first = headers.get(FORWARDED)?.as_bytes().split(|&b| b == b',').next()?;
+    first.split(|&b| b == b';').find_map(|pair| {
+        let pair = pair.trim_ascii();
+        let eq = pair.iter().position(|&b| b == b'=')?;
+        let (k, v) = pair.split_at(eq);
+        if !k.trim_ascii().eq_ignore_ascii_case(b"proto") {
+            return None;
+        }
+        let v = v[1..].trim_ascii();
+        let v = v.strip_prefix(b"\"").and_then(|q| q.strip_suffix(b"\"")).unwrap_or(v);
+        scheme(v)
+    })
+}
+
+/// Is this request already HTTPS according to a proxy we trust?
+///
+/// True only when `peer` is in `trusted` *and* says (via `X-Forwarded-Proto`
+/// or `Forwarded: proto=`) that the client connection used HTTPS. Used to stop
+/// `redirect_https` from looping behind a TLS-terminating load balancer.
+pub fn is_https_via_trusted_proxy(headers: &HeaderMap, peer: IpAddr, trusted: &[IpNet]) -> bool {
+    is_trusted(peer, trusted) && forwarded_proto(headers) == Some("https")
+}
+
 /// Rewrite `X-Forwarded-For`, `X-Forwarded-Proto`, `X-Forwarded-Host`,
 /// `X-Real-IP` and `Forwarded` (RFC 7239) for the upstream request.
 ///
@@ -361,19 +403,7 @@ pub fn apply_forwarded_headers_hv(
     let chain_ok = peer_trusted && xff_valid(headers);
 
     // Honour an upstream proxy's proto/host only when it is trusted *and* sane.
-    let kept_proto: Option<&'static str> = if peer_trusted {
-        headers.get(X_FORWARDED_PROTO).and_then(|v| v.to_str().ok()).and_then(|v| {
-            if v.eq_ignore_ascii_case("https") {
-                Some("https")
-            } else if v.eq_ignore_ascii_case("http") {
-                Some("http")
-            } else {
-                None
-            }
-        })
-    } else {
-        None
-    };
+    let kept_proto: Option<&'static str> = if peer_trusted { forwarded_proto(headers) } else { None };
     let keep_host = peer_trusted
         && headers.get(X_FORWARDED_HOST).and_then(|v| v.to_str().ok()).is_some_and(|v| validate_host(v).is_ok());
 
@@ -430,9 +460,8 @@ pub fn apply_forwarded_headers_hv(
             }
         }
     }
-    if kept_proto.is_none() {
-        headers.insert(X_FORWARDED_PROTO, HeaderValue::from_static(proto));
-    }
+    // Always normalised: a trusted `https, http` list becomes plain `https`.
+    headers.insert(X_FORWARDED_PROTO, HeaderValue::from_static(kept_proto.unwrap_or(proto)));
     if !keep_host {
         match host {
             Some(h) => {

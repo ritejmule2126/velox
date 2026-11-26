@@ -13,6 +13,9 @@ workspace = true
 
 [dependencies]
 velox-core.workspace = true
+velox-security.workspace = true
+rustls.workspace = true
+tokio-rustls.workspace = true
 fastrand.workspace = true
 thiserror.workspace = true
 tokio.workspace = true

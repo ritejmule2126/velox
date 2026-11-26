@@ -39,7 +39,10 @@ tokio-util.workspace = true
 tracing.workspace = true
 
 [dev-dependencies]
+brotli.workspace = true
 bytes.workspace = true
+flate2.workspace = true
+zstd.workspace = true
 h3.workspace = true
 h3-quinn.workspace = true
 http.workspace = true

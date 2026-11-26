@@ -888,6 +888,7 @@ fn hop_by_hop_stripping_handles_many_and_odd_connection_values() {
 #[test]
 fn forwarded_headers_with_long_existing_chains_spill_correctly() {
     // > 256 bytes of existing X-Forwarded-For / Forwarded forces the heap spill path.
+    // (The trusted chain says the client used https, so our element carries that too.)
     let trusted: Vec<ipnet::IpNet> = vec!["10.0.0.0/8".parse().unwrap()];
     let chain: Vec<String> = (1..=30).map(|i| format!("10.1.1.{i}")).collect();
     let xff = format!("198.51.100.7, {}", chain.join(", "));
@@ -897,6 +898,58 @@ fn forwarded_headers_with_long_existing_chains_spill_correctly() {
     assert_eq!(client, ip("198.51.100.7"));
     assert_eq!(h["x-forwarded-for"].to_str().unwrap(), format!("{xff}, 10.2.2.2"));
     let f = h["forwarded"].to_str().unwrap();
-    assert!(f.starts_with(&fwd) && f.ends_with("for=10.2.2.2;proto=http;host=\"example.com\""), "{f}");
+    assert!(f.starts_with(&fwd) && f.ends_with("for=10.2.2.2;proto=https;host=\"example.com\""), "{f}");
     assert!(f.len() > 256);
+}
+
+#[test]
+fn https_via_trusted_proxy_requires_trust_and_a_clean_https_claim() {
+    let trusted: Vec<ipnet::IpNet> = vec!["10.0.0.0/8".parse().unwrap()];
+    let hdr = |name: &'static str, v: &str| {
+        let mut h = HeaderMap::new();
+        h.insert(name, HeaderValue::from_str(v).unwrap());
+        h
+    };
+    let (lb, stranger) = (ip("10.1.1.1"), ip("203.0.113.9"));
+    for (name, value, want) in [
+        ("x-forwarded-proto", "https", true),
+        ("x-forwarded-proto", " HTTPS ", true),
+        ("x-forwarded-proto", "https, http", true),
+        ("x-forwarded-proto", "http", false),
+        ("x-forwarded-proto", "http, https", false), // client-most hop was plain
+        ("x-forwarded-proto", "httpss", false),
+        ("x-forwarded-proto", "", false),
+        ("forwarded", "for=1.2.3.4;proto=https", true),
+        ("forwarded", "for=1.2.3.4; PROTO=\"https\"; by=x", true),
+        ("forwarded", "proto=https, proto=http", true),
+        ("forwarded", "proto=http, proto=https", false),
+        ("forwarded", "for=1.2.3.4", false),
+        ("forwarded", "proto=", false),
+    ] {
+        let h = hdr(name, value);
+        assert_eq!(is_https_via_trusted_proxy(&h, lb, &trusted), want, "{name}: {value:?}");
+        assert!(!is_https_via_trusted_proxy(&h, stranger, &trusted), "untrusted peer: {name}: {value:?}");
+        assert!(!is_https_via_trusted_proxy(&h, lb, &[]), "no trusted proxies: {name}: {value:?}");
+    }
+    // X-Forwarded-Proto wins over Forwarded when both are present.
+    let mut h = hdr("x-forwarded-proto", "http");
+    h.insert("forwarded", HeaderValue::from_static("proto=https"));
+    assert!(!is_https_via_trusted_proxy(&h, lb, &trusted));
+}
+
+#[test]
+fn trusted_proxy_forwarded_proto_is_preserved_for_the_backend() {
+    let trusted: Vec<ipnet::IpNet> = vec!["10.0.0.0/8".parse().unwrap()];
+    // Comma lists and `Forwarded: proto=` used to be overwritten with "http".
+    for (name, value) in [("x-forwarded-proto", "https, http"), ("forwarded", "for=1.2.3.4;proto=https")] {
+        let mut h = HeaderMap::new();
+        h.insert(name, HeaderValue::from_static(value));
+        apply_forwarded_headers(&mut h, ip("10.1.1.1"), &trusted, "http", Some("example.com"));
+        assert_eq!(h["x-forwarded-proto"], "https", "{name}");
+        assert!(
+            h["forwarded"].to_str().unwrap().ends_with(";proto=https;host=\"example.com\""),
+            "{:?}",
+            h["forwarded"]
+        );
+    }
 }

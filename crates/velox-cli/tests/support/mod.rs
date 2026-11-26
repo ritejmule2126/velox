@@ -367,3 +367,123 @@ pub async fn h2c_trailer_backend() -> (SocketAddr, Arc<AtomicUsize>) {
     });
     (addr, hits)
 }
+
+// ---------------- HTTPS backends ----------------
+
+/// A named self-signed certificate (`<name>.crt` / `<name>.key`).
+pub fn write_named_cert(dir: &Path, name: &str, sans: &[&str]) -> (PathBuf, PathBuf, CertificateDer<'static>) {
+    let g = rcgen::generate_simple_self_signed(sans.iter().map(|s| (*s).to_owned()).collect::<Vec<_>>()).unwrap();
+    let (cert, key) = (dir.join(format!("{name}.crt")), dir.join(format!("{name}.key")));
+    std::fs::write(&cert, g.cert.pem()).unwrap();
+    std::fs::write(&key, g.key_pair.serialize_pem()).unwrap();
+    (cert, key, g.cert.der().clone())
+}
+
+/// What a TLS backend should demand and offer.
+#[derive(Default)]
+pub struct TlsBackendOpts {
+    /// ALPN protocols offered (`h2`, `http/1.1`).
+    pub alpn: Vec<&'static [u8]>,
+    /// Require a client certificate chaining to one of these (mTLS).
+    pub client_roots: Vec<CertificateDer<'static>>,
+}
+
+/// An HTTPS mock backend that records what its clients presented.
+pub struct TlsBackend {
+    pub addr: SocketAddr,
+    pub hits: Arc<AtomicUsize>,
+    /// DER of the client certificate presented on each successful handshake.
+    pub client_certs: Arc<std::sync::Mutex<Vec<Option<Vec<u8>>>>>,
+    /// SNI seen on each successful handshake.
+    pub snis: Arc<std::sync::Mutex<Vec<Option<String>>>>,
+    pub failed_handshakes: Arc<AtomicUsize>,
+}
+
+/// Serve `handler` over TLS with the given certificate. The response carries
+/// `x-alpn` (negotiated protocol) so tests can assert on it.
+pub async fn tls_backend(handler: Handler, cert: &Path, key: &Path, opts: TlsBackendOpts) -> TlsBackend {
+    use rustls::pki_types::pem::PemObject;
+    use rustls::pki_types::PrivateKeyDer;
+    let chain: Vec<CertificateDer<'static>> =
+        CertificateDer::pem_file_iter(cert).unwrap().map(|c| c.unwrap()).collect();
+    let key = PrivateKeyDer::from_pem_file(key).unwrap();
+    let provider = Arc::new(rustls::crypto::ring::default_provider());
+    let builder = rustls::ServerConfig::builder_with_provider(Arc::clone(&provider))
+        .with_safe_default_protocol_versions()
+        .unwrap();
+    let builder = if opts.client_roots.is_empty() {
+        builder.with_no_client_auth()
+    } else {
+        let mut roots = rustls::RootCertStore::empty();
+        for r in &opts.client_roots {
+            roots.add(r.clone()).unwrap();
+        }
+        let verifier =
+            rustls::server::WebPkiClientVerifier::builder_with_provider(Arc::new(roots), provider).build().unwrap();
+        builder.with_client_cert_verifier(verifier)
+    };
+    let mut cfg = builder.with_single_cert(chain, key).unwrap();
+    cfg.alpn_protocols = opts.alpn.iter().map(|a| a.to_vec()).collect();
+    let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(cfg));
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let out = TlsBackend {
+        addr,
+        hits: Arc::default(),
+        client_certs: Arc::default(),
+        snis: Arc::default(),
+        failed_handshakes: Arc::default(),
+    };
+    let (hits, certs, snis, failed) = (
+        Arc::clone(&out.hits),
+        Arc::clone(&out.client_certs),
+        Arc::clone(&out.snis),
+        Arc::clone(&out.failed_handshakes),
+    );
+    tokio::spawn(async move {
+        loop {
+            let Ok((tcp, _)) = listener.accept().await else { return };
+            let (acceptor, handler, hits, certs, snis, failed) = (
+                acceptor.clone(),
+                Arc::clone(&handler),
+                Arc::clone(&hits),
+                Arc::clone(&certs),
+                Arc::clone(&snis),
+                Arc::clone(&failed),
+            );
+            tokio::spawn(async move {
+                let tls = match acceptor.accept(tcp).await {
+                    Ok(t) => t,
+                    Err(_) => {
+                        failed.fetch_add(1, Ordering::SeqCst);
+                        return;
+                    }
+                };
+                let (_, session) = tls.get_ref();
+                let alpn = session.alpn_protocol().map(|a| String::from_utf8_lossy(a).into_owned());
+                certs.lock().unwrap().push(session.peer_certificates().and_then(|c| c.first()).map(|c| c.to_vec()));
+                snis.lock().unwrap().push(session.server_name().map(str::to_owned));
+                let h2 = alpn.as_deref() == Some("h2");
+                let alpn = alpn.unwrap_or_else(|| "none".to_owned());
+                let svc = service_fn(move |req: Request<Incoming>| {
+                    let (handler, hits, alpn) = (Arc::clone(&handler), Arc::clone(&hits), alpn.clone());
+                    async move {
+                        hits.fetch_add(1, Ordering::SeqCst);
+                        let mut resp = handler(req).await;
+                        resp.headers_mut().insert("x-alpn", alpn.parse().unwrap());
+                        Ok::<_, Infallible>(resp)
+                    }
+                });
+                if h2 {
+                    let _ = hyper::server::conn::http2::Builder::new(TokioExecutor::new())
+                        .serve_connection(TokioIo::new(tls), svc)
+                        .await;
+                } else {
+                    let _ = hyper::server::conn::http1::Builder::new().serve_connection(TokioIo::new(tls), svc).await;
+                }
+            });
+        }
+    });
+    out
+}

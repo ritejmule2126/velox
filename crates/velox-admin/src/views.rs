@@ -26,6 +26,12 @@ pub struct BackendView {
     pub total_failures: u64,
     /// Current failure streak.
     pub consecutive_failures: u32,
+    /// Circuit-breaker cap on in-flight requests (`null` = unlimited).
+    pub max_inflight: Option<u32>,
+    /// `true` when the backend is at its `max_inflight` cap right now.
+    pub saturated: bool,
+    /// Reached over TLS (`https://`).
+    pub tls: bool,
 }
 
 impl From<&Backend> for BackendView {
@@ -41,6 +47,9 @@ impl From<&Backend> for BackendView {
             total_requests: b.total_requests(),
             total_failures: b.total_failures(),
             consecutive_failures: b.consecutive_failures(),
+            max_inflight: b.max_inflight(),
+            saturated: b.is_saturated(),
+            tls: b.tls,
         }
     }
 }

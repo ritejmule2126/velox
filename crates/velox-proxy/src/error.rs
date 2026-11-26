@@ -34,6 +34,9 @@ pub enum ProxyError {
     /// Every backend is unavailable.
     #[error("no healthy upstream available")]
     NoHealthyUpstream,
+    /// Every eligible backend is at its `max_inflight` cap.
+    #[error("every upstream backend is at its in-flight limit")]
+    UpstreamSaturated,
     /// Could not connect to / talk to the backend.
     #[error("upstream connection failed: {0}")]
     UpstreamConnect(String),
@@ -57,7 +60,7 @@ impl ProxyError {
             Self::RateLimited { .. } => StatusCode::TOO_MANY_REQUESTS,
             Self::BodyTooLarge => StatusCode::PAYLOAD_TOO_LARGE,
             Self::ClientTimeout => StatusCode::REQUEST_TIMEOUT,
-            Self::NoHealthyUpstream => StatusCode::SERVICE_UNAVAILABLE,
+            Self::NoHealthyUpstream | Self::UpstreamSaturated => StatusCode::SERVICE_UNAVAILABLE,
             Self::UpstreamConnect(_) | Self::BadGateway(_) => StatusCode::BAD_GATEWAY,
             Self::UpstreamTimeout => StatusCode::GATEWAY_TIMEOUT,
             Self::Internal(_) => StatusCode::INTERNAL_SERVER_ERROR,
@@ -73,6 +76,7 @@ impl ProxyError {
             Self::BodyTooLarge => "request body too large",
             Self::ClientTimeout => "timed out reading request",
             Self::NoHealthyUpstream => "no healthy upstream",
+            Self::UpstreamSaturated => "upstream is overloaded, retry shortly",
             Self::UpstreamConnect(_) | Self::BadGateway(_) => "bad gateway",
             Self::UpstreamTimeout => "upstream timed out",
             Self::Internal(_) => "internal error",
@@ -90,7 +94,7 @@ impl ProxyError {
                     resp.headers_mut().insert(header::RETRY_AFTER, v);
                 }
             }
-            Self::NoHealthyUpstream => {
+            Self::NoHealthyUpstream | Self::UpstreamSaturated => {
                 resp.headers_mut().insert(header::RETRY_AFTER, HeaderValue::from_static("1"));
             }
             _ => {}
@@ -132,6 +136,7 @@ mod tests {
             (ProxyError::BodyTooLarge, 413),
             (ProxyError::ClientTimeout, 408),
             (ProxyError::NoHealthyUpstream, 503),
+            (ProxyError::UpstreamSaturated, 503),
             (ProxyError::UpstreamConnect("x".into()), 502),
             (ProxyError::BadGateway("x".into()), 502),
             (ProxyError::UpstreamTimeout, 504),

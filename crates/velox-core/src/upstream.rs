@@ -60,6 +60,11 @@ pub struct Backend {
     pub weight: u32,
     /// URI authority used to address this backend through the client pool.
     pub authority: http::uri::Authority,
+    /// Spoken to over TLS (`https://` address).
+    pub tls: bool,
+    /// Circuit-breaker cap on in-flight requests (0 = unlimited). Atomic so a
+    /// reload can change it on a backend that keeps its runtime state.
+    max_inflight: AtomicU32,
     healthy: AtomicBool,
     draining: AtomicBool,
     active: AtomicI64,
@@ -71,10 +76,16 @@ pub struct Backend {
 }
 
 impl Backend {
-    /// Build a backend that starts healthy.
+    /// Build a backend that starts healthy (no inherited in-flight cap).
     pub fn new(cfg: &BackendConfig) -> Self {
+        Self::with_default_limit(cfg, None)
+    }
+
+    /// Build a backend whose in-flight cap is its own `max_inflight`, else
+    /// `default_limit` (the upstream's).
+    pub fn with_default_limit(cfg: &BackendConfig, default_limit: Option<u32>) -> Self {
         let authority = match &cfg.addr {
-            BackendAddr::Tcp { host, port } => format!("{host}:{port}"),
+            BackendAddr::Tcp { host, port } | BackendAddr::Tls { host, port } => format!("{host}:{port}"),
             BackendAddr::Unix(path) => uds_authority(path),
         };
         Self {
@@ -82,6 +93,8 @@ impl Backend {
             addr: cfg.addr.clone(),
             weight: cfg.weight,
             authority: authority.parse().unwrap_or_else(|_| http::uri::Authority::from_static("invalid.velox-backend")),
+            tls: matches!(cfg.addr, BackendAddr::Tls { .. }),
+            max_inflight: AtomicU32::new(cfg.max_inflight.or(default_limit).unwrap_or(0)),
             healthy: AtomicBool::new(true),
             draining: AtomicBool::new(false),
             active: AtomicI64::new(0),
@@ -134,7 +147,46 @@ impl Backend {
         u64::try_from(self.active.load(Ordering::Relaxed)).unwrap_or(0)
     }
 
-    /// Mark a request in flight until the returned guard drops.
+    /// The in-flight cap, if any.
+    pub fn max_inflight(&self) -> Option<u32> {
+        Some(self.max_inflight.load(Ordering::Relaxed)).filter(|&m| m != 0)
+    }
+
+    /// Change the in-flight cap (`None` = unlimited).
+    pub fn set_max_inflight(&self, limit: Option<u32>) {
+        self.max_inflight.store(limit.unwrap_or(0), Ordering::Relaxed);
+    }
+
+    /// Has the in-flight cap been reached? (A racy hint for the balancer;
+    /// [`Backend::try_track`] is the exact check.)
+    pub fn is_saturated(&self) -> bool {
+        let max = self.max_inflight.load(Ordering::Relaxed);
+        max != 0 && self.active.load(Ordering::Relaxed) >= i64::from(max)
+    }
+
+    /// Mark a request in flight, but only if the cap allows it. The check and
+    /// the increment are one atomic step, so concurrent requests can never
+    /// overshoot the cap.
+    pub fn try_track(self: &Arc<Self>) -> Option<ActiveGuard> {
+        let max = i64::from(self.max_inflight.load(Ordering::Relaxed));
+        if max == 0 {
+            return Some(self.track());
+        }
+        let mut cur = self.active.load(Ordering::Relaxed);
+        loop {
+            if cur >= max {
+                return None;
+            }
+            match self.active.compare_exchange_weak(cur, cur + 1, Ordering::AcqRel, Ordering::Relaxed) {
+                Ok(_) => break,
+                Err(seen) => cur = seen,
+            }
+        }
+        self.total_requests.fetch_add(1, Ordering::Relaxed);
+        Some(ActiveGuard(Arc::clone(self)))
+    }
+
+    /// Mark a request in flight until the returned guard drops (ignores the cap).
     pub fn track(self: &Arc<Self>) -> ActiveGuard {
         self.active.fetch_add(1, Ordering::Relaxed);
         self.total_requests.fetch_add(1, Ordering::Relaxed);
@@ -271,6 +323,8 @@ pub struct UpstreamGroup {
     pub cum_weights: Vec<u64>,
     /// `true` when every backend has the same weight (slot → index is `% n`).
     pub uniform_weights: bool,
+    /// `true` when at least one backend is reached over TLS (`https://`).
+    pub has_tls: bool,
 }
 
 impl UpstreamGroup {
@@ -280,8 +334,14 @@ impl UpstreamGroup {
             .backends
             .iter()
             .map(|bc| {
-                prev.and_then(|p| p.backends.iter().find(|b| b.addr == bc.addr && b.weight == bc.weight).cloned())
-                    .unwrap_or_else(|| Arc::new(Backend::new(bc)))
+                match prev.and_then(|p| p.backends.iter().find(|b| b.addr == bc.addr && b.weight == bc.weight)) {
+                    Some(b) => {
+                        // Runtime state survives a reload; the cap is configuration.
+                        b.set_max_inflight(bc.max_inflight.or(cfg.max_inflight));
+                        Arc::clone(b)
+                    }
+                    None => Arc::new(Backend::with_default_limit(bc, cfg.max_inflight)),
+                }
             })
             .collect();
         let ring = (cfg.algorithm == Algorithm::ConsistentHash).then(|| HashRing::new(&backends));
@@ -294,6 +354,7 @@ impl UpstreamGroup {
             })
             .collect();
         let uniform_weights = backends.windows(2).all(|w| w[0].weight == w[1].weight);
+        let has_tls = backends.iter().any(|b| b.tls);
         Self {
             name: Arc::from(cfg.name.as_str()),
             config: cfg.clone(),
@@ -303,12 +364,20 @@ impl UpstreamGroup {
             total_weight,
             cum_weights,
             uniform_weights,
+            has_tls,
         }
     }
 
     /// Number of backends currently eligible for traffic.
     pub fn available_count(&self) -> usize {
         self.backends.iter().filter(|b| b.is_available()).count()
+    }
+
+    /// Is some backend otherwise eligible for traffic but at its in-flight cap?
+    /// (Distinguishes "everything is saturated" from "everything is down".)
+    pub fn any_saturated(&self) -> bool {
+        let now = now_ms();
+        self.backends.iter().any(|b| b.is_available_at(now) && b.is_saturated())
     }
 
     /// Find a backend by its display name (`host:port` / `unix:/path`).
@@ -325,7 +394,11 @@ mod tests {
     fn backends(n: usize) -> Vec<Arc<Backend>> {
         (0..n)
             .map(|i| {
-                Arc::new(Backend::new(&BackendConfig { addr: format!("10.0.0.{i}:80").parse().unwrap(), weight: 1 }))
+                Arc::new(Backend::new(&BackendConfig {
+                    addr: format!("10.0.0.{i}:80").parse().unwrap(),
+                    weight: 1,
+                    max_inflight: None,
+                }))
             })
             .collect()
     }
@@ -393,9 +466,13 @@ mod tests {
         assert_eq!(uds_path_from_host(&a).as_deref(), Some(p));
         assert!(uds_path_from_host("example.com").is_none());
         assert!(uds_path_from_host("zz.velox-uds").is_none());
-        let b = Backend::new(&BackendConfig { addr: "unix:/run/app/web.sock".parse().unwrap(), weight: 1 });
+        let b = Backend::new(&BackendConfig {
+            addr: "unix:/run/app/web.sock".parse().unwrap(),
+            weight: 1,
+            max_inflight: None,
+        });
         assert_eq!(b.authority.as_str(), a);
-        let t = Backend::new(&BackendConfig { addr: "[::1]:8080".parse().unwrap(), weight: 1 });
+        let t = Backend::new(&BackendConfig { addr: "[::1]:8080".parse().unwrap(), weight: 1, max_inflight: None });
         assert_eq!(t.authority.as_str(), "[::1]:8080");
     }
 
@@ -426,11 +503,17 @@ mod tests {
             backends: ws
                 .iter()
                 .enumerate()
-                .map(|(i, w)| BackendConfig { addr: format!("10.0.0.{i}:80").parse().unwrap(), weight: *w })
+                .map(|(i, w)| BackendConfig {
+                    addr: format!("10.0.0.{i}:80").parse().unwrap(),
+                    weight: *w,
+                    max_inflight: None,
+                })
                 .collect(),
             health: None,
             outlier: Default::default(),
             pool: Default::default(),
+            max_inflight: None,
+            tls: None,
         }
     }
 
@@ -438,5 +521,82 @@ mod tests {
     fn hash_is_deterministic() {
         assert_eq!(hash64(b"velox"), hash64(b"velox"));
         assert_ne!(hash64(b"velox"), hash64(b"Velox"));
+    }
+
+    fn capped(max: Option<u32>) -> Arc<Backend> {
+        Arc::new(Backend::new(&BackendConfig { addr: "10.0.0.1:80".parse().unwrap(), weight: 1, max_inflight: max }))
+    }
+
+    #[test]
+    fn try_track_enforces_the_cap_exactly_and_releases_on_drop() {
+        let b = capped(Some(2));
+        assert_eq!(b.max_inflight(), Some(2));
+        let (g1, g2) = (b.try_track().unwrap(), b.try_track().unwrap());
+        assert!(b.is_saturated() && b.try_track().is_none());
+        assert_eq!((b.active(), b.total_requests()), (2, 2), "a refused request is not counted");
+        drop(g1);
+        assert!(!b.is_saturated());
+        let g3 = b.try_track().unwrap();
+        assert_eq!(b.active(), 2);
+        drop((g2, g3));
+        assert_eq!(b.active(), 0);
+        // No cap: never saturated.
+        let free = capped(None);
+        let guards: Vec<_> = (0..500).map(|_| free.try_track().unwrap()).collect();
+        assert!(!free.is_saturated() && free.max_inflight().is_none());
+        drop(guards);
+    }
+
+    #[test]
+    fn concurrent_try_track_never_overshoots_the_cap() {
+        let b = capped(Some(8));
+        let admitted = Arc::new(AtomicU32::new(0));
+        let barrier = Arc::new(std::sync::Barrier::new(16));
+        let done = Arc::new(std::sync::Barrier::new(16));
+        let handles: Vec<_> = (0..16)
+            .map(|_| {
+                let (b, admitted, barrier, done) =
+                    (Arc::clone(&b), Arc::clone(&admitted), Arc::clone(&barrier), Arc::clone(&done));
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    let mut held = Vec::new();
+                    for _ in 0..1000 {
+                        if let Some(g) = b.try_track() {
+                            admitted.fetch_add(1, Ordering::SeqCst);
+                            assert!(b.active() <= 8, "cap overshoot: {}", b.active());
+                            held.push(g);
+                        }
+                    }
+                    done.wait(); // nobody releases until every thread has tried
+                    held.len()
+                })
+            })
+            .collect();
+        let held: usize = handles.into_iter().map(|h| h.join().unwrap()).sum();
+        assert_eq!(held, 8, "exactly the cap is held while nobody releases");
+        assert_eq!(b.active(), 0);
+    }
+
+    #[test]
+    fn caps_are_inherited_overridden_and_updated_on_reload() {
+        let mut cfg = velox_test_cfg(&[1, 1]);
+        cfg.max_inflight = Some(5);
+        cfg.backends[1].max_inflight = Some(2);
+        let g1 = UpstreamGroup::build(&cfg, None);
+        assert_eq!(g1.backends[0].max_inflight(), Some(5), "inherits the upstream default");
+        assert_eq!(g1.backends[1].max_inflight(), Some(2), "backend overrides it");
+        // Reload keeps the Backend (and its counters) but applies the new cap.
+        let held = g1.backends[0].try_track().unwrap();
+        cfg.max_inflight = Some(1);
+        cfg.backends[1].max_inflight = None;
+        let g2 = UpstreamGroup::build(&cfg, Some(&g1));
+        assert!(Arc::ptr_eq(&g1.backends[0], &g2.backends[0]), "runtime state survives reloads");
+        assert_eq!((g2.backends[0].max_inflight(), g2.backends[1].max_inflight()), (Some(1), Some(1)));
+        assert!(g2.backends[0].is_saturated() && g2.any_saturated());
+        drop(held);
+        assert!(!g2.any_saturated());
+        cfg.max_inflight = None;
+        let g3 = UpstreamGroup::build(&cfg, Some(&g2));
+        assert_eq!(g3.backends[0].max_inflight(), None);
     }
 }

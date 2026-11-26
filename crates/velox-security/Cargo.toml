@@ -14,7 +14,7 @@ workspace = true
 [features]
 default = []
 # Automatic certificates via ACME HTTP-01 (Let's Encrypt).
-acme = ["dep:instant-acme", "dep:tokio", "dep:tokio-util", "dep:serde_json", "dep:tracing"]
+acme = ["dep:instant-acme", "dep:tokio", "dep:tokio-util", "dep:serde_json"]
 
 [dependencies]
 velox-core.workspace = true
@@ -24,12 +24,13 @@ hashbrown.workspace = true
 http.workspace = true
 rcgen.workspace = true
 rustls.workspace = true
+webpki-roots.workspace = true
 thiserror.workspace = true
+tracing.workspace = true
 instant-acme = { version = "0.8", optional = true, default-features = false, features = ["ring", "hyper-rustls"] }
 tokio = { workspace = true, optional = true }
 serde_json = { workspace = true, optional = true }
 tokio-util = { workspace = true, optional = true }
-tracing = { workspace = true, optional = true }
 
 [dev-dependencies]
 tempfile.workspace = true

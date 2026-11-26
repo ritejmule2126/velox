@@ -36,6 +36,13 @@ impl FileReloader {
             || old.https_addr != new.https_addr
             || old.h3_addr != new.h3_addr
             || old.h3 != new.h3
+            || old.proxy_protocol != new.proxy_protocol
+            || live
+                .config
+                .tcp_proxies
+                .iter()
+                .map(|t| t.proxy_protocol)
+                .ne(cfg.tcp_proxies.iter().map(|t| t.proxy_protocol))
             || live.config.tcp_proxies.iter().map(|t| t.listen).ne(cfg.tcp_proxies.iter().map(|t| t.listen))
         {
             tracing::warn!(
