@@ -1,23 +1,26 @@
 # syntax=docker/dockerfile:1.7
 
 # ---- build stage ------------------------------------------------------------
-FROM rust:1-slim-bookworm AS build
+# Build a statically linked musl binary so the runtime stage needs neither
+# glibc nor OpenSSL/libssl3.
+FROM rust:1-alpine AS build
 WORKDIR /src
-# `ring` needs a C compiler; everything else is pure Rust.
-RUN apt-get update \
- && apt-get install -y --no-install-recommends build-essential pkg-config \
- && rm -rf /var/lib/apt/lists/*
+# `ring`, `zstd-sys` and `mimalloc` need a C toolchain and musl headers.
+RUN apk add --no-cache build-base pkgconfig linux-headers
 COPY . .
 # Cache mounts keep incremental rebuilds fast without bloating the image.
+# Passing `--target` explicitly keeps `RUSTFLAGS` off proc-macro crates.
+ENV RUSTFLAGS="-C target-feature=+crt-static"
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/src/target \
-    cargo build --release --locked -p velox-cli --bin velox \
- && install -D target/release/velox /out/velox
+    ARCH="$(uname -m)-unknown-linux-musl" \
+ && cargo build --release --locked --target "$ARCH" -p velox-cli --bin velox \
+ && install -Dm755 "target/$ARCH/release/velox" /out/velox
 
 # ---- runtime stage ----------------------------------------------------------
-# distroless/cc: glibc + libgcc only; no shell, no package manager, runs as
-# the unprivileged `nonroot` user (uid 65532).
-FROM gcr.io/distroless/cc-debian12:nonroot
+# distroless/static: CA certs + tzdata + nonroot user (uid 65532); no libc,
+# no OpenSSL, no shell, no package manager (0 OS-package CVEs).
+FROM gcr.io/distroless/static-debian12:nonroot
 COPY --from=build /out/velox /usr/local/bin/velox
 COPY docker/velox.toml /etc/velox/velox.toml
 # 8080/tcp  HTTP/1.1        8443/tcp  HTTPS (h2, http/1.1)
