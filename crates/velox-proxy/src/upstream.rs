@@ -2,12 +2,14 @@
 //! sockets.
 
 use crate::error::ProxyBody;
+use arc_swap::ArcSwap;
 use dashmap::DashMap;
 use hyper::rt::{Read, ReadBufCursor, Write};
 use hyper_util::client::legacy::connect::{Connected, Connection};
 use hyper_util::client::legacy::Client;
 use hyper_util::rt::{TokioExecutor, TokioIo, TokioTimer};
 use pin_project_lite::pin_project;
+use std::collections::HashMap;
 use std::future::Future;
 use std::io;
 use std::net::{IpAddr, SocketAddr};
@@ -145,6 +147,24 @@ struct TlsSetup {
     settings: Option<UpstreamTlsConfig>,
 }
 
+/// Pool authority (`ip:port`) → the host name that address was resolved from.
+/// TLS to a DNS-expanded member must verify (and send SNI for) the *name*, not
+/// the bare address it happens to be connecting to.
+type SniTable = HashMap<String, Arc<str>>;
+
+/// Entries beyond this are dropped wholesale on the next rebuild (a runaway
+/// churn guard; the live members are always re-added).
+const SNI_TABLE_MAX: usize = 4096;
+
+fn sni_table_of(group: &UpstreamGroup) -> SniTable {
+    group
+        .backends
+        .iter()
+        .filter(|b| b.tls)
+        .filter_map(|b| Some((b.authority.as_str().to_owned(), Arc::clone(b.sni.as_ref()?))))
+        .collect()
+}
+
 /// Resolves a pool URI (`http(s)://<authority>/…`) into a connection.
 #[derive(Debug, Clone)]
 pub struct Connector {
@@ -152,16 +172,20 @@ pub struct Connector {
     nodelay: bool,
     upstream: Arc<str>,
     tls: Option<TlsSetup>,
+    sni: Arc<ArcSwap<SniTable>>,
     metrics: Arc<Metrics>,
 }
 
 impl Connector {
-    async fn handshake(&self, host: &str, tcp: TcpStream) -> io::Result<UpstreamStream> {
+    async fn handshake(&self, host: &str, authority: &str, tcp: TcpStream) -> io::Result<UpstreamStream> {
         let setup = self
             .tls
             .as_ref()
             .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "https backend without TLS configuration"))?;
-        let name = server_name(setup.settings.as_ref(), host)
+        // `tls.server_name` wins; then the name a DNS-expanded member came from;
+        // then whatever the URI says (the backend's own host).
+        let resolved_from = self.sni.load().get(authority).cloned();
+        let name = server_name(setup.settings.as_ref(), resolved_from.as_deref().unwrap_or(host))
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e.to_string()))?;
         let connector = tokio_rustls::TlsConnector::from(Arc::clone(&setup.config));
         match tokio::time::timeout(self.connect_timeout, connector.connect(name, tcp)).await {
@@ -202,7 +226,10 @@ impl tower_service::Service<http::Uri> for Connector {
             };
             let stream = connect_backend(&addr, this.connect_timeout, this.nodelay).await?;
             let stream = match (tls, stream) {
-                (true, UpstreamStream::Tcp(tcp)) => this.handshake(host, tcp).await?,
+                (true, UpstreamStream::Tcp(tcp)) => {
+                    let authority = uri.authority().map_or(host, http::uri::Authority::as_str);
+                    this.handshake(host, authority, tcp).await?
+                }
                 (true, _) => return Err(io::Error::new(io::ErrorKind::InvalidInput, "TLS needs a TCP backend")),
                 (false, plain) => plain,
             };
@@ -267,6 +294,10 @@ struct ClientEntry {
     /// detect certificate rotation).
     tls: Option<Arc<rustls::ClientConfig>>,
     next_tls_check_ms: AtomicU64,
+    /// Shared with the client's connector.
+    sni: Arc<ArcSwap<SniTable>>,
+    /// The group build whose members `sni` reflects.
+    build_id: AtomicU64,
 }
 
 /// Per-upstream clients, rebuilt when their pool or TLS settings change.
@@ -298,6 +329,20 @@ impl UpstreamClients {
         let mut current_tls = None;
         if let Some(e) = self.map.get(&group.name) {
             if e.key.matches(group, connect, nodelay) {
+                // The pool was rebuilt (reload or DNS refresh): refresh the
+                // address → host-name table before any request can use a new member.
+                if e.build_id.swap(group.build_id, Ordering::Relaxed) != group.build_id {
+                    let mut table = sni_table_of(group);
+                    let old = e.sni.load();
+                    if old.len() + table.len() <= SNI_TABLE_MAX {
+                        // Keep recently retired members resolvable for requests
+                        // still finishing on the previous snapshot.
+                        for (k, v) in old.iter() {
+                            table.entry(k.clone()).or_insert_with(|| Arc::clone(v));
+                        }
+                    }
+                    e.sni.store(Arc::new(table));
+                }
                 let due = group.has_tls && now_ms() >= e.next_tls_check_ms.load(Ordering::Relaxed);
                 if !due {
                     return Ok(e.client.clone());
@@ -326,10 +371,12 @@ impl UpstreamClients {
         if key.protocol.is_h2() {
             builder.http2_only(true);
         }
+        let sni = Arc::new(ArcSwap::from_pointee(sni_table_of(group)));
         let connector = Connector {
             connect_timeout: connect,
             nodelay,
             upstream: Arc::clone(&group.name),
+            sni: Arc::clone(&sni),
             tls: tls.as_ref().map(|config| TlsSetup { config: Arc::clone(config), settings: group.config.tls.clone() }),
             metrics: Arc::clone(&self.metrics),
         };
@@ -341,6 +388,8 @@ impl UpstreamClients {
                 client: client.clone(),
                 tls,
                 next_tls_check_ms: AtomicU64::new(now_ms().saturating_add(recheck_ms(group))),
+                sni,
+                build_id: AtomicU64::new(group.build_id),
             },
         );
         Ok(client)

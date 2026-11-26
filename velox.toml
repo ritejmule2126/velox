@@ -137,6 +137,10 @@ addr = "127.0.0.1:9901"     # must be a loopback address
 log_level   = "info"        # or e.g. "info,velox_proxy=debug"; RUST_LOG overrides
 log_format  = "json"        # "json" (one object per line) or "pretty"
 access_log  = true          # one line per request with request_id, status, latency…
+# W3C Trace Context: continue a valid inbound `traceparent` (new span id for this
+# hop), mint one otherwise, forward `tracestate` only alongside a valid parent,
+# and add `trace_id` to the access log.
+traceparent = false
 # Prometheus text endpoint also served at http://127.0.0.1:9901/metrics.
 # Expose it to a scraper on its own port (serves ONLY /metrics and /healthz):
 # metrics_addr = "0.0.0.0:9100"
@@ -159,6 +163,25 @@ enabled      = false
 # content_types = ["text/*", "application/json", "application/*+json", "application/javascript",
 #                  "application/xml", "application/*+xml", "application/wasm", "application/x-ndjson",
 #                  "image/svg+xml"]
+# Compression is CPU work, so it is kept off the async event loop and bounded:
+# max_concurrent_encoders = 256      # more simultaneous compressed responses go out uncompressed
+# offload_threshold       = 32768    # slices this big run on dedicated worker threads
+# worker_threads          = 0        # 0 = one per CPU (2..=16)
+
+# -----------------------------------------------------------------------------
+# In-memory response cache (opt-in per route with `cache = {}`)
+# -----------------------------------------------------------------------------
+# Caches GET (and answers HEAD from it) per RFC 9111's shared-cache rules:
+# only responses that state their freshness (s-maxage / max-age / Expires, or the
+# route's default_ttl); never no-store / private / no-cache / Set-Cookie /
+# `Vary: *`; honours Vary, If-None-Match and If-Modified-Since (304 from memory);
+# requests with Authorization, Range or - by default - a Cookie bypass it.
+# A successful POST/PUT/PATCH/DELETE drops the URL; purge on demand with
+#   POST /admin/v1/cache/purge  {"all": true} | {"route": "...", "path_prefix": "/static/"}
+[cache]
+# max_bytes       = 67108864         # total memory (bodies + headers + keys)
+# max_entry_bytes = 1048576          # bigger bodies stream through uncached
+# shards          = 16               # independent LRUs (lock granularity)
 
 # -----------------------------------------------------------------------------
 # Upstreams
@@ -176,6 +199,13 @@ retries   = 1               # extra attempts on *another* backend (connect failu
 # an immediate 503 + Retry-After (no queueing, no cascading overload).
 # A backend can override it: { addr = "...", max_inflight = 50 }
 # max_inflight = 200
+
+# Track a hostname backend's addresses (Kubernetes headless service, multi-A
+# record): each address becomes its own pool member, re-resolved on an interval.
+# Unchanged answers cost nothing; changes add/retire members without disturbing
+# survivors or in-flight requests; a failed lookup keeps the last good answer.
+# https:// members are verified against the host name, not the address.
+# dns = { refresh_interval = "30s", timeout = "5s", max_addrs = 32, ipv6 = true }
 # hash_on = "ip"            # for consistent_hash: "ip", "path" or "header:x-user-id"
 backends = [
   { addr = "127.0.0.1:3000", weight = 1 },
@@ -234,9 +264,22 @@ upstream      = "app"
 #                                   #  or Forwarded: proto=https - is never redirected, so TLS-terminating load
 #                                   #  balancers cannot cause a redirect loop)
 # compress       = true             # override [compression].enabled for this route
+# cache = { default_ttl = "30s", max_ttl = "1h" }   # enable the response cache (see [cache])
+#                                   # also: ignore_query = true, allow_cookies = true (read the README first)
 # timeout        = "10s"            # override timeouts.upstream_response
 # request_headers = { "x-env" = "prod" }
 # rate_limit = { requests_per_second = 20.0, burst = 40, key = "header:x-api-key" }
+#
+# CORS, enforced at the edge: preflights are answered by Velox (204/403) and never
+# reach the backend; the backend's own Access-Control-* headers are replaced by
+# this policy on every response, including Velox's own 429/502.
+# [route.cors]
+# allow_origins     = ["https://app.example.com", "https://*.example.com"]   # or ["*"]
+# allow_methods     = ["GET", "POST"]            # default GET, HEAD, POST ("*" = any)
+# allow_headers     = ["content-type", "authorization"]   # "*" = reflect the preflight
+# expose_headers    = ["x-request-id"]
+# allow_credentials = false                      # never with allow_origins = ["*"]
+# max_age           = "10m"
 
 # -----------------------------------------------------------------------------
 # Optional: raw TCP (L4) load balancing, e.g. a database or MQTT broker.

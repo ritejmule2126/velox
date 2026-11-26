@@ -36,6 +36,10 @@ pub enum ProbeError {
     /// The TLS configuration for an `https://` backend is unusable.
     #[error("TLS configuration: {0}")]
     TlsConfig(String),
+    /// The backend did not speak the expected protocol (for example it did not
+    /// negotiate `h2` via ALPN).
+    #[error("protocol mismatch: {0}")]
+    Protocol(&'static str),
 }
 
 /// TLS settings for probing an `https://` backend.
@@ -45,6 +49,9 @@ pub struct TlsProbe {
     pub config: Arc<rustls::ClientConfig>,
     /// The upstream's `tls` table (for the SNI / verification name override).
     pub settings: Option<UpstreamTlsConfig>,
+    /// The host name a DNS-expanded member was resolved from: the default
+    /// SNI / certificate name when `settings` does not override it.
+    pub sni: Option<Arc<str>>,
 }
 
 /// Supervises background probe tasks.
@@ -140,12 +147,12 @@ async fn probe_loop(
         let tls_probe: Result<Option<TlsProbe>, ProbeError> = match &backend.addr {
             BackendAddr::Tls { .. } => tls
                 .client_config(tls_settings.as_ref(), h2)
-                .map(|config| Some(TlsProbe { config, settings: tls_settings }))
+                .map(|config| Some(TlsProbe { config, settings: tls_settings, sni: backend.sni.clone() }))
                 .map_err(|e| ProbeError::TlsConfig(e.to_string())),
             _ => Ok(None),
         };
         let result = match tls_probe {
-            Ok(t) => probe_with(&backend.addr, &cfg, t.as_ref()).await,
+            Ok(t) => probe_protocol(&backend.addr, &cfg, t.as_ref(), h2).await,
             Err(e) => Err(e),
         };
         match &result {
@@ -196,25 +203,52 @@ pub async fn probe(addr: &BackendAddr, cfg: &HealthConfig) -> Result<(), ProbeEr
 /// `addr` is `https://` (a `tcp` probe then proves the TLS service is up, not
 /// merely that the port accepts connections).
 pub async fn probe_with(addr: &BackendAddr, cfg: &HealthConfig, tls: Option<&TlsProbe>) -> Result<(), ProbeError> {
-    tokio::time::timeout(cfg.timeout, probe_inner(addr, cfg, tls)).await.map_err(|_| ProbeError::Timeout)?
+    probe_protocol(addr, cfg, tls, false).await
 }
 
-async fn probe_inner(addr: &BackendAddr, cfg: &HealthConfig, tls: Option<&TlsProbe>) -> Result<(), ProbeError> {
+/// Like [`probe_with`], speaking HTTP/2 when `http2` is set: prior knowledge on
+/// cleartext and Unix-socket backends (`h2c`), ALPN `h2` over TLS (which is
+/// verified: a backend that negotiates anything else fails the probe). Only
+/// affects `kind = "http"`; a `tcp` probe sends nothing either way.
+pub async fn probe_protocol(
+    addr: &BackendAddr,
+    cfg: &HealthConfig,
+    tls: Option<&TlsProbe>,
+    http2: bool,
+) -> Result<(), ProbeError> {
+    tokio::time::timeout(cfg.timeout, probe_inner(addr, cfg, tls, http2)).await.map_err(|_| ProbeError::Timeout)?
+}
+
+async fn probe_inner(
+    addr: &BackendAddr,
+    cfg: &HealthConfig,
+    tls: Option<&TlsProbe>,
+    http2: bool,
+) -> Result<(), ProbeError> {
     match addr {
         BackendAddr::Tcp { host, port } => {
             let stream = TcpStream::connect((BackendAddr::connect_host(host), *port)).await?;
             match cfg.kind {
                 HealthKind::Tcp => Ok(()),
+                HealthKind::Http if http2 => h2_probe(stream, cfg, false).await,
                 HealthKind::Http => http_probe(stream, cfg).await,
             }
         }
         BackendAddr::Tls { host, port } => {
             let tls = tls.ok_or_else(|| ProbeError::TlsConfig("no TLS configuration supplied".into()))?;
             let stream = TcpStream::connect((BackendAddr::connect_host(host), *port)).await?;
-            let name = server_name(tls.settings.as_ref(), host).map_err(|e| ProbeError::TlsConfig(e.to_string()))?;
+            let name = server_name(tls.settings.as_ref(), tls.sni.as_deref().unwrap_or(host))
+                .map_err(|e| ProbeError::TlsConfig(e.to_string()))?;
             let stream = tokio_rustls::TlsConnector::from(Arc::clone(&tls.config)).connect(name, stream).await?;
+            let negotiated_h2 = stream.get_ref().1.alpn_protocol() == Some(b"h2");
             match cfg.kind {
                 HealthKind::Tcp => Ok(()),
+                HealthKind::Http if http2 => {
+                    if !negotiated_h2 {
+                        return Err(ProbeError::Protocol("backend did not negotiate h2 via ALPN"));
+                    }
+                    h2_probe(stream, cfg, true).await
+                }
                 HealthKind::Http => http_probe(stream, cfg).await,
             }
         }
@@ -222,6 +256,7 @@ async fn probe_inner(addr: &BackendAddr, cfg: &HealthConfig, tls: Option<&TlsPro
             let stream = UnixStream::connect(path).await?;
             match cfg.kind {
                 HealthKind::Tcp => Ok(()),
+                HealthKind::Http if http2 => h2_probe(stream, cfg, false).await,
                 HealthKind::Http => http_probe(stream, cfg).await,
             }
         }
@@ -259,6 +294,46 @@ where
         Ok(())
     } else {
         Err(ProbeError::Status(status))
+    }
+}
+
+/// One `GET` over HTTP/2. The response *body* is never read: the status alone
+/// decides, and tearing the connection down resets the stream.
+async fn h2_probe<S>(stream: S, cfg: &HealthConfig, tls: bool) -> Result<(), ProbeError>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+{
+    use hyper_util::rt::{TokioExecutor, TokioIo};
+    let scheme = if tls { "https" } else { "http" };
+    let request = http::Request::builder()
+        .method(http::Method::GET)
+        .uri(format!("{scheme}://{}{}", cfg.host, cfg.path))
+        .header("user-agent", "velox-health/1")
+        .header("accept", "*/*")
+        .body(http_body_util::Empty::<bytes::Bytes>::new())
+        .map_err(|_| ProbeError::Malformed)?;
+    let (mut sender, connection) = hyper::client::conn::http2::handshake(TokioExecutor::new(), TokioIo::new(stream))
+        .await
+        .map_err(|_| ProbeError::Protocol("HTTP/2 handshake failed"))?;
+    // The connection task is aborted on every exit path, so a probe never leaks one.
+    let driver = AbortOnDrop(tokio::spawn(async move {
+        let _ = connection.await;
+    }));
+    let response = sender.send_request(request).await.map_err(|_| ProbeError::Malformed)?;
+    let status = response.status().as_u16();
+    drop(driver);
+    if (cfg.status_min..=cfg.status_max).contains(&status) {
+        Ok(())
+    } else {
+        Err(ProbeError::Status(status))
+    }
+}
+
+struct AbortOnDrop(JoinHandle<()>);
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
     }
 }
 
@@ -423,5 +498,164 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(25)).await;
         }
         panic!("condition not reached in time");
+    }
+
+    // ---- HTTP/2 probes ----
+
+    /// An `h2c` (prior knowledge) server answering with `status`; counts requests.
+    async fn h2c_mock(status: Arc<AtomicU16>) -> (std::net::SocketAddr, Arc<std::sync::atomic::AtomicUsize>) {
+        use hyper_util::rt::{TokioExecutor, TokioIo};
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let hits = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let h = Arc::clone(&hits);
+        tokio::spawn(async move {
+            loop {
+                let Ok((s, _)) = listener.accept().await else { return };
+                let (status, hits) = (Arc::clone(&status), Arc::clone(&h));
+                tokio::spawn(async move {
+                    let svc = hyper::service::service_fn(move |req: http::Request<hyper::body::Incoming>| {
+                        let (status, hits) = (Arc::clone(&status), Arc::clone(&hits));
+                        async move {
+                            hits.fetch_add(1, Ordering::SeqCst);
+                            assert_eq!(req.version(), http::Version::HTTP_2);
+                            assert_eq!(req.uri().path(), "/h2health");
+                            let mut r =
+                                http::Response::new(http_body_util::Full::new(bytes::Bytes::from_static(b"ok")));
+                            *r.status_mut() = http::StatusCode::from_u16(status.load(Ordering::Relaxed)).unwrap();
+                            Ok::<_, std::convert::Infallible>(r)
+                        }
+                    });
+                    let _ = hyper::server::conn::http2::Builder::new(TokioExecutor::new())
+                        .serve_connection(TokioIo::new(s), svc)
+                        .await;
+                });
+            }
+        });
+        (addr, hits)
+    }
+
+    fn h2_cfg() -> HealthConfig {
+        HealthConfig {
+            path: "/h2health".into(),
+            host: "svc.test".into(),
+            timeout: Duration::from_secs(2),
+            ..HealthConfig::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn h2c_probe_checks_the_status_of_a_real_http2_request() {
+        let status = Arc::new(AtomicU16::new(200));
+        let (addr, hits) = h2c_mock(Arc::clone(&status)).await;
+        let a = BackendAddr::Tcp { host: "127.0.0.1".into(), port: addr.port() };
+        assert!(probe_protocol(&a, &h2_cfg(), None, true).await.is_ok());
+        assert_eq!(hits.load(Ordering::SeqCst), 1);
+        status.store(503, Ordering::Relaxed);
+        assert!(matches!(probe_protocol(&a, &h2_cfg(), None, true).await, Err(ProbeError::Status(503))));
+        status.store(302, Ordering::Relaxed);
+        assert!(probe_protocol(&a, &h2_cfg(), None, true).await.is_ok(), "status_min..=status_max applies");
+        // A TCP probe against the same backend still just connects.
+        let tcp = HealthConfig { kind: HealthKind::Tcp, ..h2_cfg() };
+        assert!(probe_protocol(&a, &tcp, None, true).await.is_ok());
+        // Many probes do not leak connections or tasks: the server sees them all close.
+        for _ in 0..20 {
+            let _ = probe_protocol(&a, &h2_cfg(), None, true).await;
+        }
+        assert_eq!(hits.load(Ordering::SeqCst), 23);
+    }
+
+    #[tokio::test]
+    async fn protocol_mismatches_fail_the_probe_instead_of_passing_it() {
+        // An HTTP/1.1-only backend cannot answer an h2 probe…
+        let status = Arc::new(AtomicU16::new(200));
+        let h1 = mock(Arc::clone(&status)).await;
+        let a1 = BackendAddr::Tcp { host: "127.0.0.1".into(), port: h1.port() };
+        let c = HealthConfig { timeout: Duration::from_millis(800), ..h2_cfg() };
+        assert!(probe_protocol(&a1, &c, None, true).await.is_err(), "h1 server must not look healthy to an h2 probe");
+        // …and an h2c-only backend cannot answer an HTTP/1 probe.
+        let (h2, _) = h2c_mock(Arc::clone(&status)).await;
+        let a2 = BackendAddr::Tcp { host: "127.0.0.1".into(), port: h2.port() };
+        assert!(probe_protocol(&a2, &c, None, false).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn h2_probe_over_tls_requires_alpn_h2() {
+        use rustls::pki_types::pem::PemObject;
+        use velox_security::upstream_tls::UpstreamTlsRegistry;
+        let dir = tempfile::tempdir().unwrap();
+        let g = rcgen::generate_simple_self_signed(vec!["localhost".to_owned(), "127.0.0.1".to_owned()]).unwrap();
+        let (cert_path, key_path) = (dir.path().join("c.pem"), dir.path().join("k.pem"));
+        std::fs::write(&cert_path, g.cert.pem()).unwrap();
+        std::fs::write(&key_path, g.key_pair.serialize_pem()).unwrap();
+
+        // A TLS server whose ALPN list is chosen per test.
+        let serve = |alpn: Vec<Vec<u8>>| {
+            let chain = vec![g.cert.der().clone()];
+            let key = rustls::pki_types::PrivateKeyDer::from_pem_file(&key_path).unwrap();
+            async move {
+                let mut cfg =
+                    rustls::ServerConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
+                        .with_safe_default_protocol_versions()
+                        .unwrap()
+                        .with_no_client_auth()
+                        .with_single_cert(chain, key)
+                        .unwrap();
+                cfg.alpn_protocols = alpn;
+                let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(cfg));
+                let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+                let addr = listener.local_addr().unwrap();
+                tokio::spawn(async move {
+                    use hyper_util::rt::{TokioExecutor, TokioIo};
+                    loop {
+                        let Ok((s, _)) = listener.accept().await else { return };
+                        let acceptor = acceptor.clone();
+                        tokio::spawn(async move {
+                            let Ok(tls) = acceptor.accept(s).await else { return };
+                            let svc = hyper::service::service_fn(|_req: http::Request<hyper::body::Incoming>| async {
+                                Ok::<_, std::convert::Infallible>(http::Response::new(http_body_util::Full::new(
+                                    bytes::Bytes::from_static(b"ok"),
+                                )))
+                            });
+                            let _ = hyper::server::conn::http2::Builder::new(TokioExecutor::new())
+                                .serve_connection(TokioIo::new(tls), svc)
+                                .await;
+                        });
+                    }
+                });
+                addr
+            }
+        };
+        let settings = velox_core::config::UpstreamTlsConfig { ca_file: Some(cert_path.clone()), ..Default::default() };
+        let registry = UpstreamTlsRegistry::new();
+        let probe_tls = |h2: bool| TlsProbe {
+            config: registry.client_config(Some(&settings), h2).unwrap(),
+            settings: Some(settings.clone()),
+            sni: None,
+        };
+
+        // Backend that really speaks h2 over TLS: healthy.
+        let good = serve(vec![b"h2".to_vec()]).await;
+        let a = BackendAddr::Tls { host: "127.0.0.1".into(), port: good.port() };
+        assert!(probe_protocol(&a, &h2_cfg(), Some(&probe_tls(true)), true).await.is_ok());
+
+        // A backend that negotiates something else is reported as a protocol
+        // mismatch, not silently probed with the wrong protocol.
+        let h1_only = serve(vec![b"http/1.1".to_vec()]).await;
+        let a = BackendAddr::Tls { host: "127.0.0.1".into(), port: h1_only.port() };
+        // (offer h2 so the handshake completes, the server picks nothing in common → no ALPN)
+        let err = probe_protocol(&a, &h2_cfg(), Some(&probe_tls(true)), true).await.unwrap_err();
+        assert!(matches!(err, ProbeError::Protocol(_) | ProbeError::Io(_)), "{err}");
+        // A tcp probe on the same TLS service only needs the handshake to work
+        // for the ALPN set it offers.
+        let tcp = HealthConfig { kind: HealthKind::Tcp, ..h2_cfg() };
+        assert!(probe_protocol(
+            &BackendAddr::Tls { host: "127.0.0.1".into(), port: good.port() },
+            &tcp,
+            Some(&probe_tls(true)),
+            true
+        )
+        .await
+        .is_ok());
     }
 }

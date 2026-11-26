@@ -68,6 +68,20 @@ pub struct Metrics {
     proxy_protocol_errors: IntCounterVec,
     compression_responses: IntCounterVec,
     compression_bytes: IntCounterVec,
+    compression_skipped: IntCounterVec,
+    cors_denied: IntCounterVec,
+    cache_hits: IntCounterVec,
+    cache_misses: IntCounterVec,
+    cache_bypass: IntCounterVec,
+    cache_stores: IntCounter,
+    cache_evictions: IntCounter,
+    cache_purged: IntCounter,
+    cache_entries: IntGauge,
+    cache_bytes: IntGauge,
+    dns_resolutions: IntCounterVec,
+    dns_changes: IntCounterVec,
+    compression_offload_jobs: IntCounter,
+    compression_encoders_active: IntGauge,
 }
 
 /// Status codes 100..=599 get a cached counter slot.
@@ -81,6 +95,18 @@ fn counter(r: &Registry, name: &str, help: &str, labels: &[&str]) -> Result<IntC
     let c = IntCounterVec::new(Opts::new(name, help), labels)?;
     r.register(Box::new(c.clone()))?;
     Ok(c)
+}
+
+fn plain_counter(r: &Registry, name: &str, help: &str) -> Result<IntCounter, prometheus::Error> {
+    let c = IntCounter::new(name, help)?;
+    r.register(Box::new(c.clone()))?;
+    Ok(c)
+}
+
+fn plain_gauge(r: &Registry, name: &str, help: &str) -> Result<IntGauge, prometheus::Error> {
+    let g = IntGauge::new(name, help)?;
+    r.register(Box::new(g.clone()))?;
+    Ok(g)
 }
 
 fn gauge_vec(r: &Registry, name: &str, help: &str, labels: &[&str]) -> Result<IntGaugeVec, prometheus::Error> {
@@ -207,6 +233,61 @@ impl Metrics {
                 "Body bytes through the compressor (`in` = uncompressed, `out` = compressed)",
                 &["encoding", "direction"],
             )?,
+            dns_resolutions: counter(
+                &r,
+                "dns_resolutions_total",
+                "Periodic backend DNS lookups by result (ok / error / empty)",
+                &["upstream", "result"],
+            )?,
+            dns_changes: counter(
+                &r,
+                "dns_changes_total",
+                "DNS refreshes that changed an upstream's member set",
+                &["upstream"],
+            )?,
+            cache_hits: counter(&r, "cache_hits_total", "Requests answered from the response cache", &["route"])?,
+            cache_misses: counter(
+                &r,
+                "cache_misses_total",
+                "Cache-eligible requests that went to the backend",
+                &["route"],
+            )?,
+            cache_bypass: counter(
+                &r,
+                "cache_bypass_total",
+                "Requests or responses the cache declined, by reason",
+                &["reason"],
+            )?,
+            cache_stores: plain_counter(&r, "cache_stores_total", "Responses stored in the cache")?,
+            cache_evictions: plain_counter(&r, "cache_evictions_total", "Entries evicted to make room")?,
+            cache_purged: plain_counter(&r, "cache_purged_total", "Entries removed by purge or invalidation")?,
+            cache_entries: plain_gauge(&r, "cache_entries", "Objects currently cached")?,
+            cache_bytes: plain_gauge(&r, "cache_bytes", "Bytes currently cached")?,
+            cors_denied: counter(
+                &r,
+                "cors_denied_total",
+                "CORS preflights refused by a route's policy",
+                &["route", "reason"],
+            )?,
+            compression_skipped: counter(
+                &r,
+                "compression_skipped_total",
+                "Compressible responses sent uncompressed because no encoder slot was free",
+                &["reason"],
+            )?,
+            compression_offload_jobs: {
+                let c = IntCounter::new(
+                    "compression_offload_jobs_total",
+                    "Compression slices run on the dedicated worker threads",
+                )?;
+                r.register(Box::new(c.clone()))?;
+                c
+            },
+            compression_encoders_active: {
+                let g = IntGauge::new("compression_encoders_active", "Responses being compressed right now")?;
+                r.register(Box::new(g.clone()))?;
+                g
+            },
             config_generation,
             h3_enabled,
             connections_rejected,
@@ -285,6 +366,72 @@ impl Metrics {
         self.compression_responses.with_label_values(&[encoding]).inc();
         self.compression_bytes.with_label_values(&[encoding, "in"]).inc_by(bytes_in);
         self.compression_bytes.with_label_values(&[encoding, "out"]).inc_by(bytes_out);
+    }
+
+    /// Count a request answered from the cache.
+    pub fn cache_hit(&self, route: &str) {
+        self.cache_hits.with_label_values(&[route]).inc();
+    }
+
+    /// Count a cache-eligible request that went to the backend.
+    pub fn cache_miss(&self, route: &str) {
+        self.cache_misses.with_label_values(&[route]).inc();
+    }
+
+    /// Count a request or response the cache declined, and why.
+    pub fn cache_bypassed(&self, reason: &str) {
+        self.cache_bypass.with_label_values(&[reason]).inc();
+    }
+
+    /// Count a stored response.
+    pub fn cache_stored(&self) {
+        self.cache_stores.inc();
+    }
+
+    /// Count evicted entries.
+    pub fn cache_evicted(&self, n: u64) {
+        self.cache_evictions.inc_by(n);
+    }
+
+    /// Count entries removed by purge or invalidation.
+    pub fn cache_purged(&self, n: u64) {
+        self.cache_purged.inc_by(n);
+    }
+
+    /// Publish the cache's occupancy.
+    pub fn cache_size(&self, entries: usize, bytes: usize) {
+        self.cache_entries.set(i64::try_from(entries).unwrap_or(i64::MAX));
+        self.cache_bytes.set(i64::try_from(bytes).unwrap_or(i64::MAX));
+    }
+
+    /// Count a periodic DNS lookup (`ok`, `error` or `empty`).
+    pub fn dns_resolution(&self, upstream: &str, result: &str) {
+        self.dns_resolutions.with_label_values(&[upstream, result]).inc();
+    }
+
+    /// Count a DNS refresh that changed an upstream's members.
+    pub fn dns_changed(&self, upstream: &str) {
+        self.dns_changes.with_label_values(&[upstream]).inc();
+    }
+
+    /// Count a refused CORS preflight.
+    pub fn cors_denied(&self, route: &str, reason: &str) {
+        self.cors_denied.with_label_values(&[route, reason]).inc();
+    }
+
+    /// Count a compressible response that went out uncompressed.
+    pub fn compression_skipped(&self, reason: &str) {
+        self.compression_skipped.with_label_values(&[reason]).inc();
+    }
+
+    /// Count one slice compressed on a worker thread.
+    pub fn compression_offloaded(&self) {
+        self.compression_offload_jobs.inc();
+    }
+
+    /// Adjust the live-encoder gauge.
+    pub fn compression_encoders(&self, delta: i64) {
+        self.compression_encoders_active.add(delta);
     }
 
     /// Count a 429.

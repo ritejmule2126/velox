@@ -46,6 +46,9 @@ pub enum ProxyError {
     /// The backend sent something unusable.
     #[error("bad upstream response: {0}")]
     BadGateway(String),
+    /// A CORS preflight the route's policy does not allow.
+    #[error("cors preflight refused")]
+    CorsDenied,
     /// Internal inconsistency (never expected; logged, answered 500).
     #[error("internal error: {0}")]
     Internal(String),
@@ -63,6 +66,7 @@ impl ProxyError {
             Self::NoHealthyUpstream | Self::UpstreamSaturated => StatusCode::SERVICE_UNAVAILABLE,
             Self::UpstreamConnect(_) | Self::BadGateway(_) => StatusCode::BAD_GATEWAY,
             Self::UpstreamTimeout => StatusCode::GATEWAY_TIMEOUT,
+            Self::CorsDenied => StatusCode::FORBIDDEN,
             Self::Internal(_) => StatusCode::INTERNAL_SERVER_ERROR,
         }
     }
@@ -79,6 +83,7 @@ impl ProxyError {
             Self::UpstreamSaturated => "upstream is overloaded, retry shortly",
             Self::UpstreamConnect(_) | Self::BadGateway(_) => "bad gateway",
             Self::UpstreamTimeout => "upstream timed out",
+            Self::CorsDenied => "cross-origin request not allowed",
             Self::Internal(_) => "internal error",
         }
     }
@@ -137,6 +142,7 @@ mod tests {
             (ProxyError::ClientTimeout, 408),
             (ProxyError::NoHealthyUpstream, 503),
             (ProxyError::UpstreamSaturated, 503),
+            (ProxyError::CorsDenied, 403),
             (ProxyError::UpstreamConnect("x".into()), 502),
             (ProxyError::BadGateway("x".into()), 502),
             (ProxyError::UpstreamTimeout, 504),

@@ -5,6 +5,7 @@
 //! [`ProxyError`] mapped to a clean 4xx/5xx; nothing on this path unwraps.
 
 use crate::body::{BodyFault, Fault, IdleBody, LimitBody};
+use crate::cache::{self, Cache, FillTicket, KeyMeta, Offer, RequestMode};
 use crate::compress;
 use crate::error::{full, simple_response, ProxyBody, ProxyError};
 use crate::io::{Activity, InflightGuard, REJECT_PATH};
@@ -21,15 +22,18 @@ use http_body_util::BodyExt;
 use hyper_util::rt::TokioIo;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::atomic::{AtomicU16, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::Instant;
 use tracing::Instrument;
-use velox_core::config::{Algorithm, CompressionConfig, Config};
+use velox_core::cache_admin::{CacheAdmin, CacheStats, PurgeRequest};
+use velox_core::config::{Algorithm, CacheConfig, CompressionConfig, Config};
+use velox_core::cors::{self, CorsPolicy};
 use velox_core::router::Route;
 use velox_core::sanitize::{
     apply_forwarded_headers_hv, host_without_port, is_https_via_trusted_proxy, is_websocket_upgrade, request_id_from,
     resolve_client_ip, strip_hop_by_hop, validate_request_headers, Violation, X_REQUEST_ID,
 };
+use velox_core::trace::{self, TraceParent};
 use velox_core::upstream::ActiveGuard;
 use velox_core::{Snapshot, UpstreamGroup};
 use velox_health::{record_outcome, Outcome};
@@ -79,6 +83,11 @@ struct Trace<'s> {
     backend: Option<&'s str>,
     client_ip: Option<IpAddr>,
     error: Option<String>,
+    /// The trace context sent upstream (when `telemetry.traceparent` is on).
+    trace: Option<TraceParent>,
+    /// The route's CORS policy and the request's `Origin`, applied to the
+    /// response — including Velox's own error responses.
+    cors: Option<(&'s CorsPolicy, Option<HeaderValue>)>,
 }
 
 /// What response compression needs to know about the request.
@@ -94,6 +103,18 @@ struct ResponseCtx<'a> {
     ws: bool,
     client_upgrade: Option<hyper::upgrade::OnUpgrade>,
     compress: Option<CompressCtx<'a>>,
+    cache: CacheCtx,
+}
+
+/// What the response cache wants done with this request's response.
+#[derive(Default)]
+struct CacheCtx {
+    /// Value for `X-Velox-Cache` (`miss`, `bypass`), if the route caches.
+    tag: Option<&'static str>,
+    /// Offer the response for storage.
+    fill: Option<FillTicket>,
+    /// A successful unsafe request invalidates this URL.
+    invalidate: Option<(Arc<Cache>, Arc<str>)>,
 }
 
 /// The request's `Accept-Encoding` as one value (several header lines are joined).
@@ -124,10 +145,27 @@ pub struct Proxy {
     conn_limiter: Arc<ConnectionLimiter>,
     challenges: Arc<ChallengeStore>,
     clients: UpstreamClients,
+    compressor: Arc<compress::Compressor>,
+    cache: OnceLock<Arc<Cache>>,
     derived: ArcSwap<(u64, Arc<Derived>)>,
     bound_https: AtomicU16,
     bound_h3: AtomicU16,
     shutdown: Shutdown,
+}
+
+impl CacheAdmin for Proxy {
+    fn purge(&self, request: &PurgeRequest) -> usize {
+        let Some(cache) = self.cache.get() else { return 0 };
+        let removed = cache.purge_matching(request);
+        self.metrics.cache_purged(removed as u64);
+        let stats = cache.stats();
+        self.metrics.cache_size(stats.entries, stats.bytes);
+        removed
+    }
+
+    fn stats(&self) -> CacheStats {
+        self.cache.get().map(|c| c.stats()).unwrap_or_default()
+    }
 }
 
 impl std::fmt::Debug for Proxy {
@@ -162,9 +200,12 @@ impl Proxy {
     ) -> Arc<Self> {
         let derived = Arc::new(Derived::build(&state.load().config, 0, 0));
         let generation = state.load().generation;
+        let worker_threads = state.load().config.compression.worker_threads;
         Arc::new(Self {
             state,
             clients: UpstreamClients::new(Arc::clone(&metrics)),
+            compressor: compress::Compressor::new(Arc::clone(&metrics), worker_threads),
+            cache: OnceLock::new(),
             metrics,
             limiters: RateLimiters::new(),
             conn_limiter: ConnectionLimiter::new(),
@@ -207,6 +248,35 @@ impl Proxy {
     /// The shutdown handle.
     pub fn shutdown(&self) -> &Shutdown {
         &self.shutdown
+    }
+
+    /// The response cache, created on first use (so a proxy that never caches
+    /// allocates nothing).
+    fn cache(&self, cfg: &CacheConfig) -> &Arc<Cache> {
+        self.cache.get_or_init(|| Arc::new(Cache::new(cfg.shards)))
+    }
+
+    /// Compress `body` if the route wants it and the response is eligible.
+    fn apply_compression(
+        &self,
+        compress: Option<&CompressCtx<'_>>,
+        ended: bool,
+        parts: &mut http::response::Parts,
+        mut body: ProxyBody,
+    ) -> ProxyBody {
+        // A body that is already complete (`Content-Length: 0`, …) has nothing to
+        // compress; `HEAD` still gets its `Vary`.
+        if let Some(c) = compress.filter(|c| !ended || c.head) {
+            // Admission happens inside `plan`, before any header is touched: a
+            // response that cannot get an encoder slot goes out as it came.
+            let admitted = compress::plan(c.cfg, c.accept.as_ref(), c.head, parts.status, &mut parts.headers, |_| {
+                self.compressor.try_acquire(c.cfg.max_concurrent_encoders)
+            });
+            if let Some((algo, permit)) = admitted {
+                body = self.compressor.wrap(body, algo, permit, c.cfg);
+            }
+        }
+        body
     }
 
     /// Drop per-route limiters and pooled clients that no longer apply.
@@ -275,6 +345,9 @@ impl Proxy {
             }
         };
 
+        if let Some((policy, origin)) = &trace.cors {
+            policy.apply_response(origin.as_ref(), resp.headers_mut());
+        }
         let headers = resp.headers_mut();
         headers.insert(X_REQUEST_ID, request_id.clone());
         derived.response.apply(headers, conn.tls);
@@ -297,6 +370,7 @@ impl Proxy {
                 duration_ms = u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX),
                 protocol = conn.protocol.as_str(),
                 client_ip = %trace.client_ip.unwrap_or_else(|| conn.peer.ip()),
+                trace_id = trace.trace.as_ref().map(TraceParent::trace_id_hex),
                 route = trace.route,
                 upstream = trace.upstream,
                 backend = trace.backend,
@@ -374,6 +448,12 @@ impl Proxy {
             return redirect_to_https(route.canonical_host.as_deref().unwrap_or(host), derived.https_port, req.uri());
         }
 
+        // CORS: remember the policy so every response (even a 429 or 502 that
+        // Velox generates) carries it; preflights are answered below.
+        if let Some(policy) = &route.cors {
+            trace.cors = Some((policy, req.headers().get(cors::ORIGIN).cloned()));
+        }
+
         // ---- client identity + rate limit ----
         let client_ip = resolve_client_ip(req.headers(), conn.peer.ip(), &cfg.security.trusted_proxies);
         trace.client_ip = Some(client_ip);
@@ -386,6 +466,101 @@ impl Proxy {
             }
         }
 
+        // ---- CORS preflight: answered here, never forwarded ----
+        if let Some(policy) = &route.cors {
+            let h = req.headers();
+            if req.method() == Method::OPTIONS {
+                if let (Some(origin), Some(method)) = (h.get(cors::ORIGIN), h.get(cors::REQUEST_METHOD)) {
+                    let answer = policy.preflight(origin, method, h.get(cors::REQUEST_HEADERS));
+                    trace.cors = None; // the preflight answer is complete as it is
+                    return match answer {
+                        Ok(headers) => {
+                            let mut resp = Response::new(ProxyBody::Empty);
+                            *resp.status_mut() = StatusCode::NO_CONTENT;
+                            *resp.headers_mut() = headers;
+                            Ok(resp)
+                        }
+                        Err(why) => {
+                            self.metrics.cors_denied(&route.id, why.reason());
+                            Err(ProxyError::CorsDenied)
+                        }
+                    };
+                }
+            }
+        }
+
+        let compress = route.compress.unwrap_or(cfg.compression.enabled).then(|| CompressCtx {
+            cfg: &cfg.compression,
+            accept: accept_encoding(req.headers()),
+            head: req.method() == Method::HEAD,
+        });
+
+        // ---- response cache ----
+        let mut cache_ctx = CacheCtx::default();
+        if let Some(rc) = &route.cache {
+            let cache = self.cache(&cfg.cache);
+            let has_body = !(req.body().is_end_stream() || req.body().size_hint().exact() == Some(0));
+            let mode = cache::classify_request(req.method(), req.headers(), has_body, rc.allow_cookies);
+            let target = if rc.ignore_query {
+                req.uri().path()
+            } else {
+                req.uri().path_and_query().map_or("/", PathAndQuery::as_str)
+            };
+            let meta = Arc::new(KeyMeta::new(&route.id, host, conn.tls, target));
+            if let Some(key) = meta.key() {
+                match mode {
+                    RequestMode::Normal => {
+                        if let Some(entry) = cache.get(&key, req.headers(), Instant::now()) {
+                            self.metrics.cache_hit(&route.id);
+                            let hit = cache::serve_hit(&entry, req.headers(), Instant::now());
+                            let body = if req.method() == Method::HEAD || hit.status == StatusCode::NOT_MODIFIED {
+                                ProxyBody::Empty
+                            } else {
+                                ProxyBody::full(hit.body)
+                            };
+                            let mut resp = Response::new(ProxyBody::Empty);
+                            *resp.status_mut() = hit.status;
+                            *resp.headers_mut() = hit.headers;
+                            let (mut parts, _) = resp.into_parts();
+                            parts.headers.insert(cache::X_CACHE, HeaderValue::from_static("hit"));
+                            let ended = body.is_end_stream();
+                            let body = self.apply_compression(compress.as_ref(), ended, &mut parts, body);
+                            return Ok(Response::from_parts(parts, body));
+                        }
+                        self.metrics.cache_miss(&route.id);
+                    }
+                    RequestMode::Refresh => {
+                        cache.count_miss();
+                        self.metrics.cache_miss(&route.id);
+                    }
+                    RequestMode::Bypass(why) => {
+                        self.metrics.cache_bypassed(why);
+                        cache_ctx.tag = Some("bypass");
+                        // A successful write to this URL makes what we hold stale.
+                        if matches!(*req.method(), Method::POST | Method::PUT | Method::PATCH | Method::DELETE) {
+                            cache_ctx.invalidate = Some((Arc::clone(cache), Arc::clone(&key)));
+                        }
+                    }
+                }
+                if !matches!(mode, RequestMode::Bypass(_)) {
+                    cache_ctx.tag = Some("miss");
+                    // Only a `GET` is stored (a `HEAD` is answered from one).
+                    if req.method() == Method::GET {
+                        cache_ctx.fill = Some(FillTicket {
+                            cache: Arc::clone(cache),
+                            metrics: Arc::clone(&self.metrics),
+                            key,
+                            meta,
+                            route: rc.clone(),
+                            request_headers: req.headers().clone(),
+                            max_bytes: cfg.cache.max_bytes,
+                            max_entry_bytes: cfg.cache.max_entry_bytes,
+                        });
+                    }
+                }
+            }
+        }
+
         // ---- body limits ----
         let max_body = cfg.limits.max_request_body_bytes;
         if max_body > 0 && content_length(req.headers()).is_some_and(|n| n > max_body) {
@@ -395,11 +570,6 @@ impl Proxy {
         let client_upgrade = ws.then(|| hyper::upgrade::on(&mut req));
         let ws_proto = ws.then(|| req.headers().get(UPGRADE).cloned()).flatten();
         let (mut parts, body) = req.into_parts();
-        let compress = route.compress.unwrap_or(cfg.compression.enabled).then(|| CompressCtx {
-            cfg: &cfg.compression,
-            accept: accept_encoding(&parts.headers),
-            head: parts.method == Method::HEAD,
-        });
 
         let idle = cfg.timeouts.request_body_idle;
         let known_empty = body.is_end_stream() || body.size_hint().exact() == Some(0);
@@ -445,6 +615,9 @@ impl Proxy {
             host_hv.as_ref(),
             client_ip,
         );
+        if cfg.telemetry.traceparent {
+            trace.trace = Some(trace::propagate(&mut headers).context);
+        }
         for (k, v) in &route.request_headers {
             headers.insert(k.clone(), v.clone());
         }
@@ -555,7 +728,7 @@ impl Proxy {
                         resp,
                         active,
                         inflight.take(),
-                        ResponseCtx { ws, client_upgrade, compress },
+                        ResponseCtx { ws, client_upgrade, compress, cache: std::mem::take(&mut cache_ctx) },
                         cfg,
                     );
                 }
@@ -601,7 +774,7 @@ impl Proxy {
         ctx: ResponseCtx<'_>,
         cfg: &Config,
     ) -> Result<Response<ProxyBody>, ProxyError> {
-        let ResponseCtx { ws, client_upgrade, compress } = ctx;
+        let ResponseCtx { ws, client_upgrade, compress, cache: cache_ctx } = ctx;
         if resp.status() == StatusCode::SWITCHING_PROTOCOLS {
             let accepted = ws
                 && resp
@@ -613,6 +786,7 @@ impl Proxy {
             };
             let upstream_upgrade = hyper::upgrade::on(&mut resp);
             let (mut parts, _) = resp.into_parts();
+            parts.version = Version::HTTP_11;
             parts.headers.insert(CONNECTION, HeaderValue::from_static("upgrade"));
             drop(inflight); // a tunnel is not an in-flight HTTP request
             let kill = self.shutdown.kill.clone();
@@ -640,22 +814,46 @@ impl Proxy {
         }
 
         let (mut parts, body) = resp.into_parts();
+        // A legacy backend may answer `HTTP/1.0`; that is a statement about the
+        // *backend* hop only (it means "close-delimited, no chunking"), not
+        // something to leak to the client. Status, headers and body framing are
+        // untouched: hyper re-frames the body for the client connection itself
+        // (chunked for HTTP/1.1, and back down to 1.0 semantics for 1.0 clients).
+        parts.version = Version::HTTP_11;
         strip_hop_by_hop(&mut parts.headers);
         if ws {
             // The upgrade was declined: the guard stopped inspecting this
             // connection, so it must not be reused for further requests.
             parts.headers.insert(CONNECTION, HeaderValue::from_static("close"));
         }
-        // A body that is already complete (`Content-Length: 0`, `HEAD`, …) has
-        // nothing to compress.
+        if let Some((cache, key)) = &cache_ctx.invalidate {
+            if parts.status.as_u16() < 400 {
+                let removed = cache.invalidate(key);
+                if removed > 0 {
+                    self.metrics.cache_purged(removed as u64);
+                    let stats = cache.stats();
+                    self.metrics.cache_size(stats.entries, stats.bytes);
+                }
+            }
+        }
         let ended = body.is_end_stream();
         // One wrapper, one box: idle timeout + both in-flight guards.
         let body = IdleBody::with_guard(body, cfg.timeouts.upstream_body_idle, None, (active, inflight));
         let mut body = ProxyBody::boxed(body);
-        if let Some(c) = compress.as_ref().filter(|c| !ended || c.head) {
-            if let Some(algo) = compress::plan(c.cfg, c.accept.as_ref(), c.head, parts.status, &mut parts.headers) {
-                body = compress::wrap(body, algo, c.cfg.level, Arc::clone(&self.metrics));
+        let mut tag = cache_ctx.tag;
+        // The cache sees the response as the backend produced it — before
+        // compression, which is applied per client on the way out (hit or miss).
+        if let Some(ticket) = cache_ctx.fill {
+            let (offer, filled) = ticket.offer(parts.status, &parts.headers, body);
+            body = filled;
+            if let Offer::Pass(why) = offer {
+                self.metrics.cache_bypassed(why);
+                tag = Some("pass");
             }
+        }
+        let body = self.apply_compression(compress.as_ref(), ended, &mut parts, body);
+        if let Some(tag) = tag {
+            parts.headers.insert(cache::X_CACHE, HeaderValue::from_static(tag));
         }
         Ok(Response::from_parts(parts, body))
     }

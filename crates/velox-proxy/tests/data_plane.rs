@@ -1330,3 +1330,730 @@ async fn streamed_responses_are_delivered_incrementally_not_held_until_the_end()
 fn tokio_stream_from<T>(rx: tokio::sync::mpsc::Receiver<T>) -> impl futures_util::Stream<Item = T> {
     futures_util::stream::unfold(rx, |mut rx| async move { rx.recv().await.map(|v| (v, rx)) })
 }
+
+// ---------------- HTTP/1.0 backends ----------------
+
+/// A deliberately ancient backend: answers `HTTP/1.0`, optionally with no
+/// length (the body is delimited by closing the connection).
+async fn http10_backend(with_length: bool) -> SocketAddr {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        loop {
+            let Ok((mut s, _)) = listener.accept().await else { return };
+            tokio::spawn(async move {
+                let mut buf = [0u8; 2048];
+                let _ = s.read(&mut buf).await;
+                let reply: &[u8] = if with_length {
+                    b"HTTP/1.0 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 11\r\nX-Legacy: yes\r\n\r\nhello legacy"
+                } else {
+                    b"HTTP/1.0 200 OK\r\nContent-Type: text/plain\r\nX-Legacy: yes\r\n\r\nhello legacy"
+                };
+                // (11 bytes declared: "hello legacy" is 12, the declared length wins)
+                let _ = s.write_all(reply).await;
+                let _ = s.shutdown().await;
+            });
+        }
+    });
+    addr
+}
+
+#[tokio::test]
+async fn http10_backend_responses_are_normalised_for_clients() {
+    for with_length in [false, true] {
+        let b = http10_backend(with_length).await;
+        let h = start(&base("", &[b])).await;
+        let r =
+            raw(h.addr, b"GET / HTTP/1.1\r\nHost: example.test\r\nConnection: close\r\n\r\n", Duration::from_secs(2))
+                .await;
+        assert!(r.starts_with("HTTP/1.1 200 OK\r\n"), "length={with_length}: the 1.0 status line must not leak: {r}");
+        assert!(r.to_ascii_lowercase().contains("x-legacy: yes"), "headers survive: {r}");
+        if with_length {
+            assert!(r.to_ascii_lowercase().contains("content-length: 11"), "{r}");
+            assert_eq!(body(&r), "hello legac", "declared framing is preserved exactly");
+        } else {
+            // Close-delimited upstream body becomes a properly framed HTTP/1.1 body.
+            assert!(r.to_ascii_lowercase().contains("transfer-encoding: chunked"), "{r}");
+            assert!(r.contains("hello legacy"), "{r}");
+        }
+        // Keep-alive works toward the client even though the backend hop never could.
+        let two = raw(
+            h.addr,
+            b"GET /a HTTP/1.1\r\nHost: example.test\r\n\r\nGET /b HTTP/1.1\r\nHost: example.test\r\nConnection: close\r\n\r\n",
+            Duration::from_secs(2),
+        )
+        .await;
+        assert_eq!(two.matches("HTTP/1.1 200 OK").count(), 2, "{two}");
+        assert!(!two.contains("HTTP/1.0"), "{two}");
+        h.running.shutdown().await;
+    }
+}
+
+#[tokio::test]
+async fn http10_clients_still_get_http10_semantics() {
+    let (b, _) = backend(echo_headers()).await;
+    let h = start(&base("", &[b])).await;
+    let r = raw(h.addr, b"GET / HTTP/1.0\r\nHost: example.test\r\n\r\n", Duration::from_secs(2)).await;
+    assert!(r.starts_with("HTTP/1.0 200") || r.starts_with("HTTP/1.1 200"), "{r}");
+    assert!(!r.to_ascii_lowercase().contains("transfer-encoding: chunked"), "no chunking for a 1.0 client: {r}");
+    h.running.shutdown().await;
+}
+
+// ---------------- compression: encoder cap ----------------
+
+/// `/hold` streams one chunk and then stays open until released; anything else
+/// is an ordinary compressible document.
+async fn hold_backend(release: Arc<tokio::sync::Notify>) -> SocketAddr {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let doc = article();
+    tokio::spawn(async move {
+        loop {
+            let Ok((stream, _)) = listener.accept().await else { return };
+            let (release, doc) = (Arc::clone(&release), doc.clone());
+            tokio::spawn(async move {
+                let svc = service_fn(move |req: Request<Incoming>| {
+                    let (release, doc) = (Arc::clone(&release), doc.clone());
+                    async move {
+                        let hold = req.uri().path() == "/hold";
+                        let (tx, rx) = tokio::sync::mpsc::channel::<Result<http_body::Frame<Bytes>, Infallible>>(4);
+                        tokio::spawn(async move {
+                            let _ = tx.send(Ok(http_body::Frame::data(Bytes::from(doc)))).await;
+                            if hold {
+                                release.notified().await;
+                                let _ = tx.send(Ok(http_body::Frame::data(Bytes::from_static(b"tail\n")))).await;
+                            }
+                        });
+                        let mut r = Response::new(http_body_util::StreamBody::new(tokio_stream_from(rx)));
+                        r.headers_mut().insert("content-type", "text/html".parse().unwrap());
+                        Ok::<_, Infallible>(r)
+                    }
+                });
+                let _ = hyper::server::conn::http1::Builder::new().serve_connection(TokioIo::new(stream), svc).await;
+            });
+        }
+    });
+    addr
+}
+
+#[tokio::test]
+async fn compression_never_queues_or_fails_traffic_when_every_encoder_slot_is_busy() {
+    let release = Arc::new(tokio::sync::Notify::new());
+    let b = hold_backend(Arc::clone(&release)).await;
+    let h = start(&compression_config(b, "enabled = true\nmax_concurrent_encoders = 1", "")).await;
+    let ae = [("accept-encoding", "gzip")];
+
+    // Request A takes the only slot and keeps it (its body is still streaming).
+    let stream = TcpStream::connect(h.addr).await.unwrap();
+    let (mut sender, conn) = hyper::client::conn::http1::handshake(TokioIo::new(stream)).await.unwrap();
+    tokio::spawn(conn);
+    let req = Request::builder()
+        .uri("/hold")
+        .header("host", "example.test")
+        .header("accept-encoding", "gzip")
+        .body(Empty::<Bytes>::new())
+        .unwrap();
+    let resp = sender.send_request(req).await.unwrap();
+    assert_eq!(resp.headers()["content-encoding"], "gzip");
+    let mut a_body = resp.into_body();
+    let first = a_body.frame().await.unwrap().unwrap().into_data().unwrap();
+    assert!(!first.is_empty());
+
+    // B finds no free slot: it is served promptly, correctly, just uncompressed —
+    // and its headers do not pretend otherwise.
+    let t0 = std::time::Instant::now();
+    let (status, headers, body) = fetch(h.addr, "GET", "/doc", &ae).await;
+    assert_eq!(status, 200);
+    assert!(t0.elapsed() < Duration::from_secs(1), "no queueing behind the busy encoder: {:?}", t0.elapsed());
+    assert!(!headers.contains_key("content-encoding"), "{headers:?}");
+    assert_eq!(headers["vary"], "Accept-Encoding");
+    assert_eq!(body, article());
+    let m = h.proxy.metrics().render().unwrap();
+    assert!(m.contains("velox_compression_skipped_total{reason=\"saturated\"} 1"), "{m}");
+    assert!(m.contains("velox_compression_encoders_active 1"), "{m}");
+
+    // Finish A: the slot frees up and compression resumes.
+    release.notify_waiters();
+    let mut all = first.to_vec();
+    while let Some(f) = a_body.frame().await {
+        if let Ok(d) = f.unwrap().into_data() {
+            all.extend_from_slice(&d);
+        }
+    }
+    let mut expected = article();
+    expected.extend_from_slice(b"tail\n");
+    assert_eq!(decode("gzip", &all), expected, "the held response completed intact");
+    for _ in 0..100 {
+        if h.proxy.metrics().render().unwrap().contains("velox_compression_encoders_active 0") {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    let (_, headers, body) = fetch(h.addr, "GET", "/doc", &ae).await;
+    assert_eq!(headers["content-encoding"], "gzip", "slot released ⇒ compressing again");
+    assert_eq!(decode("gzip", &body), article());
+    h.running.shutdown().await;
+}
+
+// ---------------- CORS ----------------
+
+fn cors_config(backend: SocketAddr, cors: &str) -> String {
+    base(&format!("[route.cors]\n{cors}\n"), &[backend])
+}
+
+fn cors_backend() -> Handler {
+    // A backend with opinions of its own: it claims `*` + credentials, which the
+    // edge policy must override.
+    Arc::new(|req| {
+        let mut r = text(&format!("{} {}", req.method(), req.uri()));
+        r.headers_mut().insert("access-control-allow-origin", "*".parse().unwrap());
+        r.headers_mut().insert("access-control-allow-credentials", "true".parse().unwrap());
+        r.headers_mut().insert("access-control-expose-headers", "x-backend-secret".parse().unwrap());
+        r
+    })
+}
+
+#[tokio::test]
+async fn cors_preflights_are_answered_at_the_edge_and_never_reach_the_backend() {
+    let (b, hits) = backend(cors_backend()).await;
+    let h = start(&cors_config(
+        b,
+        "allow_origins = [\"https://app.example.com\", \"https://*.partner.test\"]\n\
+         allow_methods = [\"GET\", \"POST\", \"PUT\"]\nallow_headers = [\"content-type\", \"x-api-key\"]\n\
+         allow_credentials = true\nmax_age = \"10m\"\nexpose_headers = [\"x-request-id\"]",
+    ))
+    .await;
+    let preflight = |origin: &'static str, method: &'static str, headers: &'static str| {
+        let extra: Vec<(&str, &str)> = [("origin", origin), ("access-control-request-method", method)]
+            .into_iter()
+            .chain((!headers.is_empty()).then_some(("access-control-request-headers", headers)))
+            .collect();
+        let addr = h.addr;
+        async move { fetch(addr, "OPTIONS", "/api", &extra).await }
+    };
+
+    for origin in ["https://app.example.com", "https://eu.partner.test"] {
+        let (status, headers, body) = preflight(origin, "PUT", "content-type, x-api-key").await;
+        assert_eq!(status, 204, "{origin}");
+        assert!(body.is_empty());
+        assert_eq!(headers["access-control-allow-origin"], origin);
+        assert_eq!(headers["access-control-allow-methods"], "GET, POST, PUT");
+        assert_eq!(headers["access-control-allow-headers"], "content-type, x-api-key");
+        assert_eq!(headers["access-control-allow-credentials"], "true");
+        assert_eq!(headers["access-control-max-age"], "600");
+        let vary = headers.get_all("vary").iter().map(|v| v.to_str().unwrap()).collect::<Vec<_>>().join(",");
+        assert!(vary.contains("Origin") && vary.contains("Access-Control-Request-Method"), "{vary}");
+    }
+    // Refusals: 403 and no Access-Control-* at all.
+    for (origin, method, hdrs, why) in [
+        ("https://evil.test", "GET", "", "origin"),
+        ("https://app.example.com", "DELETE", "", "method"),
+        ("https://app.example.com", "GET", "x-secret", "header"),
+    ] {
+        let (status, headers, _) = preflight(origin, method, hdrs).await;
+        assert_eq!(status, 403, "{why}");
+        assert!(!headers.keys().any(|k| k.as_str().starts_with("access-control-")), "{why}: {headers:?}");
+        let m = h.proxy.metrics().render().unwrap();
+        assert!(m.contains(&format!("velox_cors_denied_total{{reason=\"{why}\",route=\"route-0\"}}")), "{m}");
+    }
+    assert_eq!(hits.load(Ordering::SeqCst), 0, "no preflight, allowed or not, reached the backend");
+
+    // An OPTIONS request that is *not* a preflight (no Access-Control-Request-Method) is just proxied.
+    let (status, _, body) = fetch(h.addr, "OPTIONS", "/api", &[("origin", "https://app.example.com")]).await;
+    assert_eq!(status, 200);
+    assert!(String::from_utf8_lossy(&body).starts_with("OPTIONS /api"));
+    assert_eq!(hits.load(Ordering::SeqCst), 1);
+    h.running.shutdown().await;
+}
+
+#[tokio::test]
+async fn cors_policy_replaces_the_backends_headers_on_real_and_error_responses() {
+    let (b, _) = backend(cors_backend()).await;
+    let h =
+        start(&cors_config(b, "allow_origins = [\"https://app.example.com\"]\nexpose_headers = [\"x-request-id\"]"))
+            .await;
+    // Allowed origin: the edge's policy, not the backend's `*` + credentials.
+    let (status, headers, _) = fetch(h.addr, "GET", "/data", &[("origin", "https://app.example.com")]).await;
+    assert_eq!(status, 200);
+    assert_eq!(headers["access-control-allow-origin"], "https://app.example.com");
+    assert!(!headers.contains_key("access-control-allow-credentials"), "backend's credentials claim removed");
+    assert_eq!(headers["access-control-expose-headers"], "x-request-id");
+    assert!(headers["vary"].to_str().unwrap().contains("Origin"));
+    // Disallowed origin: the backend's permissive headers are stripped, nothing replaces them.
+    let (status, headers, body) = fetch(h.addr, "GET", "/data", &[("origin", "https://evil.test")]).await;
+    assert_eq!(status, 200, "the request itself is still served (CORS is enforced by the browser)");
+    assert!(!headers.keys().any(|k| k.as_str().starts_with("access-control-")), "{headers:?}");
+    assert!(!body.is_empty());
+    // No Origin: no CORS headers, still varies.
+    let (_, headers, _) = fetch(h.addr, "GET", "/data", &[]).await;
+    assert!(!headers.contains_key("access-control-allow-origin"));
+    assert!(headers["vary"].to_str().unwrap().contains("Origin"));
+    h.running.shutdown().await;
+
+    // Velox's own errors carry the policy, so the browser reports the real status.
+    let dead = refused_port().await;
+    let h = start(&cors_config(dead, "allow_origins = [\"https://app.example.com\"]")).await;
+    let (status, headers, _) = fetch(h.addr, "GET", "/", &[("origin", "https://app.example.com")]).await;
+    assert_eq!(status, 502);
+    assert_eq!(
+        headers["access-control-allow-origin"], "https://app.example.com",
+        "a 502 must not look like a CORS failure"
+    );
+    h.running.shutdown().await;
+
+    // Rate limited requests too.
+    let (b, _) = backend(cors_backend()).await;
+    let cfg = cors_config(b, "allow_origins = [\"https://app.example.com\"]")
+        .replace("[route.cors]", "rate_limit = { requests_per_second = 0.001, burst = 1 }\n[route.cors]");
+    let h = start(&cfg).await;
+    let mut statuses = Vec::new();
+    for _ in 0..3 {
+        let (status, headers, _) = fetch(h.addr, "GET", "/", &[("origin", "https://app.example.com")]).await;
+        assert_eq!(headers["access-control-allow-origin"], "https://app.example.com", "status {status}");
+        statuses.push(status);
+    }
+    assert!(statuses.contains(&http::StatusCode::TOO_MANY_REQUESTS), "{statuses:?}");
+    h.running.shutdown().await;
+}
+
+#[tokio::test]
+async fn routes_without_cors_are_untouched_and_wildcard_origin_needs_no_credentials() {
+    let (b, hits) = backend(cors_backend()).await;
+    // No [route.cors]: the backend's own headers pass through, preflights are proxied.
+    let h = start(&base("", &[b])).await;
+    let (_, headers, _) = fetch(h.addr, "GET", "/", &[("origin", "https://x.test")]).await;
+    assert_eq!(headers["access-control-allow-origin"], "*");
+    assert_eq!(headers["access-control-allow-credentials"], "true");
+    let (status, _, _) =
+        fetch(h.addr, "OPTIONS", "/", &[("origin", "https://x.test"), ("access-control-request-method", "GET")]).await;
+    assert_eq!(status, 200);
+    assert_eq!(hits.load(Ordering::SeqCst), 2);
+    h.running.shutdown().await;
+
+    let h = start(&cors_config(b, "allow_origins = [\"*\"]")).await;
+    let (_, headers, _) = fetch(h.addr, "GET", "/", &[("origin", "https://anyone.test")]).await;
+    assert_eq!(headers["access-control-allow-origin"], "*");
+    assert!(!headers.contains_key("access-control-allow-credentials"));
+    let (_, headers, _) = fetch(h.addr, "GET", "/", &[]).await;
+    assert_eq!(headers["access-control-allow-origin"], "*", "a credential-less `*` answers everyone");
+    h.running.shutdown().await;
+}
+
+// ---------------- W3C trace context ----------------
+
+fn echo_trace() -> Handler {
+    Arc::new(|req| {
+        let get = |n: &str| req.headers().get(n).map_or_else(String::new, |v| v.to_str().unwrap().to_owned());
+        text(&format!("traceparent={}\ntracestate={}\n", get("traceparent"), get("tracestate")))
+    })
+}
+
+fn field<'a>(body: &'a str, name: &str) -> &'a str {
+    body.lines().find_map(|l| l.strip_prefix(&format!("{name}="))).unwrap_or("")
+}
+
+#[tokio::test]
+async fn traceparent_is_continued_or_minted_and_never_forwarded_when_disabled() {
+    const TRACE: &str = "4bf92f3577b34da6a3ce929d0e0e4736";
+    const SPAN: &str = "00f067aa0ba902b7";
+    let (b, _) = backend(echo_trace()).await;
+    let cfg = base("", &[b]).replace("[admin]", "[telemetry]\ntraceparent = true\n[admin]");
+    let h = start(&cfg).await;
+    let go = |headers: Vec<(&'static str, String)>| {
+        let addr = h.addr;
+        async move {
+            let hdrs: Vec<(&str, &str)> = headers.iter().map(|(k, v)| (*k, v.as_str())).collect();
+            let (_, _, body) = fetch(addr, "GET", "/", &hdrs).await;
+            String::from_utf8(body).unwrap()
+        }
+    };
+    // Valid inbound: same trace, new span, flags and tracestate kept.
+    let body = go(vec![("traceparent", format!("00-{TRACE}-{SPAN}-01")), ("tracestate", "vendor=x".to_owned())]).await;
+    let tp = field(&body, "traceparent");
+    assert!(tp.starts_with(&format!("00-{TRACE}-")) && tp.ends_with("-01"), "{tp}");
+    assert_ne!(&tp[36..52], SPAN, "our hop is a new span");
+    assert_eq!(field(&body, "tracestate"), "vendor=x");
+    // Not sampled stays not sampled.
+    let body = go(vec![("traceparent", format!("00-{TRACE}-{SPAN}-00"))]).await;
+    assert!(field(&body, "traceparent").ends_with("-00"));
+    // Missing, malformed, zero ids, duplicates: a fresh, valid trace and no orphan tracestate.
+    for headers in [
+        vec![],
+        vec![("traceparent", "garbage".to_owned()), ("tracestate", "vendor=x".to_owned())],
+        vec![("traceparent", format!("00-{}-{SPAN}-01", "0".repeat(32)))],
+        vec![("traceparent", format!("00-{TRACE}-{SPAN}-01")), ("traceparent", format!("00-{TRACE}-{SPAN}-00"))],
+    ] {
+        let body = go(headers).await;
+        let tp = field(&body, "traceparent");
+        assert_eq!(tp.len(), 55, "{tp}");
+        assert!(tp.starts_with("00-") && tp.ends_with("-01"), "{tp}");
+        assert_ne!(&tp[3..35], TRACE);
+        assert_eq!(field(&body, "tracestate"), "", "{body}");
+    }
+    h.running.shutdown().await;
+
+    // Off by default: whatever the client sent is simply forwarded, nothing minted.
+    let (b, _) = backend(echo_trace()).await;
+    let h = start(&base("", &[b])).await;
+    let (_, _, body) = fetch(h.addr, "GET", "/", &[]).await;
+    assert_eq!(field(std::str::from_utf8(&body).unwrap(), "traceparent"), "");
+    let (_, _, body) = fetch(h.addr, "GET", "/", &[("traceparent", "anything")]).await;
+    assert_eq!(field(std::str::from_utf8(&body).unwrap(), "traceparent"), "anything");
+    h.running.shutdown().await;
+}
+
+// ---------------- response cache ----------------
+
+/// A backend whose every invocation yields a distinct body (`n=<count>`), so a
+/// cached answer is distinguishable from a fresh one, with caller-chosen headers.
+fn counting_backend(headers: &'static [(&'static str, &'static str)]) -> Handler {
+    let n = Arc::new(AtomicUsize::new(0));
+    Arc::new(move |req| {
+        let i = n.fetch_add(1, Ordering::SeqCst) + 1;
+        let lang = req.headers().get("accept-language").map_or("-", |v| v.to_str().unwrap_or("?")).to_owned();
+        let mut r = text(&format!("n={i} lang={lang} {} {}", req.method(), req.uri()));
+        r.headers_mut().insert("content-type", "text/plain".parse().unwrap());
+        for (k, v) in headers {
+            r.headers_mut().insert(*k, v.parse().unwrap());
+        }
+        r
+    })
+}
+
+fn cache_config(backend: SocketAddr, route_cache: &str, global: &str) -> String {
+    base(&format!("cache = {route_cache}\n"), &[backend]).replace("[admin]", &format!("[cache]\n{global}\n[admin]"))
+}
+
+fn cache_state(headers: &http::HeaderMap) -> &str {
+    headers.get("x-velox-cache").map_or("", |v| v.to_str().unwrap())
+}
+
+fn text_of(body: &[u8]) -> String {
+    String::from_utf8_lossy(body).into_owned()
+}
+
+#[tokio::test]
+async fn cacheable_responses_are_served_from_memory_until_they_expire() {
+    let (b, hits) = backend(counting_backend(&[("cache-control", "max-age=1"), ("etag", "\"v1\"")])).await;
+    let h = start(&cache_config(b, "{}", "")).await;
+
+    let (s1, h1, b1) = fetch(h.addr, "GET", "/page?x=1", &[]).await;
+    assert_eq!((s1.as_u16(), cache_state(&h1)), (200, "miss"));
+    let (s2, h2, b2) = fetch(h.addr, "GET", "/page?x=1", &[]).await;
+    assert_eq!((s2.as_u16(), cache_state(&h2)), (200, "hit"));
+    assert_eq!(b1, b2, "the hit is byte-identical to the stored response");
+    assert_eq!(hits.load(Ordering::SeqCst), 1, "the backend was asked once");
+    assert!(h2.contains_key("age") && h2["etag"] == "\"v1\"", "{h2:?}");
+    assert_eq!(h2["content-length"].to_str().unwrap(), b2.len().to_string());
+    // A different query string is a different object.
+    let (_, h3, b3) = fetch(h.addr, "GET", "/page?x=2", &[]).await;
+    assert_eq!(cache_state(&h3), "miss");
+    assert_ne!(b3, b1);
+    assert_eq!(hits.load(Ordering::SeqCst), 2);
+    // A HEAD is answered from the stored GET: headers, no body.
+    let (sh, hh, bh) = fetch(h.addr, "HEAD", "/page?x=1", &[]).await;
+    assert_eq!((sh.as_u16(), cache_state(&hh)), (200, "hit"));
+    assert!(bh.is_empty());
+    assert_eq!(hh["content-length"].to_str().unwrap(), b1.len().to_string());
+    assert_eq!(hits.load(Ordering::SeqCst), 2);
+
+    // After max-age the entry is gone and the backend is asked again.
+    tokio::time::sleep(Duration::from_millis(1300)).await;
+    let (_, h4, b4) = fetch(h.addr, "GET", "/page?x=1", &[]).await;
+    assert_eq!(cache_state(&h4), "miss");
+    assert_ne!(b4, b1, "fresh content, not the stale entry");
+    let m = h.proxy.metrics().render().unwrap();
+    assert!(m.contains("velox_cache_hits_total{route=\"route-0\"} 2"), "{m}");
+    assert!(m.contains("velox_cache_misses_total{route=\"route-0\"} 3"), "{m}");
+    assert!(m.contains("velox_cache_stores_total 3"), "{m}");
+    h.running.shutdown().await;
+}
+
+#[tokio::test]
+async fn responses_the_backend_forbids_or_does_not_date_are_never_cached() {
+    for (label, headers, cached) in [
+        ("no-store", &[("cache-control", "no-store, max-age=60")][..], false),
+        ("private", &[("cache-control", "private, max-age=60")][..], false),
+        ("no-cache", &[("cache-control", "no-cache")][..], false),
+        ("set-cookie", &[("cache-control", "max-age=60"), ("set-cookie", "sid=1")][..], false),
+        ("vary *", &[("cache-control", "max-age=60"), ("vary", "*")][..], false),
+        ("max-age=0", &[("cache-control", "max-age=0")][..], false),
+        ("no freshness at all", &[][..], false),
+        ("s-maxage alone is enough", &[("cache-control", "s-maxage=60")][..], true),
+    ] {
+        let (b, hits) = backend(counting_backend(Box::leak(headers.to_vec().into_boxed_slice()))).await;
+        let h = start(&cache_config(b, "{}", "")).await;
+        for i in 0..3 {
+            let (status, headers, _) = fetch(h.addr, "GET", "/x", &[]).await;
+            assert_eq!(status, 200, "{label}");
+            let expect_hit = cached && i > 0;
+            assert_eq!(cache_state(&headers) == "hit", expect_hit, "{label} request {i}: {headers:?}");
+            if !cached {
+                assert_eq!(cache_state(&headers), "pass", "{label}");
+            }
+        }
+        assert_eq!(hits.load(Ordering::SeqCst), if cached { 1 } else { 3 }, "{label}");
+        h.running.shutdown().await;
+    }
+    // Velox does not invent freshness… unless the route says how long to keep things.
+    let (b, hits) = backend(counting_backend(&[])).await;
+    let h = start(&cache_config(b, "{ default_ttl = \"30s\" }", "")).await;
+    for _ in 0..3 {
+        fetch(h.addr, "GET", "/x", &[]).await;
+    }
+    assert_eq!(hits.load(Ordering::SeqCst), 1);
+    h.running.shutdown().await;
+    // …and `max_ttl` caps what a backend asks for.
+    let (b, hits) = backend(counting_backend(&[("cache-control", "max-age=3600")])).await;
+    let h = start(&cache_config(b, "{ max_ttl = \"1s\" }", "")).await;
+    fetch(h.addr, "GET", "/x", &[]).await;
+    tokio::time::sleep(Duration::from_millis(1200)).await;
+    fetch(h.addr, "GET", "/x", &[]).await;
+    assert_eq!(hits.load(Ordering::SeqCst), 2);
+    h.running.shutdown().await;
+}
+
+#[tokio::test]
+async fn vary_creates_separate_variants_and_conditionals_return_304_from_the_cache() {
+    let (b, hits) =
+        backend(counting_backend(&[("cache-control", "max-age=60"), ("vary", "Accept-Language"), ("etag", "\"v1\"")]))
+            .await;
+    let h = start(&cache_config(b, "{}", "")).await;
+    let get = |lang: &'static str| {
+        let addr = h.addr;
+        async move { fetch(addr, "GET", "/doc", &[("accept-language", lang)]).await }
+    };
+    let (_, h_en1, b_en1) = get("en").await;
+    let (_, h_fr1, b_fr1) = get("fr").await;
+    let (_, h_en2, b_en2) = get("en").await;
+    let (_, h_fr2, b_fr2) = get("fr").await;
+    assert_eq!(
+        (cache_state(&h_en1), cache_state(&h_fr1), cache_state(&h_en2), cache_state(&h_fr2)),
+        ("miss", "miss", "hit", "hit")
+    );
+    assert!(text_of(&b_en1).contains("lang=en") && text_of(&b_fr1).contains("lang=fr"));
+    assert_eq!((b_en1, b_fr1), (b_en2, b_fr2), "each client gets its own variant back");
+    assert_eq!(hits.load(Ordering::SeqCst), 2);
+    assert_eq!(h_en2["vary"], "Accept-Language");
+
+    // Conditional requests are answered by the cache itself.
+    for inm in ["\"v1\"", "W/\"v1\"", "\"old\", \"v1\"", "*"] {
+        let (status, headers, body) =
+            fetch(h.addr, "GET", "/doc", &[("accept-language", "en"), ("if-none-match", inm)]).await;
+        assert_eq!(status, 304, "{inm}");
+        assert!(body.is_empty());
+        assert_eq!((cache_state(&headers), headers["etag"].to_str().unwrap()), ("hit", "\"v1\""));
+        assert!(!headers.contains_key("content-type"), "no content headers on a 304");
+    }
+    let (status, _, body) =
+        fetch(h.addr, "GET", "/doc", &[("accept-language", "en"), ("if-none-match", "\"stale\"")]).await;
+    assert_eq!(status, 200, "a non-matching validator gets the full response");
+    assert!(!body.is_empty());
+    assert_eq!(hits.load(Ordering::SeqCst), 2, "no conditional request reached the backend");
+    h.running.shutdown().await;
+}
+
+#[tokio::test]
+async fn requests_that_must_not_be_cached_bypass_it_and_writes_invalidate() {
+    let (b, hits) = backend(counting_backend(&[("cache-control", "max-age=60")])).await;
+    let h = start(&cache_config(b, "{}", "")).await;
+    fetch(h.addr, "GET", "/res", &[]).await; // fill
+    assert_eq!(hits.load(Ordering::SeqCst), 1);
+
+    // Authorization, Range and no-store requests are never served from, or stored in, the cache.
+    for (label, hdr) in [
+        ("authorization", ("authorization", "Bearer secret")),
+        ("range", ("range", "bytes=0-3")),
+        ("no-store", ("cache-control", "no-store")),
+    ] {
+        let before = hits.load(Ordering::SeqCst);
+        let (_, headers, body) = fetch(h.addr, "GET", "/res", &[hdr]).await;
+        assert_eq!(cache_state(&headers), "bypass", "{label}");
+        assert_eq!(hits.load(Ordering::SeqCst), before + 1, "{label}: went to the backend");
+        assert!(text_of(&body).starts_with(&format!("n={}", before + 1)), "{label}");
+    }
+    // The entry that was already there is untouched by those.
+    let (_, headers, body) = fetch(h.addr, "GET", "/res", &[]).await;
+    assert_eq!(cache_state(&headers), "hit");
+    assert!(text_of(&body).starts_with("n=1 "), "{}", text_of(&body));
+
+    // `no-cache` skips the lookup but refreshes the stored copy.
+    let (_, headers, body) = fetch(h.addr, "GET", "/res", &[("cache-control", "no-cache")]).await;
+    assert_eq!(cache_state(&headers), "miss");
+    let refreshed = text_of(&body);
+    let (_, headers, body) = fetch(h.addr, "GET", "/res", &[]).await;
+    assert_eq!((cache_state(&headers), text_of(&body)), ("hit", refreshed), "the refresh replaced the entry");
+
+    // A successful write to the URL invalidates it (RFC 9111 §4.4).
+    let stream = TcpStream::connect(h.addr).await.unwrap();
+    let (mut sender, conn) = hyper::client::conn::http1::handshake(TokioIo::new(stream)).await.unwrap();
+    tokio::spawn(conn);
+    let post = Request::builder()
+        .method("POST")
+        .uri("/res")
+        .header("host", "example.test")
+        .body(Empty::<Bytes>::new())
+        .unwrap();
+    let r = sender.send_request(post).await.unwrap();
+    assert_eq!(r.status(), 200);
+    assert_eq!(r.headers()["x-velox-cache"], "bypass");
+    let (_, headers, _) = fetch(h.addr, "GET", "/res", &[]).await;
+    assert_eq!(cache_state(&headers), "miss", "the POST dropped the cached GET");
+    h.running.shutdown().await;
+}
+
+#[tokio::test]
+async fn oversized_bodies_stream_through_intact_and_are_not_stored() {
+    let big = "z".repeat(5_000);
+    let (b, hits) =
+        backend(content_backend_boxed("text/plain", big.clone().into_bytes(), &[("cache-control", "max-age=60")]))
+            .await;
+    let h = start(&cache_config(b, "{}", "max_entry_bytes = 2048\nmax_bytes = 1048576\nshards = 4")).await;
+    for _ in 0..3 {
+        let (status, headers, body) = fetch(h.addr, "GET", "/big", &[]).await;
+        assert_eq!(status, 200);
+        assert_eq!(text_of(&body), big, "the client always gets the whole body");
+        assert_eq!(cache_state(&headers), "pass");
+    }
+    assert_eq!(hits.load(Ordering::SeqCst), 3);
+    assert!(h.proxy.metrics().render().unwrap().contains("velox_cache_bypass_total{reason=\"too-large\"} 3"));
+    h.running.shutdown().await;
+}
+
+fn content_backend_boxed(
+    content_type: &'static str,
+    body: Vec<u8>,
+    extra: &'static [(&'static str, &'static str)],
+) -> Handler {
+    content_backend(content_type, body, extra)
+}
+
+#[tokio::test]
+async fn memory_stays_bounded_and_the_hot_entries_survive() {
+    let (b, hits) = backend(counting_backend(&[("cache-control", "max-age=300")])).await;
+    // One shard, room for roughly a dozen small entries.
+    let h = start(&cache_config(b, "{}", "max_bytes = 6000\nmax_entry_bytes = 1024\nshards = 1")).await;
+    fetch(h.addr, "GET", "/hot", &[]).await;
+    for i in 0..60 {
+        fetch(h.addr, "GET", &format!("/cold/{i}"), &[]).await;
+        // Keep /hot warm.
+        let (_, headers, _) = fetch(h.addr, "GET", "/hot", &[]).await;
+        assert_eq!(cache_state(&headers), "hit", "round {i}: the recently used entry must not be evicted");
+    }
+    let m = h.proxy.metrics().render().unwrap();
+    let gauge = |name: &str| -> usize {
+        m.lines().find_map(|l| l.strip_prefix(name)).and_then(|v| v.trim().parse().ok()).unwrap_or(usize::MAX)
+    };
+    assert!(gauge("velox_cache_bytes ") <= 6000, "{m}");
+    assert!(gauge("velox_cache_entries ") < 60, "old entries were evicted: {m}");
+    assert!(!m.contains("velox_cache_evictions_total 0"), "{m}");
+    assert_eq!(hits.load(Ordering::SeqCst), 61, "/hot hit the backend exactly once");
+    h.running.shutdown().await;
+}
+
+#[tokio::test]
+async fn compression_and_cors_are_applied_per_client_on_cached_responses() {
+    let doc = article();
+    let (b, hits) = backend(content_backend("text/html", doc.clone(), &[("cache-control", "max-age=60")])).await;
+    let cfg = base("cache = {}\n", &[b]).replace("[admin]", "[compression]\nenabled = true\n[admin]").replace(
+        "cache = {}\n",
+        "cache = {}\n[route.cors]\nallow_origins = [\"https://a.test\", \"https://b.test\"]\n",
+    );
+    let h = start(&cfg).await;
+    // Fill with an identity client from origin A.
+    let (_, h1, b1) = fetch(h.addr, "GET", "/doc", &[("origin", "https://a.test")]).await;
+    assert_eq!((cache_state(&h1), h1["access-control-allow-origin"].to_str().unwrap()), ("miss", "https://a.test"));
+    assert_eq!(b1, doc);
+    // Hits are compressed per client and carry the *requesting* origin's CORS headers.
+    let (_, h2, b2) = fetch(h.addr, "GET", "/doc", &[("accept-encoding", "gzip"), ("origin", "https://b.test")]).await;
+    assert_eq!(cache_state(&h2), "hit");
+    assert_eq!(h2["content-encoding"], "gzip");
+    assert_eq!(decode("gzip", &b2), doc);
+    assert_eq!(h2["access-control-allow-origin"], "https://b.test", "origin A's header must not leak to B");
+    let (_, h3, b3) = fetch(h.addr, "GET", "/doc", &[]).await;
+    assert_eq!((cache_state(&h3), b3), ("hit", doc));
+    assert!(!h3.contains_key("content-encoding") && !h3.contains_key("access-control-allow-origin"));
+    assert_eq!(hits.load(Ordering::SeqCst), 1, "one backend request served all three clients");
+    h.running.shutdown().await;
+}
+
+#[tokio::test]
+async fn routes_hosts_and_the_ignore_query_option_form_the_cache_key() {
+    let (b, hits) = backend(counting_backend(&[("cache-control", "max-age=60")])).await;
+    let h = start(&cache_config(b, "{ ignore_query = true }", "")).await;
+    let (_, h1, b1) = fetch(h.addr, "GET", "/p?utm=1", &[]).await;
+    let (_, h2, b2) = fetch(h.addr, "GET", "/p?utm=2", &[]).await;
+    assert_eq!(
+        (cache_state(&h1), cache_state(&h2), b1 == b2),
+        ("miss", "hit", true),
+        "the query is not part of the key"
+    );
+    h.running.shutdown().await;
+
+    let h = start(&cache_config(b, "{}", "")).await;
+    let on_host = |host: &'static str| {
+        let addr = h.addr;
+        async move {
+            let stream = TcpStream::connect(addr).await.unwrap();
+            let (mut s, conn) = hyper::client::conn::http1::handshake(TokioIo::new(stream)).await.unwrap();
+            tokio::spawn(conn);
+            let req = Request::builder().uri("/same").header("host", host).body(Empty::<Bytes>::new()).unwrap();
+            s.send_request(req).await.unwrap().headers()["x-velox-cache"].to_str().unwrap().to_owned()
+        }
+    };
+    assert_eq!(on_host("a.test").await, "miss");
+    assert_eq!(on_host("A.TEST").await, "hit", "hosts compare case-insensitively");
+    assert_eq!(on_host("b.test").await, "miss", "another host is another object");
+    let _ = hits;
+    h.running.shutdown().await;
+}
+
+#[tokio::test]
+async fn routes_without_a_cache_table_are_untouched() {
+    let (b, hits) = backend(counting_backend(&[("cache-control", "max-age=60")])).await;
+    let h = start(&base("", &[b])).await;
+    for _ in 0..3 {
+        let (_, headers, _) = fetch(h.addr, "GET", "/x", &[]).await;
+        assert!(!headers.contains_key("x-velox-cache"));
+    }
+    assert_eq!(hits.load(Ordering::SeqCst), 3);
+    h.running.shutdown().await;
+    // `enabled = false` switches a configured route off without deleting the table.
+    let (b, hits) = backend(counting_backend(&[("cache-control", "max-age=60")])).await;
+    let h = start(&cache_config(b, "{ enabled = false }", "")).await;
+    for _ in 0..2 {
+        fetch(h.addr, "GET", "/x", &[]).await;
+    }
+    assert_eq!(hits.load(Ordering::SeqCst), 2);
+    h.running.shutdown().await;
+}
+
+#[tokio::test]
+async fn requests_with_cookies_never_see_or_fill_the_shared_cache_unless_the_route_opts_in() {
+    // The classic leak: a backend that personalises on the cookie but forgot `Vary: Cookie`.
+    let (b, hits) = backend(counting_backend(&[("cache-control", "max-age=60")])).await;
+    let h = start(&cache_config(b, "{}", "")).await;
+    let (_, cold, _) = fetch(h.addr, "GET", "/profile", &[]).await; // an anonymous visitor fills the cache
+    assert_eq!(cache_state(&cold), "miss");
+    for who in ["sid=alice", "sid=bob"] {
+        let (_, headers, body) = fetch(h.addr, "GET", "/profile", &[("cookie", who)]).await;
+        assert_eq!(cache_state(&headers), "bypass", "{who}");
+        assert!(text_of(&body).starts_with("n="), "{who}");
+    }
+    assert_eq!(hits.load(Ordering::SeqCst), 3, "each cookie-bearing request went to the backend");
+    // …and their (possibly personal) responses were not stored for others.
+    let (_, anon, body) = fetch(h.addr, "GET", "/profile", &[]).await;
+    assert_eq!(cache_state(&anon), "hit");
+    assert!(text_of(&body).starts_with("n=1 "), "still the anonymous copy: {}", text_of(&body));
+    assert!(h.proxy.metrics().render().unwrap().contains("velox_cache_bypass_total{reason=\"cookie\"} 2"));
+    h.running.shutdown().await;
+
+    // An explicit opt-in for routes known not to vary on cookies.
+    let (b, hits) = backend(counting_backend(&[("cache-control", "max-age=60")])).await;
+    let h = start(&cache_config(b, "{ allow_cookies = true }", "")).await;
+    fetch(h.addr, "GET", "/asset.js", &[("cookie", "sid=alice")]).await;
+    let (_, headers, _) = fetch(h.addr, "GET", "/asset.js", &[("cookie", "sid=bob")]).await;
+    assert_eq!(cache_state(&headers), "hit");
+    assert_eq!(hits.load(Ordering::SeqCst), 1);
+    h.running.shutdown().await;
+}

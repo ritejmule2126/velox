@@ -8,7 +8,7 @@ use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use velox_admin::{AdminApi, Reloader};
 use velox_core::{Config, SharedState};
-use velox_health::HealthChecker;
+use velox_health::{DnsRefresher, HealthChecker, Resolver, SystemResolver};
 use velox_proxy::{Proxy, Running, Shutdown};
 use velox_security::{ChallengeStore, SniResolver};
 use velox_telemetry::Metrics;
@@ -99,6 +99,16 @@ impl App {
     /// `config_path` enables file-based reloads; without it `reload` fails
     /// with a clear message (API/state edits still work).
     pub async fn start(config: Config, config_path: Option<PathBuf>) -> Result<Self> {
+        Self::start_with_resolver(config, config_path, Arc::new(SystemResolver)).await
+    }
+
+    /// [`App::start`] with a custom resolver for periodic backend DNS refresh
+    /// (service discovery, or a scripted resolver in tests).
+    pub async fn start_with_resolver(
+        config: Config,
+        config_path: Option<PathBuf>,
+        resolver: Arc<dyn Resolver>,
+    ) -> Result<Self> {
         let state = SharedState::new(config.clone())?;
         let metrics = Arc::new(Metrics::new()?);
         let challenges = Arc::new(ChallengeStore::default());
@@ -133,13 +143,21 @@ impl App {
 
         // Background health checking follows the proxy's drain signal.
         aux.push(HealthChecker::new(Arc::clone(&state), aux_cancel.clone()).spawn());
+        aux.push(
+            DnsRefresher::new(Arc::clone(&state), aux_cancel.clone())
+                .with_resolver(resolver)
+                .with_metrics(Arc::clone(&metrics))
+                .spawn(),
+        );
 
         let reloader: Arc<dyn Reloader> = match config_path {
             Some(path) => Arc::new(FileReloader::new(path, Arc::clone(&state), tls)),
             None => Arc::new(NoFile),
         };
         let token = config.admin.token_env.as_deref().and_then(|var| std::env::var(var).ok()).filter(|t| !t.is_empty());
-        let api = AdminApi::new(Arc::clone(&state), Arc::clone(&metrics), Arc::clone(&reloader), token);
+        let cache: Arc<dyn velox_core::cache_admin::CacheAdmin> = Arc::clone(&proxy) as _;
+        let api =
+            AdminApi::with_cache(Arc::clone(&state), Arc::clone(&metrics), Arc::clone(&reloader), token, Some(cache));
 
         let mut admin_addr = None;
         if let Some(addr) = config.admin.addr {

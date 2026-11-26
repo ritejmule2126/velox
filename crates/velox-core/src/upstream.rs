@@ -62,6 +62,9 @@ pub struct Backend {
     pub authority: http::uri::Authority,
     /// Spoken to over TLS (`https://` address).
     pub tls: bool,
+    /// The host name this backend was resolved from (DNS refresh): the default
+    /// SNI / certificate name, and what the admin API reports.
+    pub sni: Option<Arc<str>>,
     /// Circuit-breaker cap on in-flight requests (0 = unlimited). Atomic so a
     /// reload can change it on a backend that keeps its runtime state.
     max_inflight: AtomicU32,
@@ -84,6 +87,12 @@ impl Backend {
     /// Build a backend whose in-flight cap is its own `max_inflight`, else
     /// `default_limit` (the upstream's).
     pub fn with_default_limit(cfg: &BackendConfig, default_limit: Option<u32>) -> Self {
+        Self::resolved(cfg, default_limit, None)
+    }
+
+    /// Like [`Backend::with_default_limit`] for a member produced by DNS
+    /// refresh: `cfg.addr` is the IP, `from_host` the name it came from.
+    pub fn resolved(cfg: &BackendConfig, default_limit: Option<u32>, from_host: Option<Arc<str>>) -> Self {
         let authority = match &cfg.addr {
             BackendAddr::Tcp { host, port } | BackendAddr::Tls { host, port } => format!("{host}:{port}"),
             BackendAddr::Unix(path) => uds_authority(path),
@@ -94,6 +103,7 @@ impl Backend {
             weight: cfg.weight,
             authority: authority.parse().unwrap_or_else(|_| http::uri::Authority::from_static("invalid.velox-backend")),
             tls: matches!(cfg.addr, BackendAddr::Tls { .. }),
+            sni: from_host,
             max_inflight: AtomicU32::new(cfg.max_inflight.or(default_limit).unwrap_or(0)),
             healthy: AtomicBool::new(true),
             draining: AtomicBool::new(false),
@@ -325,22 +335,60 @@ pub struct UpstreamGroup {
     pub uniform_weights: bool,
     /// `true` when at least one backend is reached over TLS (`https://`).
     pub has_tls: bool,
+    /// Unique per build: lets caches keyed on the group notice a rebuild.
+    pub build_id: u64,
 }
+
+/// DNS answers by `(upstream name, configured backend address)`.
+pub type DnsTable = std::collections::HashMap<(String, String), Arc<[std::net::IpAddr]>>;
+
+static BUILD_IDS: AtomicU64 = AtomicU64::new(1);
 
 impl UpstreamGroup {
     /// Build a group, reusing runtime state of identical backends in `prev`.
     pub fn build(cfg: &UpstreamConfig, prev: Option<&UpstreamGroup>) -> Self {
-        let backends: Vec<Arc<Backend>> = cfg
-            .backends
+        Self::build_with_dns(cfg, prev, &DnsTable::new())
+    }
+
+    /// [`UpstreamGroup::build`], expanding hostname backends into one member per
+    /// address in `dns` (when the upstream has a `dns` table and an answer is
+    /// known; otherwise the hostname backend stays a single member that the OS
+    /// resolves per connection).
+    pub fn build_with_dns(cfg: &UpstreamConfig, prev: Option<&UpstreamGroup>, dns: &DnsTable) -> Self {
+        // (member config, host name it was resolved from)
+        let mut members: Vec<(BackendConfig, Option<Arc<str>>)> = Vec::with_capacity(cfg.backends.len());
+        for bc in &cfg.backends {
+            let answer = cfg
+                .dns
+                .as_ref()
+                .and(bc.addr.hostname())
+                .and_then(|_| dns.get(&(cfg.name.clone(), bc.addr.to_string())))
+                .filter(|ips| !ips.is_empty());
+            match (answer, bc.addr.hostname()) {
+                (Some(ips), Some(host)) => {
+                    let host: Arc<str> = Arc::from(host);
+                    for ip in ips.iter() {
+                        if let Some(addr) = bc.addr.at_ip(*ip) {
+                            members.push((BackendConfig { addr, ..bc.clone() }, Some(Arc::clone(&host))));
+                        }
+                    }
+                }
+                _ => members.push((bc.clone(), None)),
+            }
+        }
+        let backends: Vec<Arc<Backend>> = members
             .iter()
-            .map(|bc| {
-                match prev.and_then(|p| p.backends.iter().find(|b| b.addr == bc.addr && b.weight == bc.weight)) {
+            .map(|(bc, from)| {
+                let reuse = prev.and_then(|p| {
+                    p.backends.iter().find(|b| b.addr == bc.addr && b.weight == bc.weight && b.sni == *from)
+                });
+                match reuse {
                     Some(b) => {
                         // Runtime state survives a reload; the cap is configuration.
                         b.set_max_inflight(bc.max_inflight.or(cfg.max_inflight));
                         Arc::clone(b)
                     }
-                    None => Arc::new(Backend::with_default_limit(bc, cfg.max_inflight)),
+                    None => Arc::new(Backend::resolved(bc, cfg.max_inflight, from.clone())),
                 }
             })
             .collect();
@@ -365,6 +413,7 @@ impl UpstreamGroup {
             cum_weights,
             uniform_weights,
             has_tls,
+            build_id: BUILD_IDS.fetch_add(1, Ordering::Relaxed),
         }
     }
 
@@ -514,6 +563,7 @@ mod tests {
             pool: Default::default(),
             max_inflight: None,
             tls: None,
+            dns: None,
         }
     }
 

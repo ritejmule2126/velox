@@ -9,6 +9,7 @@ use serde::Serialize;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+use velox_core::cache_admin::{CacheAdmin, PurgeRequest};
 use velox_core::config::{RouteConfig, UpstreamConfig};
 use velox_core::{Config, ConfigError, SharedState};
 use velox_telemetry::Metrics;
@@ -46,6 +47,7 @@ pub struct AdminApi {
     state: Arc<SharedState>,
     metrics: Arc<Metrics>,
     reloader: Arc<dyn Reloader>,
+    cache: Option<Arc<dyn CacheAdmin>>,
     token: Option<String>,
     started: Instant,
 }
@@ -115,7 +117,26 @@ impl AdminApi {
         reloader: Arc<dyn Reloader>,
         token: Option<String>,
     ) -> Arc<Self> {
-        Arc::new(Self { state, metrics, reloader, token: token.filter(|t| !t.is_empty()), started: Instant::now() })
+        Self::with_cache(state, metrics, reloader, token, None)
+    }
+
+    /// [`AdminApi::new`] plus the response cache's management handle, enabling
+    /// `GET /admin/v1/cache` and `POST /admin/v1/cache/purge`.
+    pub fn with_cache(
+        state: Arc<SharedState>,
+        metrics: Arc<Metrics>,
+        reloader: Arc<dyn Reloader>,
+        token: Option<String>,
+        cache: Option<Arc<dyn CacheAdmin>>,
+    ) -> Arc<Self> {
+        Arc::new(Self {
+            state,
+            metrics,
+            reloader,
+            cache,
+            token: token.filter(|t| !t.is_empty()),
+            started: Instant::now(),
+        })
     }
 
     /// Handle one request from `peer`.
@@ -223,6 +244,26 @@ impl AdminApi {
                     Err(ApiError::new(StatusCode::UNPROCESSABLE_ENTITY, e))
                 }
             },
+
+            // ---- response cache ----
+            (&Method::GET, ["admin", "v1", "cache"]) => {
+                let cache = self.cache.as_ref().ok_or_else(|| not_found("cache"))?;
+                json(StatusCode::OK, &cache.stats())
+            }
+            (&Method::POST, ["admin", "v1", "cache", "purge"]) => {
+                let cache = self.cache.as_ref().ok_or_else(|| not_found("cache"))?;
+                let request: PurgeRequest = Self::read_json(&parts.headers, body).await?;
+                if !request.is_selective() {
+                    // `{}` must never mean "everything": say so explicitly with `all`.
+                    return Err(ApiError::new(
+                        StatusCode::BAD_REQUEST,
+                        "name what to purge: `all`, `route`, `host`, `path` or `path_prefix`",
+                    ));
+                }
+                let purged = cache.purge(&request);
+                tracing::info!(purged, ?request, "cache purged via admin API");
+                json(StatusCode::OK, &serde_json::json!({ "purged": purged }))
+            }
 
             // ---- upstreams ----
             (&Method::GET, ["admin", "v1", "upstreams"]) => {

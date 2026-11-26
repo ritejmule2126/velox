@@ -57,3 +57,17 @@ path = "fuzz_targets/accept_encoding.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "traceparent"
+path = "fuzz_targets/traceparent.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "cache_policy"
+path = "fuzz_targets/cache_policy.rs"
+test = false
+doc = false
+bench = false

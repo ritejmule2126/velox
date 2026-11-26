@@ -261,3 +261,116 @@ async fn https_backend_health_checks_complete_the_tls_handshake() {
     eventually(5, "backend recovers", || state(true)).await;
     assert!(app.shutdown().await);
 }
+
+#[tokio::test]
+async fn http_health_checks_work_for_h2_tls_backends_without_falling_back_to_tcp() {
+    let dir = tempfile::tempdir().unwrap();
+    let (cert, key, _) = write_named_cert(dir.path(), "srv", &["localhost", "127.0.0.1"]);
+    let healthy = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let probes = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let (h, p) = (std::sync::Arc::clone(&healthy), std::sync::Arc::clone(&probes));
+    // ALPN offers *only* h2: an HTTP/1.1 probe could not even connect.
+    let b = tls_backend(
+        handler(move |req| {
+            let (h, p) = (std::sync::Arc::clone(&h), std::sync::Arc::clone(&p));
+            async move {
+                if req.uri().path() == "/health" {
+                    assert_eq!(req.version(), http::Version::HTTP_2, "the probe is real HTTP/2");
+                    p.fetch_add(1, Ordering::SeqCst);
+                    if !h.load(Ordering::SeqCst) {
+                        let mut r = text("down");
+                        *r.status_mut() = http::StatusCode::SERVICE_UNAVAILABLE;
+                        return r;
+                    }
+                }
+                text("ok")
+            }
+        }),
+        &cert,
+        &key,
+        TlsBackendOpts { alpn: vec![b"h2"], ..Default::default() },
+    )
+    .await;
+    let up = format!(
+        "protocol = \"h2\"\nbackends = [{{ addr = \"https://127.0.0.1:{}\" }}]\ntls = {{ ca_file = \"{}\" }}\n\
+         health = {{ kind = \"http\", path = \"/health\", interval = \"100ms\", timeout = \"1s\", jitter = 0.0, healthy_threshold = 1, unhealthy_threshold = 1 }}",
+        b.addr.port(),
+        pem(&cert)
+    );
+    let app = start_app(&up, "").await;
+    let admin_addr = app.admin_addr.unwrap();
+    let state = |want: bool| async move {
+        let (_, v) = support::admin(admin_addr, "GET", "/admin/v1/upstreams/app", None).await;
+        v["backends"][0]["healthy"] == serde_json::json!(want)
+    };
+    eventually(5, "h2 probes reach the backend", || {
+        let probes = std::sync::Arc::clone(&probes);
+        async move { probes.load(Ordering::SeqCst) >= 3 }
+    })
+    .await;
+    assert!(state(true).await);
+    healthy.store(false, Ordering::SeqCst);
+    eventually(5, "backend marked unhealthy by the HTTP/2 probe", || state(false)).await;
+    healthy.store(true, Ordering::SeqCst);
+    eventually(5, "backend recovers", || state(true)).await;
+    // And real traffic over the same h2 TLS pool works.
+    let (status, head, _) = plain(app.running.http_addr.unwrap(), "/", "").await;
+    assert_eq!(status, 200);
+    assert!(head.to_ascii_lowercase().contains("x-alpn: h2"), "{head}");
+    assert!(app.shutdown().await);
+}
+
+#[tokio::test]
+async fn dns_expanded_https_members_are_verified_against_the_service_name_not_the_ip() {
+    use std::future::Future;
+    use std::pin::Pin;
+    struct Fixed(Vec<std::net::IpAddr>);
+    impl velox_health::Resolver for Fixed {
+        fn resolve<'a>(
+            &'a self,
+            _h: &'a str,
+            _p: u16,
+        ) -> Pin<Box<dyn Future<Output = std::io::Result<Vec<std::net::IpAddr>>> + Send + 'a>> {
+            Box::pin(async move { Ok(self.0.clone()) })
+        }
+    }
+    let dir = tempfile::tempdir().unwrap();
+    // The certificate names the *service*, not any IP address.
+    let (cert, key, _) = write_named_cert(dir.path(), "srv", &["pay.internal"]);
+    let b =
+        tls_backend(describe(), &cert, &key, TlsBackendOpts { alpn: vec![b"http/1.1"], ..Default::default() }).await;
+    let toml = format!(
+        "[server]\nhttp_addr = \"127.0.0.1:0\"\ndrain_timeout = \"1s\"\n[admin]\naddr = \"127.0.0.1:0\"\n\
+         [[upstream]]\nname = \"app\"\nretries = 0\ndns = {{ refresh_interval = \"1s\" }}\n\
+         backends = [{{ addr = \"https://pay.internal:{}\" }}]\ntls = {{ ca_file = \"{}\" }}\n\
+         health = {{ kind = \"http\", path = \"/health\", interval = \"100ms\", timeout = \"1s\", jitter = 0.0, healthy_threshold = 1, unhealthy_threshold = 1 }}\n\
+         [[route]]\nupstream = \"app\"\n",
+        b.addr.port(),
+        pem(&cert)
+    );
+    let resolver = std::sync::Arc::new(Fixed(vec!["127.0.0.1".parse().unwrap()]));
+    let app = App::start_with_resolver(Config::from_toml_str(&toml).unwrap(), None, resolver).await.unwrap();
+    let http = app.running.http_addr.unwrap();
+    let admin_addr = app.admin_addr.unwrap();
+    eventually(10, "pool to expand to the resolved address", || async {
+        let (_, v) = support::admin(admin_addr, "GET", "/admin/v1/upstreams/app", None).await;
+        v["backends"][0]["resolved_from"] == "pay.internal"
+    })
+    .await;
+    let (_, v) = support::admin(admin_addr, "GET", "/admin/v1/upstreams/app", None).await;
+    assert_eq!(v["backends"][0]["addr"], format!("https://127.0.0.1:{}", b.addr.port()));
+
+    // Real traffic: succeeds only because verification used `pay.internal`.
+    let (status, _, body) = plain(http, "/x", "").await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(b.snis.lock().unwrap().last().unwrap().as_deref(), Some("pay.internal"));
+    // So do the health probes of that member (they flip it healthy only if they handshake).
+    eventually(5, "TLS health probe to succeed against the resolved member", || async {
+        b.snis.lock().unwrap().len() >= 3
+    })
+    .await;
+    let (_, v) = support::admin(admin_addr, "GET", "/admin/v1/upstreams/app", None).await;
+    assert_eq!(v["backends"][0]["healthy"], true);
+    assert_eq!(b.failed_handshakes.load(Ordering::SeqCst), 0, "no handshake was ever refused");
+    assert!(app.shutdown().await);
+}

@@ -330,3 +330,101 @@ async fn real_listener_refuses_non_loopback_and_serves_loopback() {
     cancel.cancel();
     handle.await.unwrap();
 }
+
+// ---------------- response cache endpoints ----------------
+
+use std::sync::Mutex;
+use velox_core::cache_admin::{CacheAdmin, CacheStats, PurgeRequest};
+
+#[derive(Default)]
+struct FakeCache {
+    purges: Mutex<Vec<PurgeRequest>>,
+}
+
+impl CacheAdmin for FakeCache {
+    fn purge(&self, request: &PurgeRequest) -> usize {
+        self.purges.lock().unwrap().push(request.clone());
+        7
+    }
+    fn stats(&self) -> CacheStats {
+        CacheStats { entries: 3, bytes: 4096, max_bytes: 1 << 20, hits: 10, misses: 4, evictions: 1 }
+    }
+}
+
+fn cache_fixture() -> (Fixture, Arc<FakeCache>) {
+    let f = fixture(None);
+    let cache = Arc::new(FakeCache::default());
+    let api = AdminApi::with_cache(
+        Arc::clone(&f.state),
+        Arc::new(Metrics::new().unwrap()),
+        Arc::clone(&f.reloader) as Arc<dyn Reloader>,
+        None,
+        Some(Arc::clone(&cache) as Arc<dyn CacheAdmin>),
+    );
+    (Fixture { api, ..f }, cache)
+}
+
+#[tokio::test]
+async fn cache_endpoints_report_stats_and_forward_purges() {
+    let (f, cache) = cache_fixture();
+    let (status, v, _) = call(&f, Method::GET, "/admin/v1/cache", None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        (v["entries"].as_u64(), v["hits"].as_u64(), v["max_bytes"].as_u64()),
+        (Some(3), Some(10), Some(1 << 20))
+    );
+
+    let body = json!({ "route": "r1", "path_prefix": "/static/" });
+    let (status, v, _) = call(&f, Method::POST, "/admin/v1/cache/purge", Some(body)).await;
+    assert_eq!((status, v["purged"].as_u64()), (StatusCode::OK, Some(7)));
+    let seen = cache.purges.lock().unwrap().clone();
+    assert_eq!(seen.len(), 1);
+    assert_eq!(
+        (seen[0].route.as_deref(), seen[0].path_prefix.as_deref(), seen[0].all),
+        (Some("r1"), Some("/static/"), false)
+    );
+
+    // Nothing selected, or a typo: refused, and the cache is never asked.
+    for bad in [json!({}), json!({ "all": false }), json!({ "alll": true })] {
+        let (status, _, text) = call(&f, Method::POST, "/admin/v1/cache/purge", Some(bad)).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{text}");
+    }
+    assert_eq!(cache.purges.lock().unwrap().len(), 1);
+    // JSON is required, like every admin write.
+    let (status, ..) =
+        request(&f, LOCAL, Method::POST, "/admin/v1/cache/purge", None, &[("host", "127.0.0.1:9901")]).await;
+    assert_eq!(status, StatusCode::UNSUPPORTED_MEDIA_TYPE);
+}
+
+#[tokio::test]
+async fn cache_endpoints_are_404_without_a_cache_and_guarded_like_the_rest() {
+    let f = fixture(None);
+    assert_eq!(call(&f, Method::GET, "/admin/v1/cache", None).await.0, StatusCode::NOT_FOUND);
+    assert_eq!(
+        call(&f, Method::POST, "/admin/v1/cache/purge", Some(json!({ "all": true }))).await.0,
+        StatusCode::NOT_FOUND
+    );
+    // Purging is a write: the usual loopback / token / CSRF rules apply.
+    let (f, cache) = cache_fixture();
+    let (status, ..) = request(
+        &f,
+        "10.0.0.1:5000",
+        Method::POST,
+        "/admin/v1/cache/purge",
+        Some(json!({ "all": true })),
+        &[("host", "127.0.0.1:9901")],
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    let (status, ..) = request(
+        &f,
+        LOCAL,
+        Method::POST,
+        "/admin/v1/cache/purge",
+        Some(json!({ "all": true })),
+        &[("host", "127.0.0.1:9901"), ("origin", "https://evil.test")],
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "browser-originated purge refused");
+    assert!(cache.purges.lock().unwrap().is_empty());
+}

@@ -32,6 +32,8 @@ pub struct BackendView {
     pub saturated: bool,
     /// Reached over TLS (`https://`).
     pub tls: bool,
+    /// The host name this member was resolved from (DNS refresh), if any.
+    pub resolved_from: Option<String>,
 }
 
 impl From<&Backend> for BackendView {
@@ -50,6 +52,7 @@ impl From<&Backend> for BackendView {
             max_inflight: b.max_inflight(),
             saturated: b.is_saturated(),
             tls: b.tls,
+            resolved_from: b.sni.as_deref().map(str::to_owned),
         }
     }
 }

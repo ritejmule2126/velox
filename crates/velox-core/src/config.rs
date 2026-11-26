@@ -30,6 +30,8 @@ pub struct Config {
     pub security: SecurityConfig,
     /// Streaming response compression (opt-in).
     pub compression: CompressionConfig,
+    /// Sizing of the in-memory response cache (routes opt in with `cache`).
+    pub cache: CacheConfig,
     /// Default rate-limit policy applied to every route (routes may override).
     pub rate_limit: Option<RateLimitConfig>,
     /// Localhost-only admin API.
@@ -403,11 +405,20 @@ pub struct TelemetryConfig {
     pub access_log: bool,
     /// Optional dedicated listener serving only `/metrics` (may be non-loopback).
     pub metrics_addr: Option<SocketAddr>,
+    /// Propagate W3C Trace Context: continue a valid inbound `traceparent`
+    /// (new span id for this hop), mint one otherwise, and log the trace id.
+    pub traceparent: bool,
 }
 
 impl Default for TelemetryConfig {
     fn default() -> Self {
-        Self { log_level: "info".to_owned(), log_format: LogFormat::Json, access_log: true, metrics_addr: None }
+        Self {
+            log_level: "info".to_owned(),
+            log_format: LogFormat::Json,
+            access_log: true,
+            metrics_addr: None,
+            traceparent: false,
+        }
     }
 }
 
@@ -435,6 +446,30 @@ pub enum BackendAddr {
 }
 
 impl BackendAddr {
+    /// The host name if this is a TCP/TLS backend addressed by name (not by IP
+    /// literal) — the ones DNS refresh applies to.
+    pub fn hostname(&self) -> Option<&str> {
+        match self {
+            Self::Tcp { host, .. } | Self::Tls { host, .. } => {
+                (Self::connect_host(host).parse::<std::net::IpAddr>().is_err()).then_some(host.as_str())
+            }
+            Self::Unix(_) => None,
+        }
+    }
+
+    /// The same endpoint at a resolved `ip` (`None` for Unix sockets).
+    pub fn at_ip(&self, ip: std::net::IpAddr) -> Option<Self> {
+        let host = match ip {
+            std::net::IpAddr::V4(v4) => v4.to_string(),
+            std::net::IpAddr::V6(v6) => format!("[{v6}]"),
+        };
+        match self {
+            Self::Tcp { port, .. } => Some(Self::Tcp { host, port: *port }),
+            Self::Tls { port, .. } => Some(Self::Tls { host, port: *port }),
+            Self::Unix(_) => None,
+        }
+    }
+
     /// The host without IPv6 brackets, suitable for `TcpStream::connect`.
     pub fn connect_host(host: &str) -> &str {
         host.trim_start_matches('[').trim_end_matches(']')
@@ -592,6 +627,15 @@ pub struct CompressionConfig {
     /// Compressible media types: `type/subtype`, `type/*`, or a `*` glob in
     /// the subtype (`application/*+json`).
     pub content_types: Vec<String>,
+    /// At most this many responses are compressed at once (each holds an
+    /// encoder). Beyond it, responses pass through uncompressed — compression
+    /// is an optimisation and never queues or fails traffic.
+    pub max_concurrent_encoders: usize,
+    /// Slices of at least this many bytes are compressed on dedicated worker
+    /// threads instead of the async runtime; smaller ones run inline.
+    pub offload_threshold: usize,
+    /// Compression worker threads (`0` = one per CPU, between 2 and 16).
+    pub worker_threads: usize,
 }
 
 impl Default for CompressionConfig {
@@ -615,6 +659,9 @@ impl Default for CompressionConfig {
             .iter()
             .map(|s| (*s).to_owned())
             .collect(),
+            max_concurrent_encoders: 256,
+            offload_threshold: 32 * 1024,
+            worker_threads: 0,
         }
     }
 }
@@ -832,6 +879,41 @@ pub struct UpstreamConfig {
     /// certificate). Optional: the defaults verify against the public web PKI.
     #[serde(default)]
     pub tls: Option<UpstreamTlsConfig>,
+    /// Periodically re-resolve hostname backends and use *every* address they
+    /// return (Kubernetes headless services, multi-A records). Omit to keep the
+    /// old behaviour: the OS resolves the name on each new connection.
+    #[serde(default)]
+    pub dns: Option<DnsConfig>,
+}
+
+/// Periodic DNS resolution of hostname backends.
+///
+/// Each hostname backend (`app.svc.cluster.local:8080`) becomes one pool member
+/// per resolved address, each with its own health, ejection, `max_inflight` and
+/// in-flight accounting. A refresh that returns the same addresses changes
+/// nothing; a changed answer adds new members and retires vanished ones
+/// *without* touching surviving members or their pooled connections. If a
+/// lookup fails or returns nothing, the last good answer stays in use.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct DnsConfig {
+    /// Time between lookups of each hostname.
+    #[serde(with = "humantime_serde")]
+    pub refresh_interval: Duration,
+    /// Deadline for one lookup.
+    #[serde(with = "humantime_serde")]
+    pub timeout: Duration,
+    /// Use at most this many addresses per hostname (lowest first, so every
+    /// instance picks the same ones).
+    pub max_addrs: usize,
+    /// Also use IPv6 (`AAAA`) answers.
+    pub ipv6: bool,
+}
+
+impl Default for DnsConfig {
+    fn default() -> Self {
+        Self { refresh_interval: Duration::from_secs(30), timeout: Duration::from_secs(5), max_addrs: 32, ipv6: true }
+    }
 }
 
 /// TLS used to reach `https://` backends.
@@ -919,6 +1001,92 @@ pub struct RouteConfig {
     /// Override of `compression.enabled` for this route.
     #[serde(default)]
     pub compress: Option<bool>,
+    /// CORS policy enforced at the edge (preflights answered by Velox).
+    #[serde(default)]
+    pub cors: Option<CorsConfig>,
+    /// Cache `GET`/`HEAD` responses of this route in memory (see `[cache]`).
+    /// `cache = {}` turns it on with defaults.
+    #[serde(default)]
+    pub cache: Option<RouteCacheConfig>,
+}
+
+/// Sizing of the shared response cache. Which routes use it, and how long
+/// their responses live, is decided per route and by the backend's own
+/// `Cache-Control`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct CacheConfig {
+    /// Total bytes the cache may hold (bodies + headers + keys).
+    pub max_bytes: u64,
+    /// Responses with a larger body are streamed through uncached; this also
+    /// bounds what is buffered per in-flight cacheable miss.
+    pub max_entry_bytes: u64,
+    /// Independent LRU shards (lock granularity). Fixed once the cache exists.
+    pub shards: usize,
+}
+
+impl Default for CacheConfig {
+    fn default() -> Self {
+        Self { max_bytes: 64 * 1024 * 1024, max_entry_bytes: 1024 * 1024, shards: 16 }
+    }
+}
+
+/// Per-route cache settings.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct RouteCacheConfig {
+    /// Master switch for this route (handy to turn it off without deleting the table).
+    pub enabled: bool,
+    /// Freshness to assume for a cacheable response that states none
+    /// (no `max-age`, `s-maxage` or `Expires`). Without it such responses are
+    /// never cached: Velox does not guess lifetimes.
+    #[serde(with = "humantime_serde::option")]
+    pub default_ttl: Option<Duration>,
+    /// Upper bound on how long anything is kept, whatever the backend says.
+    #[serde(with = "humantime_serde::option")]
+    pub max_ttl: Option<Duration>,
+    /// Ignore the query string when forming the cache key (`?utm=…` busting).
+    /// Only safe if the backend's answer really does not depend on it.
+    pub ignore_query: bool,
+    /// Serve and store requests that carry a `Cookie` header. Off by default:
+    /// a backend that personalises on cookies without saying `Vary: Cookie` or
+    /// `private` would otherwise show one visitor's page to another. Turn it on
+    /// only for routes whose cacheable responses never depend on cookies.
+    pub allow_cookies: bool,
+}
+
+impl Default for RouteCacheConfig {
+    fn default() -> Self {
+        Self { enabled: true, default_ttl: None, max_ttl: None, ignore_query: false, allow_cookies: false }
+    }
+}
+
+/// Per-route CORS policy. See [`crate::cors`] for the exact semantics.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CorsConfig {
+    /// Allowed origins: `"https://app.example.com"`, `"https://*.example.com"`
+    /// (subdomains), or `"*"` (any origin; not with `allow_credentials`).
+    pub allow_origins: Vec<String>,
+    /// Allowed methods (`"*"` = any).
+    #[serde(default = "default_cors_methods")]
+    pub allow_methods: Vec<String>,
+    /// Allowed request headers (`"*"` = reflect whatever the preflight asks for).
+    #[serde(default)]
+    pub allow_headers: Vec<String>,
+    /// Response headers scripts may read.
+    #[serde(default)]
+    pub expose_headers: Vec<String>,
+    /// Allow cookies / `Authorization` (`Access-Control-Allow-Credentials`).
+    #[serde(default)]
+    pub allow_credentials: bool,
+    /// How long browsers may cache a preflight answer (at most one day).
+    #[serde(default, with = "humantime_serde::option")]
+    pub max_age: Option<Duration>,
+}
+
+fn default_cors_methods() -> Vec<String> {
+    vec!["GET".to_owned(), "HEAD".to_owned(), "POST".to_owned()]
 }
 
 fn default_prefix() -> String {
@@ -1123,6 +1291,20 @@ impl Config {
             if u.max_inflight == Some(0) || u.backends.iter().any(|b| b.max_inflight == Some(0)) {
                 errs.push(format!("upstream `{n}`: max_inflight must be >= 1 (omit it for no limit)"));
             }
+            if let Some(d) = &u.dns {
+                if !u.backends.iter().any(|b| b.addr.hostname().is_some()) {
+                    errs.push(format!("upstream `{n}`: `dns` is set but no backend uses a host name"));
+                }
+                if d.refresh_interval < Duration::from_secs(1) {
+                    errs.push(format!("upstream `{n}`: dns.refresh_interval must be at least 1s"));
+                }
+                if d.timeout.is_zero() {
+                    errs.push(format!("upstream `{n}`: dns.timeout must be >0"));
+                }
+                if !(1..=512).contains(&d.max_addrs) {
+                    errs.push(format!("upstream `{n}`: dns.max_addrs must be within 1..=512"));
+                }
+            }
             let has_tls = u.backends.iter().any(|b| matches!(b.addr, BackendAddr::Tls { .. }));
             if let Some(t) = &u.tls {
                 if !has_tls {
@@ -1187,6 +1369,20 @@ impl Config {
             if r.timeout.is_some_and(|t| t.is_zero()) {
                 errs.push(format!("route `{id}`: timeout must be >0"));
             }
+            if let Some(c) = &r.cors {
+                validate_cors(&format!("route `{id}`"), c, errs);
+            }
+            if let Some(c) = &r.cache {
+                let year = Duration::from_secs(365 * 86_400);
+                for (name, v) in [("default_ttl", c.default_ttl), ("max_ttl", c.max_ttl)] {
+                    if v.is_some_and(|d| d.is_zero() || d > year) {
+                        errs.push(format!("route `{id}`: cache.{name} must be within 1s..=1y"));
+                    }
+                }
+                if c.default_ttl.zip(c.max_ttl).is_some_and(|(d, m)| d > m) {
+                    errs.push(format!("route `{id}`: cache.default_ttl exceeds cache.max_ttl"));
+                }
+            }
         }
     }
 
@@ -1232,6 +1428,19 @@ impl Config {
                 errs.push(format!("tcp_proxy {}: proxy_protocol requires server.proxy_protocol_trusted", t.listen));
             }
         }
+        let cc = &self.cache;
+        if !(1..=256).contains(&cc.shards) {
+            errs.push("cache.shards must be within 1..=256".into());
+        }
+        if cc.max_entry_bytes < 1024 {
+            errs.push("cache.max_entry_bytes must be at least 1 KiB".into());
+        }
+        if cc.shards > 0 && cc.max_bytes / (cc.shards as u64) < cc.max_entry_bytes {
+            errs.push(
+                "cache.max_bytes / cache.shards must be at least cache.max_entry_bytes (each shard must be able to hold one maximum-size entry)"
+                    .into(),
+            );
+        }
         let c = &self.compression;
         if c.enabled || !c.algorithms.is_empty() {
             let mut seen = HashSet::new();
@@ -1241,6 +1450,15 @@ impl Config {
             if c.algorithms.iter().any(|a| !seen.insert(*a)) {
                 errs.push("compression.algorithms lists an encoding twice".into());
             }
+        }
+        if c.max_concurrent_encoders == 0 {
+            errs.push("compression.max_concurrent_encoders must be >= 1".into());
+        }
+        if !(1024..=1024 * 1024).contains(&c.offload_threshold) {
+            errs.push("compression.offload_threshold must be within 1 KiB..=1 MiB".into());
+        }
+        if c.worker_threads > 256 {
+            errs.push("compression.worker_threads must be <= 256".into());
         }
         for ct in &c.content_types {
             let ok = ct.split_once('/').is_some_and(|(t, sub)| {
@@ -1257,6 +1475,41 @@ impl Config {
         if self.telemetry.log_level.trim().is_empty() {
             errs.push("telemetry.log_level must not be empty".into());
         }
+    }
+}
+
+fn validate_cors(ctx: &str, c: &CorsConfig, errs: &mut Vec<String>) {
+    if c.allow_origins.is_empty() {
+        errs.push(format!("{ctx}: cors.allow_origins must not be empty"));
+    }
+    for o in &c.allow_origins {
+        if !crate::cors::valid_origin_pattern(o) {
+            errs.push(format!(
+                "{ctx}: cors origin `{o}` must be `*`, `null`, `scheme://host[:port]` or `scheme://*.host[:port]`"
+            ));
+        }
+    }
+    if c.allow_credentials && c.allow_origins.iter().any(|o| o == "*") {
+        errs.push(format!(
+            "{ctx}: cors.allow_credentials cannot be combined with allow_origins = [\"*\"] (browsers refuse it, and it \
+             would let any site make credentialed requests); list the origins instead"
+        ));
+    }
+    for m in c.allow_methods.iter().filter(|m| *m != "*") {
+        if http::Method::from_bytes(m.as_bytes()).is_err() {
+            errs.push(format!("{ctx}: cors method `{m}` is not a valid HTTP method"));
+        }
+    }
+    if c.allow_methods.is_empty() {
+        errs.push(format!("{ctx}: cors.allow_methods must not be empty"));
+    }
+    for h in c.allow_headers.iter().chain(&c.expose_headers).filter(|h| *h != "*") {
+        if http::HeaderName::from_bytes(h.as_bytes()).is_err() {
+            errs.push(format!("{ctx}: cors header `{h}` is not a valid header name"));
+        }
+    }
+    if c.max_age.is_some_and(|d| d > Duration::from_secs(86_400)) {
+        errs.push(format!("{ctx}: cors.max_age must be at most 24h"));
     }
 }
 
@@ -1465,5 +1718,128 @@ mod tests {
         // Per-route override.
         let route = MINIMAL.replace("upstream = \"app\"\n    ", "upstream = \"app\"\n        compress = true\n    ");
         assert_eq!(Config::from_toml_str(&route).unwrap().routes[0].compress, Some(true));
+    }
+
+    #[test]
+    fn compression_runtime_limits_have_safe_defaults_and_bounds() {
+        let cfg = Config::from_toml_str(MINIMAL).unwrap();
+        let c = &cfg.compression;
+        assert_eq!((c.max_concurrent_encoders, c.offload_threshold, c.worker_threads), (256, 32 * 1024, 0));
+        let ok = format!(
+            "{MINIMAL}\n[compression]\nmax_concurrent_encoders = 8\noffload_threshold = 65536\nworker_threads = 4\n"
+        );
+        let c = Config::from_toml_str(&ok).unwrap().compression;
+        assert_eq!((c.max_concurrent_encoders, c.offload_threshold, c.worker_threads), (8, 65_536, 4));
+        let err = |extra: &str| {
+            Config::from_toml_str(&format!("{MINIMAL}\n[compression]\n{extra}\n")).unwrap_err().to_string()
+        };
+        assert!(err("max_concurrent_encoders = 0").contains("max_concurrent_encoders"));
+        assert!(err("offload_threshold = 10").contains("offload_threshold"));
+        assert!(err("offload_threshold = 99999999").contains("offload_threshold"));
+        assert!(err("worker_threads = 1000").contains("worker_threads"));
+    }
+
+    #[test]
+    fn cors_and_traceparent_config_validation() {
+        // `[route.cors]` attaches to the `[[route]]` entry MINIMAL ends with.
+        let text = |cors: &str| format!("{MINIMAL}\n[route.cors]\n{cors}\n");
+        let ok = Config::from_toml_str(&text(
+            "allow_origins = [\"https://a.test\", \"https://*.b.test:8443\"]\nmax_age = \"1h\"",
+        ));
+        let cfg = ok.unwrap();
+        let c = cfg.routes[0].cors.as_ref().unwrap();
+        assert_eq!(c.allow_methods, ["GET", "HEAD", "POST"], "safe defaults");
+        assert!(!c.allow_credentials);
+        assert!(!cfg.telemetry.traceparent, "trace propagation is opt-in");
+        assert!(
+            Config::from_toml_str(&format!("{MINIMAL}\n[telemetry]\ntraceparent = true\n"))
+                .unwrap()
+                .telemetry
+                .traceparent
+        );
+        let err = |cors: &str| Config::from_toml_str(&text(cors)).unwrap_err().to_string();
+        assert!(err("allow_origins = []").contains("must not be empty"));
+        assert!(err("allow_origins = [\"a.test\"]").contains("cors origin"));
+        assert!(err("allow_origins = [\"https://*\"]").contains("cors origin"));
+        assert!(err("allow_origins = [\"*\"]\nallow_credentials = true").contains("allow_credentials"));
+        assert!(err("allow_origins = [\"https://a.test\"]\nallow_methods = [\"GE T\"]").contains("method"));
+        assert!(err("allow_origins = [\"https://a.test\"]\nallow_headers = [\"bad header\"]").contains("header"));
+        assert!(err("allow_origins = [\"https://a.test\"]\nmax_age = \"48h\"").contains("24h"));
+        // `*` in methods/headers is allowed, and credentials with an explicit list is fine.
+        assert!(Config::from_toml_str(&text("allow_origins = [\"https://a.test\"]\nallow_credentials = true\nallow_methods = [\"*\"]\nallow_headers = [\"*\"]")).is_ok());
+    }
+
+    #[test]
+    fn dns_config_validation() {
+        let base = |extra: &str, backend: &str| {
+            format!(
+                "[server]\nhttp_addr = \"127.0.0.1:8080\"\n[[upstream]]\nname = \"app\"\n{extra}\nbackends = [{{ addr = \"{backend}\" }}]\n[[route]]\nupstream = \"app\"\n"
+            )
+        };
+        let c = Config::from_toml_str(&base(
+            "dns = { refresh_interval = \"10s\", max_addrs = 8, ipv6 = false }",
+            "svc.internal:8080",
+        ))
+        .unwrap();
+        let d = c.upstreams[0].dns.as_ref().unwrap();
+        assert_eq!((d.refresh_interval, d.max_addrs, d.ipv6), (Duration::from_secs(10), 8, false));
+        assert_eq!(DnsConfig::default().refresh_interval, Duration::from_secs(30));
+        let err = |extra: &str, backend: &str| Config::from_toml_str(&base(extra, backend)).unwrap_err().to_string();
+        assert!(err("dns = {}", "10.0.0.1:80").contains("no backend uses a host name"));
+        assert!(err("dns = {}", "unix:/run/a.sock").contains("no backend uses a host name"));
+        assert!(err("dns = { refresh_interval = \"100ms\" }", "svc:80").contains("refresh_interval"));
+        assert!(err("dns = { max_addrs = 0 }", "svc:80").contains("max_addrs"));
+        assert!(err("dns = { max_addrs = 9999 }", "svc:80").contains("max_addrs"));
+        assert!(err("dns = { timeout = \"0s\" }", "svc:80").contains("timeout"));
+        // Hostname detection.
+        assert_eq!("svc.internal:80".parse::<BackendAddr>().unwrap().hostname(), Some("svc.internal"));
+        assert_eq!("https://svc:443".parse::<BackendAddr>().unwrap().hostname(), Some("svc"));
+        assert_eq!("10.0.0.1:80".parse::<BackendAddr>().unwrap().hostname(), None);
+        assert_eq!("[::1]:80".parse::<BackendAddr>().unwrap().hostname(), None);
+        assert_eq!("unix:/x".parse::<BackendAddr>().unwrap().hostname(), None);
+    }
+
+    #[test]
+    fn cache_config_defaults_and_validation() {
+        let cfg = Config::from_toml_str(MINIMAL).unwrap();
+        assert_eq!((cfg.cache.max_bytes, cfg.cache.max_entry_bytes, cfg.cache.shards), (64 << 20, 1 << 20, 16));
+        assert!(cfg.routes[0].cache.is_none(), "caching is opt-in per route");
+        let route = |cache: &str| {
+            MINIMAL.replace("upstream = \"app\"\n    ", &format!("upstream = \"app\"\n        cache = {cache}\n    "))
+        };
+        let rc = Config::from_toml_str(&route("{}")).unwrap().routes[0].cache.clone().unwrap();
+        assert!(rc.enabled && rc.default_ttl.is_none() && !rc.ignore_query && !rc.allow_cookies, "safe defaults");
+        let rc = Config::from_toml_str(&route("{ default_ttl = \"30s\", max_ttl = \"5m\", ignore_query = true }"))
+            .unwrap()
+            .routes[0]
+            .cache
+            .clone()
+            .unwrap();
+        assert_eq!(
+            (rc.default_ttl, rc.max_ttl, rc.ignore_query),
+            (Some(Duration::from_secs(30)), Some(Duration::from_secs(300)), true)
+        );
+        let err = |c: &str| Config::from_toml_str(&route(c)).unwrap_err().to_string();
+        assert!(err("{ default_ttl = \"0s\" }").contains("default_ttl"));
+        assert!(err("{ max_ttl = \"400d\" }").contains("max_ttl"));
+        assert!(err("{ default_ttl = \"10m\", max_ttl = \"1m\" }").contains("exceeds"));
+        assert!(err("{ nope = 1 }").contains("unknown field"));
+        let global = |g: &str| Config::from_toml_str(&format!("{MINIMAL}\n[cache]\n{g}\n")).unwrap_err().to_string();
+        assert!(global("shards = 0").contains("shards"));
+        assert!(global("shards = 1000").contains("shards"));
+        assert!(global("max_entry_bytes = 10").contains("max_entry_bytes"));
+        assert!(global("max_bytes = 1000000\nmax_entry_bytes = 900000\nshards = 4").contains("one maximum-size entry"));
+        assert!(Config::from_toml_str(&format!(
+            "{MINIMAL}\n[cache]\nmax_bytes = 4194304\nmax_entry_bytes = 1048576\nshards = 4\n"
+        ))
+        .is_ok());
+        // A disabled table leaves the route uncached; an enabled one compiles into the route.
+        let live = |text: String| {
+            let state = crate::SharedState::new(Config::from_toml_str(&text).unwrap()).unwrap();
+            let snap = state.load();
+            snap.router.find("any", "/").unwrap().cache.clone()
+        };
+        assert!(live(route("{ enabled = false }")).is_none());
+        assert!(live(route("{ default_ttl = \"9s\" }")).is_some_and(|c| c.default_ttl == Some(Duration::from_secs(9))));
     }
 }

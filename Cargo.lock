@@ -2286,8 +2286,15 @@ dependencies = [
 name = "velox-health"
 version = "0.1.0"
 dependencies = [
+ "bytes",
  "fastrand",
+ "http",
+ "http-body-util",
+ "hyper",
+ "hyper-util",
+ "rcgen 0.13.2",
  "rustls",
+ "tempfile",
  "thiserror 2.0.21",
  "tokio",
  "tokio-rustls",
@@ -2295,6 +2302,7 @@ dependencies = [
  "tracing",
  "velox-core",
  "velox-security",
+ "velox-telemetry",
 ]
 
 [[package]]
@@ -2314,6 +2322,7 @@ dependencies = [
  "http",
  "http-body",
  "http-body-util",
+ "httpdate",
  "hyper",
  "hyper-util",
  "ipnet",

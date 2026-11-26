@@ -25,6 +25,7 @@ futures-util.workspace = true
 h3.workspace = true
 h3-quinn.workspace = true
 http.workspace = true
+httpdate.workspace = true
 http-body.workspace = true
 http-body-util.workspace = true
 hyper.workspace = true

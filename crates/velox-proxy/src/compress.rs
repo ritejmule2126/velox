@@ -29,15 +29,19 @@ use http::header::{
 use http::{HeaderMap, StatusCode};
 use http_body::{Body, Frame, SizeHint};
 use pin_project_lite::pin_project;
+use std::future::Future;
 use std::io::{self, Write};
 use std::pin::Pin;
-use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{mpsc, Arc, Mutex, OnceLock, PoisonError};
 use std::task::{Context, Poll};
+use tokio::sync::oneshot;
 use velox_core::config::{CompressionAlgorithm, CompressionConfig, CompressionLevel};
 use velox_telemetry::Metrics;
 
-/// Uncompressed bytes fed to the encoder per step (bounds CPU per poll).
-const INPUT_SLICE: usize = 32 * 1024;
+/// Uncompressed bytes fed to the encoder per step (bounds the CPU of one step).
+/// Raised to `offload_threshold` when that is larger.
+const INPUT_SLICE: usize = 64 * 1024;
 /// Emit a frame once this much compressed output is buffered.
 const EMIT_THRESHOLD: usize = 16 * 1024;
 /// Force the encoder to emit what it holds after this much input, whatever the
@@ -175,13 +179,20 @@ fn add_vary(h: &mut HeaderMap) {
 /// `Vary: Accept-Encoding` is added to every response that *could* have been
 /// compressed (right type, size and status) — even when this client did not
 /// accept any encoding — so shared caches never serve the wrong variant.
-pub fn plan(
+///
+/// `admit` is asked, after the response has proven compressible and an encoding
+/// was negotiated but **before** any header is rewritten, whether resources are
+/// available to compress it (an [`EncoderPermit`], typically). Returning `None`
+/// leaves the response a plain pass-through: the headers never claim an
+/// encoding that will not happen.
+pub fn plan<P>(
     cfg: &CompressionConfig,
     accept: Option<&HeaderValue>,
     is_head: bool,
     status: StatusCode,
     headers: &mut HeaderMap,
-) -> Option<CompressionAlgorithm> {
+    admit: impl FnOnce(CompressionAlgorithm) -> Option<P>,
+) -> Option<(CompressionAlgorithm, P)> {
     // No body, or not the whole representation: nothing to encode, no variant.
     if status.is_informational()
         || status == StatusCode::NO_CONTENT
@@ -211,6 +222,7 @@ pub fn plan(
         return None; // headers describe a GET we do not execute; leave them honest
     }
     let algo = negotiate(accept, &cfg.algorithms)?;
+    let admitted = admit(algo)?;
 
     headers.remove(CONTENT_LENGTH);
     headers.remove(ACCEPT_RANGES);
@@ -227,7 +239,7 @@ pub fn plan(
             }
         }
     }
-    Some(algo)
+    Some((algo, admitted))
 }
 
 // ------------------------------------------------------------------- encoders
@@ -316,6 +328,143 @@ impl Encoder {
     }
 }
 
+// --------------------------------------------------------- runtime and limits
+
+/// What a worker hands back after compressing one slice.
+struct JobDone {
+    encoder: Encoder,
+    result: io::Result<()>,
+    flushed: bool,
+}
+
+type Job = Box<dyn FnOnce() + Send + 'static>;
+
+/// A small, fixed set of OS threads dedicated to compression.
+///
+/// Compression of a large slice is milliseconds of pure CPU; running it on a
+/// Tokio worker would stall every other connection scheduled there. Jobs run
+/// here instead, and the response's task simply waits for its result.
+///
+/// The pool is deliberately separate from Tokio's blocking pool, which also
+/// serves DNS lookups and file I/O and must not be starved by compression. Its
+/// queue is bounded in practice by the encoder cap: one response has at most
+/// one job outstanding, and a response only exists while it holds a permit.
+struct EncoderPool {
+    threads: usize,
+    tx: OnceLock<Option<mpsc::Sender<Job>>>,
+}
+
+impl EncoderPool {
+    fn new(threads: usize) -> Self {
+        let auto = std::thread::available_parallelism().map_or(2, std::num::NonZeroUsize::get).clamp(2, 16);
+        Self { threads: if threads == 0 { auto } else { threads }, tx: OnceLock::new() }
+    }
+
+    /// Queue `job`; if no worker thread could be started the job is handed back
+    /// so the caller can run it inline (degraded, but correct).
+    fn submit(&self, job: Job) -> Result<(), Job> {
+        match self.tx.get_or_init(|| self.start()) {
+            Some(tx) => tx.send(job).map_err(|e| e.0),
+            None => Err(job),
+        }
+    }
+
+    fn start(&self) -> Option<mpsc::Sender<Job>> {
+        let (tx, rx) = mpsc::channel::<Job>();
+        let rx = Arc::new(Mutex::new(rx));
+        let mut started = 0;
+        for i in 0..self.threads {
+            let rx = Arc::clone(&rx);
+            let spawned = std::thread::Builder::new().name(format!("velox-compress-{i}")).spawn(move || loop {
+                // Only the thread waiting for work holds the lock; it is released
+                // before the job runs.
+                let job = rx.lock().unwrap_or_else(PoisonError::into_inner).recv();
+                match job {
+                    Ok(job) => job(),
+                    Err(_) => return, // the pool was dropped
+                }
+            });
+            if spawned.is_ok() {
+                started += 1;
+            }
+        }
+        (started > 0).then_some(tx)
+    }
+}
+
+/// Process-wide compression state: the encoder cap and the worker pool.
+pub struct Compressor {
+    active: AtomicUsize,
+    pool: EncoderPool,
+    metrics: Arc<Metrics>,
+}
+
+impl std::fmt::Debug for Compressor {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Compressor").field("active", &self.active.load(Ordering::Relaxed)).finish_non_exhaustive()
+    }
+}
+
+/// Proof that one encoder may exist; releases its slot on drop.
+#[derive(Debug)]
+pub struct EncoderPermit(Arc<Compressor>);
+
+impl Drop for EncoderPermit {
+    fn drop(&mut self) {
+        self.0.active.fetch_sub(1, Ordering::AcqRel);
+        self.0.metrics.compression_encoders(-1);
+    }
+}
+
+impl Compressor {
+    /// Create the runtime; worker threads start lazily on the first large slice.
+    /// `worker_threads = 0` picks the CPU count (2..=16).
+    pub fn new(metrics: Arc<Metrics>, worker_threads: usize) -> Arc<Self> {
+        Arc::new(Self { active: AtomicUsize::new(0), pool: EncoderPool::new(worker_threads), metrics })
+    }
+
+    /// Claim an encoder slot if fewer than `cap` are live. Atomic: concurrent
+    /// callers can never take the cap over its limit. Counts a skip when full.
+    pub fn try_acquire(self: &Arc<Self>, cap: usize) -> Option<EncoderPermit> {
+        let mut cur = self.active.load(Ordering::Relaxed);
+        loop {
+            if cur >= cap {
+                self.metrics.compression_skipped("saturated");
+                return None;
+            }
+            match self.active.compare_exchange_weak(cur, cur + 1, Ordering::AcqRel, Ordering::Relaxed) {
+                Ok(_) => break,
+                Err(seen) => cur = seen,
+            }
+        }
+        self.metrics.compression_encoders(1);
+        Some(EncoderPermit(Arc::clone(self)))
+    }
+
+    /// Live encoders.
+    pub fn active(&self) -> usize {
+        self.active.load(Ordering::Relaxed)
+    }
+
+    /// Wrap `body` in a compressor for an encoding [`plan`] admitted.
+    ///
+    /// If the encoder cannot be created (never expected: it only allocates), the
+    /// client gets a body error rather than an uncompressed payload under a
+    /// `Content-Encoding` header that says otherwise.
+    pub fn wrap(
+        self: &Arc<Self>,
+        body: ProxyBody,
+        algo: CompressionAlgorithm,
+        permit: EncoderPermit,
+        cfg: &CompressionConfig,
+    ) -> ProxyBody {
+        match CompressBody::new(body, algo, cfg, Arc::clone(self), permit) {
+            Ok(b) => ProxyBody::boxed(b),
+            Err(e) => ProxyBody::boxed(FailedBody(Some(e))),
+        }
+    }
+}
+
 // ----------------------------------------------------------------- the body
 
 /// Reports bytes through the compressor when the response ends (or is dropped
@@ -337,15 +486,26 @@ pin_project! {
     /// Compresses `B` on the fly. See the [module docs](self).
     pub struct CompressBody<B> {
         #[pin] inner: B,
+        // `None` while a slice is being compressed on a worker thread, and
+        // once the stream is finished.
         encoder: Option<Encoder>,
+        // The worker's answer for the slice in flight.
+        job: Option<oneshot::Receiver<JobDone>>,
         // Uncompressed data of the current inner frame not yet fed to the encoder.
         input: Bytes,
         inner_done: bool,
+        // The compressed stream is over (finished or failed): only trailers remain.
+        done: bool,
         // Data written to the encoder since the last flush.
         dirty: bool,
         // Input fed since the last flush.
         since_flush: usize,
         trailers: Option<HeaderMap>,
+        slice: usize,
+        offload_min: usize,
+        runtime: Arc<Compressor>,
+        // Held for the life of the stream; released the moment it ends.
+        permit: Option<EncoderPermit>,
         stats: Stats,
     }
 }
@@ -354,21 +514,29 @@ impl<B> CompressBody<B>
 where
     B: Body<Data = Bytes>,
 {
-    /// Wrap `inner`, compressing with `algo` at `level`.
+    /// Wrap `inner`, compressing with `algo` per `cfg`.
     pub fn new(
         inner: B,
         algo: CompressionAlgorithm,
-        level: CompressionLevel,
-        metrics: Arc<Metrics>,
+        cfg: &CompressionConfig,
+        runtime: Arc<Compressor>,
+        permit: EncoderPermit,
     ) -> io::Result<Self> {
+        let metrics = Arc::clone(&runtime.metrics);
         Ok(Self {
             inner,
-            encoder: Some(Encoder::new(algo, level)?),
+            encoder: Some(Encoder::new(algo, cfg.level)?),
+            job: None,
             input: Bytes::new(),
             inner_done: false,
+            done: false,
             dirty: false,
             since_flush: 0,
             trailers: None,
+            slice: INPUT_SLICE.max(cfg.offload_threshold),
+            offload_min: cfg.offload_threshold,
+            runtime,
+            permit: Some(permit),
             stats: Stats { metrics, encoding: algo.token(), bytes_in: 0, bytes_out: 0 },
         })
     }
@@ -382,37 +550,94 @@ where
     type Data = Bytes;
     type Error = BoxError;
 
+    #[allow(clippy::too_many_lines)]
     fn poll_frame(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Result<Frame<Bytes>, BoxError>>> {
         let mut this = self.project();
+        // End the compressed stream with `err` (or cleanly) and free the encoder slot.
+        macro_rules! fail {
+            ($err:expr) => {{
+                *this.done = true;
+                *this.encoder = None;
+                *this.job = None;
+                *this.permit = None;
+                return Poll::Ready(Some(Err($err)));
+            }};
+        }
         loop {
+            // 0. A slice compressing on a worker thread: wait for it (no busy loop;
+            //    the task is woken when the worker is done).
+            if let Some(rx) = this.job.as_mut() {
+                match Pin::new(rx).poll(cx) {
+                    Poll::Pending => return Poll::Pending,
+                    Poll::Ready(Ok(done)) => {
+                        *this.job = None;
+                        *this.encoder = Some(done.encoder);
+                        if let Err(e) = done.result {
+                            fail!(Box::new(e));
+                        }
+                        if done.flushed {
+                            *this.since_flush = 0;
+                            *this.dirty = false;
+                        }
+                    }
+                    Poll::Ready(Err(_)) => fail!("compression worker failed".into()),
+                }
+            }
+
             // Past the end of the compressed stream: only trailers remain.
-            let Some(encoder) = this.encoder.as_mut() else {
+            if *this.done {
                 return Poll::Ready(this.trailers.take().map(|t| Ok(Frame::trailers(t))));
+            }
+            let Some(encoder) = this.encoder.as_mut() else {
+                *this.done = true;
+                continue;
             };
+
+            // Emit what is already buffered once it is worth a frame.
+            if encoder.buffered() >= EMIT_THRESHOLD {
+                let out = encoder.take_output();
+                this.stats.bytes_out += out.len() as u64;
+                return Poll::Ready(Some(Ok(Frame::data(out))));
+            }
 
             // 1. Feed buffered input in bounded slices.
             if !this.input.is_empty() {
-                let n = this.input.len().min(INPUT_SLICE);
+                let n = this.input.len().min(*this.slice);
                 let slice = this.input.split_to(n);
-                if let Err(e) = encoder.write(&slice) {
-                    *this.encoder = None;
-                    return Poll::Ready(Some(Err(Box::new(e))));
-                }
                 this.stats.bytes_in += n as u64;
                 *this.dirty = true;
                 *this.since_flush += n;
-                if *this.since_flush >= FLUSH_EVERY {
-                    if let Err(e) = encoder.flush() {
-                        *this.encoder = None;
-                        return Poll::Ready(Some(Err(Box::new(e))));
+                let flush = *this.since_flush >= FLUSH_EVERY;
+                if n >= *this.offload_min {
+                    // Big slice: compress it off the event loop. Only this
+                    // response waits; every other connection keeps running.
+                    let Some(mut enc) = this.encoder.take() else { continue };
+                    let (tx, rx) = oneshot::channel();
+                    let job: Job = Box::new(move || {
+                        let mut result = enc.write(&slice);
+                        if flush && result.is_ok() {
+                            result = enc.flush();
+                        }
+                        let _ = tx.send(JobDone { encoder: enc, result, flushed: flush });
+                    });
+                    this.runtime.metrics.compression_offloaded();
+                    if let Err(job) = this.runtime.pool.submit(job) {
+                        job(); // no worker threads at all: degrade to inline
                     }
+                    *this.job = Some(rx);
+                    continue;
+                }
+                // Small slice: cheaper to do here than to hop threads.
+                let mut result = encoder.write(&slice);
+                if flush && result.is_ok() {
+                    result = encoder.flush();
+                }
+                if let Err(e) = result {
+                    fail!(Box::new(e));
+                }
+                if flush {
                     *this.since_flush = 0;
                     *this.dirty = false;
-                }
-                if encoder.buffered() >= EMIT_THRESHOLD {
-                    let out = encoder.take_output();
-                    this.stats.bytes_out += out.len() as u64;
-                    return Poll::Ready(Some(Ok(Frame::data(out))));
                 }
                 continue;
             }
@@ -420,6 +645,8 @@ where
             // 2. The upstream is exhausted: terminate the stream.
             if *this.inner_done {
                 let Some(encoder) = this.encoder.take() else { continue };
+                *this.done = true;
+                *this.permit = None;
                 return match encoder.finish() {
                     Ok(tail) => {
                         this.stats.bytes_out += tail.len() as u64;
@@ -443,9 +670,8 @@ where
                     }
                 },
                 Poll::Ready(Some(Err(e))) => {
-                    *this.encoder = None;
                     *this.inner_done = true;
-                    return Poll::Ready(Some(Err(e.into())));
+                    fail!(e.into());
                 }
                 Poll::Ready(None) => *this.inner_done = true,
                 Poll::Pending => {
@@ -453,8 +679,7 @@ where
                     // have so a slow stream is not held back by encoder buffering.
                     if *this.dirty {
                         if let Err(e) = encoder.flush() {
-                            *this.encoder = None;
-                            return Poll::Ready(Some(Err(Box::new(e))));
+                            fail!(Box::new(e));
                         }
                         *this.dirty = false;
                         *this.since_flush = 0;
@@ -471,23 +696,11 @@ where
     }
 
     fn is_end_stream(&self) -> bool {
-        self.encoder.is_none() && self.trailers.is_none()
+        self.done && self.trailers.is_none()
     }
 
     fn size_hint(&self) -> SizeHint {
         SizeHint::default() // the compressed length is unknowable up front
-    }
-}
-
-/// Wrap `body` in a compressor for an encoding [`plan`] returned.
-///
-/// If the encoder cannot be created (never expected: it only allocates), the
-/// client gets a body error rather than an uncompressed payload under a
-/// `Content-Encoding` header that says otherwise.
-pub fn wrap(body: ProxyBody, algo: CompressionAlgorithm, level: CompressionLevel, metrics: Arc<Metrics>) -> ProxyBody {
-    match CompressBody::new(body, algo, level, metrics) {
-        Ok(b) => ProxyBody::boxed(b),
-        Err(e) => ProxyBody::boxed(FailedBody(Some(e))),
     }
 }
 
@@ -571,8 +784,8 @@ mod tests {
 
     fn run(accept: &str, status: u16, pairs: &[(&'static str, &str)]) -> (Option<&'static str>, HeaderMap) {
         let mut h = headers(pairs);
-        let r = plan(&cfg(), Some(&hv(accept)), false, StatusCode::from_u16(status).unwrap(), &mut h)
-            .map(CompressionAlgorithm::token);
+        let r = plan(&cfg(), Some(&hv(accept)), false, StatusCode::from_u16(status).unwrap(), &mut h, |_| Some(()))
+            .map(|(a, ())| a.token());
         (r, h)
     }
 
@@ -662,7 +875,7 @@ mod tests {
         for accept in [None, Some("identity"), Some("br;q=0")] {
             let mut h = headers(&[("content-type", "text/html"), ("content-length", "5000"), ("etag", "\"v1\"")]);
             let accept = accept.map(hv);
-            let enc = plan(&cfg(), accept.as_ref(), false, StatusCode::OK, &mut h);
+            let enc = plan(&cfg(), accept.as_ref(), false, StatusCode::OK, &mut h, |_| Some(()));
             assert_eq!(enc, None);
             assert_eq!(h[VARY], "Accept-Encoding");
             assert_eq!(h[CONTENT_LENGTH], "5000");
@@ -671,7 +884,7 @@ mod tests {
         }
         // HEAD: describes the identity variant honestly, still varies.
         let mut h = headers(&[("content-type", "text/html"), ("content-length", "5000")]);
-        assert_eq!(plan(&cfg(), Some(&hv("gzip")), true, StatusCode::OK, &mut h), None);
+        assert!(plan(&cfg(), Some(&hv("gzip")), true, StatusCode::OK, &mut h, |_| Some(())).is_none());
         assert_eq!((h[VARY].to_str().unwrap(), h[CONTENT_LENGTH].to_str().unwrap()), ("Accept-Encoding", "5000"));
     }
 
@@ -681,14 +894,17 @@ mod tests {
         c.content_types = vec!["image/png".into()];
         c.min_size = 10;
         let mut h = headers(&[("content-type", "image/png"), ("content-length", "10")]);
-        assert!(plan(&c, Some(&hv("gzip")), false, StatusCode::OK, &mut h).is_some());
+        assert!(plan(&c, Some(&hv("gzip")), false, StatusCode::OK, &mut h, |_| Some(())).is_some());
         let mut h = headers(&[("content-type", "text/html"), ("content-length", "5000")]);
-        assert!(plan(&c, Some(&hv("gzip")), false, StatusCode::OK, &mut h).is_none(), "no longer in the list");
+        assert!(
+            plan(&c, Some(&hv("gzip")), false, StatusCode::OK, &mut h, |_| Some(())).is_none(),
+            "no longer in the list"
+        );
         assert!(!h.contains_key(VARY));
         // Empty list ⇒ nothing is compressible.
         c.content_types.clear();
         let mut h = headers(&[("content-type", "text/html")]);
-        assert!(plan(&c, Some(&hv("gzip")), false, StatusCode::OK, &mut h).is_none());
+        assert!(plan(&c, Some(&hv("gzip")), false, StatusCode::OK, &mut h, |_| Some(())).is_none());
     }
 
     // ---- the body adapter ----
@@ -725,6 +941,19 @@ mod tests {
             }
         }
         out
+    }
+
+    /// A `CompressBody` with its own runtime, as the proxy would build one.
+    fn comp<B: Body<Data = Bytes>>(
+        inner: B,
+        algo: CompressionAlgorithm,
+        level: CompressionLevel,
+        m: Arc<Metrics>,
+    ) -> io::Result<CompressBody<B>> {
+        let rt = Compressor::new(m, 2);
+        let permit = rt.try_acquire(1_000).expect("slot");
+        let c = CompressionConfig { level, ..cfg() };
+        CompressBody::new(inner, algo, &c, rt, permit)
     }
 
     fn metrics() -> Arc<Metrics> {
@@ -785,7 +1014,7 @@ mod tests {
                         let frames: Vec<Result<Frame<Bytes>, BoxError>> =
                             data.chunks(chunk).map(|c| Ok(Frame::data(Bytes::copy_from_slice(c)))).collect();
                         let src = http_body_util::StreamBody::new(futures_util::stream::iter(frames));
-                        let body = CompressBody::new(src, algo, level, metrics()).unwrap();
+                        let body = comp(src, algo, level, metrics()).unwrap();
                         let (compressed, nframes, _) = collect_frames(Box::pin(body)).await;
                         assert_eq!(
                             decode(algo, &compressed).unwrap(),
@@ -812,9 +1041,7 @@ mod tests {
     #[tokio::test]
     async fn an_empty_body_is_still_a_valid_compressed_stream() {
         for algo in ALL {
-            let body =
-                CompressBody::new(http_body_util::Empty::<Bytes>::new(), algo, CompressionLevel::Default, metrics())
-                    .unwrap();
+            let body = comp(http_body_util::Empty::<Bytes>::new(), algo, CompressionLevel::Default, metrics()).unwrap();
             let (compressed, _, _) = collect_frames(Box::pin(body)).await;
             assert_eq!(decode(algo, &compressed).unwrap(), b"", "{algo:?}");
         }
@@ -824,7 +1051,7 @@ mod tests {
     async fn a_slow_stream_is_flushed_when_the_upstream_pauses() {
         for algo in ALL {
             let (tx, chan) = ChannelBody::new(None);
-            let mut body = Box::pin(CompressBody::new(chan, algo, CompressionLevel::Default, metrics()).unwrap());
+            let mut body = Box::pin(comp(chan, algo, CompressionLevel::Default, metrics()).unwrap());
             tx.send(Ok(Frame::data(Bytes::from_static(b"{\"event\":1}\n")))).await.unwrap();
             // The upstream goes quiet. The client must still get event 1 promptly.
             let first = tokio::time::timeout(Duration::from_secs(2), body.frame())
@@ -859,7 +1086,7 @@ mod tests {
         trailers.insert("x-checksum", hv("abc"));
         let frames: Vec<Result<Frame<Bytes>, BoxError>> =
             vec![Ok(Frame::data(Bytes::from_static(b"hello hello hello"))), Ok(Frame::trailers(trailers.clone()))];
-        let body = CompressBody::new(
+        let body = comp(
             http_body_util::StreamBody::new(futures_util::stream::iter(frames)),
             CompressionAlgorithm::Gzip,
             CompressionLevel::Default,
@@ -873,7 +1100,7 @@ mod tests {
         let frames: Vec<Result<Frame<Bytes>, BoxError>> =
             vec![Ok(Frame::data(Bytes::from_static(b"partial"))), Err("backend died".into())];
         let mut body = Box::pin(
-            CompressBody::new(
+            comp(
                 http_body_util::StreamBody::new(futures_util::stream::iter(frames)),
                 CompressionAlgorithm::Zstd,
                 CompressionLevel::Default,
@@ -894,7 +1121,7 @@ mod tests {
     async fn compression_is_accounted_in_metrics() {
         let m = metrics();
         let data = sample(50_000);
-        let body = CompressBody::new(
+        let body = comp(
             http_body_util::Full::new(Bytes::from(data.clone())),
             CompressionAlgorithm::Gzip,
             CompressionLevel::Default,
@@ -918,5 +1145,203 @@ mod tests {
             )),
             "{text}"
         );
+    }
+
+    // ---- the runtime: encoder cap and off-thread compression ----
+
+    #[test]
+    fn the_encoder_cap_is_exact_under_contention_and_slots_are_released() {
+        let rt = Compressor::new(metrics(), 2);
+        let barrier = Arc::new(std::sync::Barrier::new(16));
+        let done = Arc::new(std::sync::Barrier::new(16));
+        let handles: Vec<_> = (0..16)
+            .map(|_| {
+                let (rt, barrier, done) = (Arc::clone(&rt), Arc::clone(&barrier), Arc::clone(&done));
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    let mut held = Vec::new();
+                    for _ in 0..500 {
+                        if let Some(p) = rt.try_acquire(10) {
+                            assert!(rt.active() <= 10, "cap overshoot: {}", rt.active());
+                            held.push(p);
+                        }
+                    }
+                    done.wait();
+                    held.len()
+                })
+            })
+            .collect();
+        let total: usize = handles.into_iter().map(|h| h.join().unwrap()).sum();
+        assert_eq!(total, 10, "exactly `cap` permits were granted while nobody released");
+        assert_eq!(rt.active(), 0, "every permit was returned on drop");
+        assert!(rt.try_acquire(1).is_some());
+        let text = rt.metrics.render().unwrap();
+        assert!(text.contains("velox_compression_skipped_total{reason=\"saturated\"}"), "{text}");
+        assert!(text.contains("velox_compression_encoders_active 0"), "{text}");
+    }
+
+    #[test]
+    fn a_saturated_runtime_leaves_the_response_headers_alone() {
+        let rt = Compressor::new(metrics(), 2);
+        let _held = rt.try_acquire(1).unwrap();
+        let mut h = headers(&[("content-type", "text/html"), ("content-length", "5000"), ("etag", "\"v1\"")]);
+        let r = plan(&cfg(), Some(&hv("gzip")), false, StatusCode::OK, &mut h, |_| rt.try_acquire(1));
+        assert!(r.is_none(), "no slot ⇒ no compression");
+        // The headers must not claim an encoding that is not going to happen…
+        assert!(!h.contains_key(CONTENT_ENCODING));
+        assert_eq!((h[CONTENT_LENGTH].to_str().unwrap(), h[ETAG].to_str().unwrap()), ("5000", "\"v1\""));
+        // …but the response still varies on the request, for caches.
+        assert_eq!(h[VARY], "Accept-Encoding");
+    }
+
+    #[tokio::test]
+    async fn the_slot_is_released_when_the_stream_ends_not_when_the_body_is_dropped() {
+        let rt = Compressor::new(metrics(), 2);
+        let permit = rt.try_acquire(1).unwrap();
+        let body = CompressBody::new(
+            http_body_util::Full::new(Bytes::from(sample(10_000))),
+            CompressionAlgorithm::Gzip,
+            &cfg(),
+            Arc::clone(&rt),
+            permit,
+        )
+        .unwrap();
+        let mut body = Box::pin(body);
+        assert_eq!(rt.active(), 1);
+        while let Some(f) = body.frame().await {
+            f.unwrap();
+        }
+        assert_eq!(rt.active(), 0, "encoder state is gone once the stream ended, though the body value lives on");
+        // A client that disconnects mid-stream also frees the slot (drop).
+        let permit = rt.try_acquire(1).unwrap();
+        let (tx, chan) = ChannelBody::new(None);
+        let body = CompressBody::new(chan, CompressionAlgorithm::Zstd, &cfg(), Arc::clone(&rt), permit).unwrap();
+        tx.send(Ok(Frame::data(Bytes::from_static(b"some data")))).await.unwrap();
+        let mut body = Box::pin(body);
+        let _ = body.frame().await;
+        assert_eq!(rt.active(), 1);
+        drop(body);
+        assert_eq!(rt.active(), 0);
+    }
+
+    #[tokio::test]
+    async fn large_bodies_are_compressed_off_the_event_loop() {
+        // A single-threaded runtime makes any stall visible to every other task.
+        let m = metrics();
+        let rt = Compressor::new(Arc::clone(&m), 2);
+        let c = CompressionConfig { level: CompressionLevel::Best, ..cfg() };
+        let data = sample(8 * 1024 * 1024);
+        let permit = rt.try_acquire(10).unwrap();
+        let body = CompressBody::new(
+            http_body_util::Full::new(Bytes::from(data.clone())),
+            CompressionAlgorithm::Gzip,
+            &c,
+            Arc::clone(&rt),
+            permit,
+        )
+        .unwrap();
+
+        let finished = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let ticker = {
+            let finished = Arc::clone(&finished);
+            tokio::spawn(async move {
+                let (mut worst, mut last, mut ticks) = (Duration::ZERO, std::time::Instant::now(), 0u32);
+                while !finished.load(Ordering::Relaxed) {
+                    tokio::time::sleep(Duration::from_millis(1)).await;
+                    let now = std::time::Instant::now();
+                    worst = worst.max(now - last);
+                    last = now;
+                    ticks += 1;
+                }
+                (worst, ticks)
+            })
+        };
+        let t0 = std::time::Instant::now();
+        let (compressed, _, _) = collect_frames(Box::pin(body)).await;
+        let elapsed = t0.elapsed();
+        finished.store(true, Ordering::Relaxed);
+        let (worst, ticks) = ticker.await.unwrap();
+
+        assert_eq!(decode(CompressionAlgorithm::Gzip, &compressed).unwrap(), data);
+        assert!(
+            ticks >= 5,
+            "other tasks must keep running while the response compresses ({ticks} ticks in {elapsed:?})"
+        );
+        assert!(
+            worst < Duration::from_millis(150),
+            "the event loop stalled for {worst:?} during an {elapsed:?} compression"
+        );
+        assert!(m.render().unwrap().contains("velox_compression_offload_jobs_total"), "slices ran on the pool");
+        assert!(!m.render().unwrap().contains("velox_compression_offload_jobs_total 0"));
+    }
+
+    #[tokio::test]
+    async fn small_slices_stay_inline_and_the_pool_is_optional() {
+        // Below the threshold nothing is handed to a worker.
+        let m = metrics();
+        let rt = Compressor::new(Arc::clone(&m), 2);
+        let c = CompressionConfig { offload_threshold: 64 * 1024, ..cfg() };
+        let data = sample(20_000);
+        let body = CompressBody::new(
+            http_body_util::Full::new(Bytes::from(data.clone())),
+            CompressionAlgorithm::Brotli,
+            &c,
+            Arc::clone(&rt),
+            rt.try_acquire(5).unwrap(),
+        )
+        .unwrap();
+        let (out, _, _) = collect_frames(Box::pin(body)).await;
+        assert_eq!(decode(CompressionAlgorithm::Brotli, &out).unwrap(), data);
+        assert!(m.render().unwrap().contains("velox_compression_offload_jobs_total 0"), "{}", m.render().unwrap());
+
+        // If no worker thread can be started, large slices degrade to inline
+        // compression instead of failing the response.
+        let no_threads = Arc::new(Compressor {
+            active: AtomicUsize::new(0),
+            pool: EncoderPool { threads: 0, tx: OnceLock::new() },
+            metrics: metrics(),
+        });
+        let big = sample(300_000);
+        let body = CompressBody::new(
+            http_body_util::Full::new(Bytes::from(big.clone())),
+            CompressionAlgorithm::Zstd,
+            &cfg(),
+            Arc::clone(&no_threads),
+            no_threads.try_acquire(5).unwrap(),
+        )
+        .unwrap();
+        let (out, _, _) = collect_frames(Box::pin(body)).await;
+        assert_eq!(decode(CompressionAlgorithm::Zstd, &out).unwrap(), big);
+    }
+
+    #[tokio::test]
+    async fn a_failed_worker_surfaces_as_a_body_error_and_frees_the_slot() {
+        let rt = Compressor::new(metrics(), 2);
+        let permit = rt.try_acquire(1).unwrap();
+        let mut body = Box::pin(
+            CompressBody::new(
+                http_body_util::Full::new(Bytes::from(sample(200_000))),
+                CompressionAlgorithm::Gzip,
+                &cfg(),
+                Arc::clone(&rt),
+                permit,
+            )
+            .unwrap(),
+        );
+        // Simulate the worker vanishing: replace the in-flight job's receiver by one whose sender is gone.
+        let _ = body.frame().await; // runs the first slice normally
+        let (tx, rx) = oneshot::channel::<JobDone>();
+        drop(tx);
+        // Reach into the pinned body (same module) to install the dead receiver.
+        body.as_mut().project().job.replace(rx);
+        let mut errored = false;
+        while let Some(f) = body.frame().await {
+            if f.is_err() {
+                errored = true;
+                break;
+            }
+        }
+        assert!(errored, "a dead worker must fail the response, not hang or truncate silently");
+        assert_eq!(rt.active(), 0, "and the encoder slot is returned");
     }
 }

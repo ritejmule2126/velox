@@ -110,7 +110,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        target: [request_head, guard_stream, chunked, typed_headers, proxy_protocol, accept_encoding]
+        target: [request_head, guard_stream, chunked, typed_headers, proxy_protocol, accept_encoding, traceparent, cache_policy]
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@nightly

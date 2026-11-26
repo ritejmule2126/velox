@@ -28,6 +28,10 @@ pub struct Route {
     pub timeout: Option<Duration>,
     /// Per-route override of `compression.enabled` (`None` = follow the global switch).
     pub compress: Option<bool>,
+    /// Response-cache settings, if the route caches (and has not disabled it).
+    pub cache: Option<crate::config::RouteCacheConfig>,
+    /// Compiled CORS policy, if the route has one.
+    pub cors: Option<crate::cors::CorsPolicy>,
     /// Target pool.
     pub upstream: Arc<UpstreamGroup>,
 }
@@ -57,6 +61,8 @@ impl Route {
             request_headers,
             timeout: cfg.timeout,
             compress: cfg.compress,
+            cache: cfg.cache.clone().filter(|c| c.enabled),
+            cors: cfg.cors.as_ref().and_then(crate::cors::CorsPolicy::new),
             upstream,
         }
     }

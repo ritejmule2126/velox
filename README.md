@@ -212,7 +212,7 @@ server_name      = "payments.internal"            # SNI + name checked (default:
 
 * **Verified by default**: public web PKI (bundled Mozilla roots) unless `ca_file` is given, in which case *only* that bundle is trusted. Names are checked against DNS or IP SANs; a mismatch is a `502` and counts in `velox_upstream_tls_errors_total`. `insecure_skip_verify = true` exists for lab use and is off unless you ask for it.
 * **Rotation without a reload**: `ca_file` and the client certificate/key are re-checked every `reload_interval` (default 5 s). New connections use the new identity; a half-written rotation keeps the last good configuration instead of taking traffic down.
-* One pool may mix `https://`, `host:port` and `unix:` backends. Active health checks complete the TLS handshake first (a `tcp` check on an `https://` backend therefore proves the TLS service is up, not only the port). HTTP probes speak HTTP/1.1; for an HTTP/2-only TLS backend use `kind = "tcp"`.
+* One pool may mix `https://`, `host:port` and `unix:` backends. Active health checks complete the TLS handshake first (a `tcp` check on an `https://` backend therefore proves the TLS service is up, not only the port). With `protocol = "h2"` or `"h2c"` the HTTP probe is a real HTTP/2 request (over TLS it requires ALPN to actually negotiate `h2`; a backend that does not fails the probe rather than being probed with the wrong protocol), so HTTP/2-only backends get genuine `kind = "http"` health checks.
 * `[[tcp_proxy]]` relays bytes and does not originate TLS, so its upstreams cannot contain `https://` backends (rejected at validation).
 
 ### Per-backend circuit breaker (`max_inflight`)
@@ -240,7 +240,78 @@ algorithms = ["zstd", "br", "gzip"]
 min_size = 1024
 ```
 
-`Accept-Encoding` is negotiated per RFC 9110 (`q` values, `*`, `identity`; your `algorithms` order breaks ties). Responses are compressed **as a stream** in 32 KiB slices: memory per response is bounded, and the encoder is flushed whenever the upstream pauses (and every 256 KiB regardless), so NDJSON/long-poll style bodies are not held back. The response gets `Content-Encoding`, `Vary: Accept-Encoding` (also on responses that *could* have been compressed but went out identity, so shared caches stay correct), no `Content-Length`, a weak `ETag`, and no `Accept-Ranges`. Skipped — and left byte-for-byte untouched — for already-encoded bodies (never double-compressed), bodies smaller than `min_size`, types outside `content_types`, `text/event-stream`, `application/grpc*`, `Cache-Control: no-transform`, `206`/`Content-Range`, `1xx`/`204`/`304`, and `HEAD` (which only gets `Vary`). Works identically over HTTP/1.1, HTTP/2 and HTTP/3; `velox_compression_responses_total` and `velox_compression_bytes_total{direction}` report the savings. gzip and brotli are pure Rust; zstd uses `libzstd` through the `zstd` crate (the one C dependency besides `ring`). Each in-flight compressed response holds a live encoder whose size depends on the algorithm and level (the zstd and brotli windows are the largest; brotli's is capped at 1 MiB), so on small instances serving very many concurrent large responses prefer `level = "fast"` or drop `br`/`zstd` from `algorithms`. Measure with your own traffic before enabling it broadly.
+`Accept-Encoding` is negotiated per RFC 9110 (`q` values, `*`, `identity`; your `algorithms` order breaks ties). Responses are compressed **as a stream** in 64 KiB slices: memory per response is bounded, and the encoder is flushed whenever the upstream pauses (and every 256 KiB regardless), so NDJSON/long-poll style bodies are not held back. The response gets `Content-Encoding`, `Vary: Accept-Encoding` (also on responses that *could* have been compressed but went out identity, so shared caches stay correct), no `Content-Length`, a weak `ETag`, and no `Accept-Ranges`. Skipped — and left byte-for-byte untouched — for already-encoded bodies (never double-compressed), bodies smaller than `min_size`, types outside `content_types`, `text/event-stream`, `application/grpc*`, `Cache-Control: no-transform`, `206`/`Content-Range`, `1xx`/`204`/`304`, and `HEAD` (which only gets `Vary`). Works identically over HTTP/1.1, HTTP/2 and HTTP/3; `velox_compression_responses_total` and `velox_compression_bytes_total{direction}` report the savings. gzip and brotli are pure Rust; zstd uses `libzstd` through the `zstd` crate (the one C dependency besides `ring`).
+
+**Protecting the event loop.** Compression is CPU work, so it never runs on the async worker threads for anything big: slices of at least `offload_threshold` bytes (default 32 KiB) are compressed on a small dedicated pool of OS threads (`worker_threads`, default one per CPU, 2–16) while only that response waits, so a multi-megabyte download cannot stall other connections scheduled on the same runtime thread. (A test runs an 8 MiB, best-level gzip on a single-threaded runtime next to a 1 ms ticker and fails if the loop stalls for 150 ms; forcing the work back inline fails it.) The pool is separate from Tokio's blocking pool, which also serves DNS and file I/O. Memory is bounded by `max_concurrent_encoders` (default 256): each in-flight compressed response holds one encoder, and when all slots are taken further compressible responses simply go out **uncompressed** — compression is an optimisation, it never queues or fails traffic. That fallback is decided before any header is rewritten, so such a response keeps its `Content-Length` and strong `ETag` (it still gets `Vary`). Watch `velox_compression_encoders_active`, `velox_compression_skipped_total{reason="saturated"}` and `velox_compression_offload_jobs_total`; if no worker thread can be started at all, large slices degrade to inline compression instead of failing.
+
+### Response cache
+
+```toml
+[cache]                               # sizing, shared by every route that opts in
+max_bytes       = 67108864            # 64 MiB in total
+max_entry_bytes = 1048576             # larger bodies stream through uncached
+shards          = 16
+
+[[route]]
+upstream = "app"
+cache = { default_ttl = "30s", max_ttl = "1h" }   # `cache = {}` enables it with defaults
+```
+
+An in-memory, sharded, byte-bounded **LRU** for `GET` (and `HEAD`, answered from a stored `GET`). Each shard has its own lock, held only for map operations; hits clone reference-counted `Bytes`, never copy bodies. On a miss the response streams to the client unchanged while a bounded copy is collected, and the entry is stored only if the body ended cleanly, matched its declared length and stayed under `max_entry_bytes` — a client that disconnects mid-download leaves nothing behind. (HTTP servers do not always poll for a body's final `None`, so completion is decided from the length / end-of-stream signals; this was found by the integration tests.)
+
+What is cached is deliberately conservative — Velox implements the shared-cache subset of RFC 9111 and does not guess:
+
+* **Freshness must be stated**: `s-maxage`, else `max-age`, else `Expires` (relative to `Date`), minus `Age`; or the route's `default_ttl`. No heuristic freshness. `max_ttl` caps whatever the backend asks for. An invalid `max-age` means stale.
+* **Never stored**: `no-store`, `private`, `no-cache`, `Set-Cookie`, `Vary: *`, `Pragma: no-cache`, partial content, responses with trailers, and statuses outside 200/203/204/300/301/308/404/405/410/414/501.
+* **Never touches the cache**: requests with `Authorization`, `Range`/`If-Range`, a body or `Upgrade`, `Cache-Control: no-store`, and — **by default — a `Cookie`**: a backend that personalises on cookies without `Vary: Cookie`/`private` would otherwise show one visitor's page to another. Set `allow_cookies = true` only on routes whose cacheable responses never depend on cookies. `no-cache` / `max-age=0` / `Pragma: no-cache` skip the lookup but refresh the entry.
+* **`Vary`** is honoured: each URL holds up to 8 variants keyed on the stored request header values. **Conditionals** work from the cache: `If-None-Match` (weak comparison, `*`) and `If-Modified-Since` produce `304` without contacting the backend.
+* **Keys** are route + host (case-insensitive) + scheme + path and query. HTTP and HTTPS are separate because Velox tells the backend which one the client used. `ignore_query = true` drops the query for busting parameters.
+* **Invalidation**: a successful `POST`/`PUT`/`PATCH`/`DELETE` to a URL drops it (RFC 9111 §4.4), and the admin API purges on demand.
+* Compression and CORS are applied **per client on the way out**, to hits and misses alike, so one stored object serves identity, gzip and brotli clients and every allowed origin.
+* Every response on a caching route carries `X-Velox-Cache: hit | miss | pass | bypass` (and hits carry `Age`).
+
+```bash
+curl -XPOST localhost:9901/admin/v1/cache/purge -H 'content-type: application/json' \
+     -d '{"path_prefix": "/static/", "route": "site"}'      # → {"purged": 12}
+curl localhost:9901/admin/v1/cache                           # entries, bytes, hits, misses, evictions
+```
+
+Purge selectors are `all`, `route`, `host`, `path` (exact, with query) and `path_prefix`, ANDed; a request that selects nothing is refused (`{}` never means "everything"). Metrics: `velox_cache_hits_total{route}`, `velox_cache_misses_total{route}`, `velox_cache_bypass_total{reason}`, `velox_cache_stores_total`, `velox_cache_evictions_total`, `velox_cache_purged_total`, and the `velox_cache_entries` / `velox_cache_bytes` gauges. **Caveats**: it assumes the backend's answer depends only on method, URL, host and its own `Vary` headers — do not cache routes that personalise by client IP (`X-Forwarded-For`) or other unkeyed headers. Concurrent misses are not coalesced (each reaches the backend), stale entries are never served, and each in-flight cacheable miss buffers up to `max_entry_bytes`.
+
+### CORS
+
+```toml
+[[route]]
+upstream = "api"
+[route.cors]
+allow_origins  = ["https://app.example.com", "https://*.example.com"]   # or ["*"] (no credentials)
+allow_methods  = ["GET", "POST", "PUT"]         # default GET, HEAD, POST; "*" = any
+allow_headers  = ["content-type", "authorization"]   # "*" = whatever the preflight asks for
+expose_headers = ["x-request-id"]
+allow_credentials = true
+max_age = "10m"
+```
+
+Preflights (`OPTIONS` + `Origin` + `Access-Control-Request-Method`) are answered by Velox with `204` and never reach the backend; a disallowed origin, method or header gets `403` with no `Access-Control-*` headers (`velox_cors_denied_total{route,reason}`). On real requests the edge policy **replaces** whatever `Access-Control-*` the backend set, so one policy governs everything — including Velox's own `429`/`502`, which would otherwise show up in a browser as an opaque CORS error. `Vary: Origin` is added whenever the answer depends on the origin. Origin matching is exact (scheme, host and port, case-insensitive) or `scheme://*.host` for subdomains with at least one extra label (`*.example.com` matches neither `example.com` nor `evilexample.com`); `*` together with `allow_credentials` is rejected when the configuration loads.
+
+### Trace context (`traceparent`)
+
+`telemetry.traceparent = true` makes every proxied request carry a valid [W3C `traceparent`](https://www.w3.org/TR/trace-context/): a valid inbound one is **continued** (same trace id and sampling flags, a fresh span id for Velox's hop), a missing or malformed one — wrong widths, uppercase hex, all-zero ids, version `ff`, several header lines — is replaced by a freshly minted sampled trace. `tracestate` travels only with a valid `traceparent` and only if printable ASCII within 512 bytes. The trace id is added to the access log (`trace_id`), so logs, Velox and the backends line up.
+
+### DNS refresh for multi-address backends
+
+```toml
+[[upstream]]
+name = "orders"
+backends = [{ addr = "orders.default.svc.cluster.local:8080" }]
+dns = { refresh_interval = "10s", max_addrs = 64, ipv6 = true }
+```
+
+With a `dns` table, every hostname backend (and `https://` ones) is looked up on its own schedule and becomes **one pool member per address**, each with its own health, ejection, `max_inflight` and in-flight accounting (the admin API shows `resolved_from`). A refresh that returns the same set changes nothing; a changed answer adds members and retires vanished ones **without touching survivors**: they keep their identity, drain flag and pooled connections, and requests already running on a retired member finish normally (an end-to-end test holds a request on an address that DNS then removes). A failed or empty lookup keeps the last good answer and retries sooner, so a DNS outage cannot empty a pool; answers are sorted and capped at `max_addrs`, so every Velox instance picks the same members from an oversized record set. For `https://` backends the certificate is verified against the **host name**, not the address it resolved to (unless `tls.server_name` says otherwise). Before the first answer the hostname backend works as before (the OS resolves it per connection). Metrics: `velox_dns_resolutions_total{upstream,result}`, `velox_dns_changes_total`.
+
+### Upstream HTTP versions
+
+An upstream that answers `HTTP/1.0` (legacy appliances, some CGI-era servers) no longer leaks that status line to clients: the response is normalised to `HTTP/1.1`, with status, headers and the body bytes untouched. A close-delimited upstream body becomes a properly framed chunked response, and keep-alive works toward the client even though the backend hop never could.
 
 **What reloads live?** Routes, upstreams (including backend sets/weights/algorithms), health and outlier settings, rate limits, limits and timeouts for *new* connections/requests, response headers, trusted proxies, TLS certificates. **What needs a restart?** Listener addresses and PROXY-protocol listener settings (`http_addr`, `https_addr`, `h3`, `h3_addr`, `server.proxy_protocol`, `[[tcp_proxy]]` listeners and their `proxy_protocol`). A reload that changes them applies everything else and logs a warning.
 
@@ -264,6 +335,8 @@ All under `http://127.0.0.1:9901`. Mutations take `Content-Type: application/jso
 | `GET /admin/v1/routes` | routes with their ids |
 | `PUT /admin/v1/routes` · `POST /admin/v1/routes` | replace all · append one |
 | `PUT /admin/v1/routes/{id}` · `DELETE …/{id}` | replace · remove one |
+| `GET /admin/v1/cache` | response-cache occupancy and counters (`404` if the admin API was built without a cache) |
+| `POST /admin/v1/cache/purge` | drop cached entries: `{"all":true}` or any of `route`, `host`, `path`, `path_prefix` (ANDed); an empty request is refused |
 | `GET /metrics`, `GET /healthz` | Prometheus text, liveness |
 
 ```bash
@@ -343,7 +416,8 @@ cargo fmt --all -- --check
 | **End-to-end** (`velox-cli/tests`) | **HTTP/1.1, HTTP/2 and HTTP/3** with real TLS/QUIC clients (incl. 100 KB uploads, 50 multiplexed streams, `Alt-Svc`, protocol metrics, cert hot-reload); failover + active-health recovery; passive ejection + admin reset; **zero-failure reconfiguration under load** (8 keep-alive connections across API edits, file reload and a rejected bad reload, with an in-flight request straddling the cut-over); consistent-hash pinning + drain; L4 proxy; and the **real `velox` binary** under `SIGTERM` (in-flight request completes, exit 0), `SIGINT`, `SIGHUP`, `velox reload`, `velox validate`. |
 | **Backend TLS / mTLS** (`velox-cli/tests/e2e_upstream_tls.rs`) | A real TLS backend: custom-CA verification, SNI and name mismatch, untrusted certificate ⇒ `502` with no request sent, `insecure_skip_verify`, mTLS (anonymous client refused, identity seen by the backend), **live certificate rotation** and a broken rotation, ALPN `h2` vs `http/1.1`, mixed TLS/cleartext pools, TLS health probes flipping a backend down and up. |
 | **Circuit breaker, PROXY protocol, compression** (`velox-proxy`) | `max_inflight`: exact cap under 16-thread contention, every balancer skips full backends, `503` fast-shed vs. outage; PROXY v1/v2: parser unit + property tests (every prefix is `Incomplete`), exact-consumption on real sockets, trust list, mandatory header, per-real-client limits, TLS and L4 behind it; compression: negotiation matrix, eligibility matrix, round-trips for each codec/level/frame shape, streaming flush latency, pass-through cases, and h1/h2/h3. |
-| **Fuzz targets** (`fuzz/`) | `cargo-fuzz` targets for the request head, the guard stream, chunked framing, typed headers, the PROXY protocol parser and `Accept-Encoding` negotiation, with a smuggling seed corpus in `fuzz/seeds/`. CI runs them weekly for 3 minutes each on nightly. |
+| **Cache, CORS, DNS, trace context, H2 probes** | Cache: policy matrix (freshness sources, forbidden directives, invalid lifetimes), exact LRU eviction and byte accounting under 8-thread churn, `Vary` variants, `304`s, fill completeness (oversized, truncated, errored, trailers, client gone, and a consumer that never polls the final `None`), and end-to-end hit/miss/expiry/bypass/invalidation/cookie/scheme behaviour on h1/h2/h3 plus the admin purge API. CORS: origin-matching attack cases, preflight allow/deny, backend headers replaced on real, `429` and `502` responses. DNS: scripted resolver driving expansion, scale up/down, failure/empty answers, capping, survivors keeping state, in-flight request surviving removal, and TLS verified against the service name. `traceparent`: strict parser plus property tests. HTTP/2 probes against `h2c` and TLS (ALPN enforced). Compression: cap, offload and event-loop-stall tests. HTTP/1.0 backend normalisation. |
+| **Fuzz targets** (`fuzz/`) | `cargo-fuzz` targets for the request head, the guard stream, chunked framing, typed headers, the PROXY protocol parser, `Accept-Encoding` negotiation, `traceparent` and the cache policy, with a smuggling seed corpus in `fuzz/seeds/`. CI runs them weekly for 3 minutes each on nightly. |
 
 Run coverage-guided fuzzing locally:
 
@@ -393,9 +467,10 @@ Why: a sampling profile of the proxy under this load shows ~84 % of samples are 
 
 * **Listener addresses need a restart**; everything else reloads live (see above).
 * **Upstream TLS** covers client-auth and custom CAs but not certificate pinning, OCSP stapling checks or CRLs; `[[tcp_proxy]]` does not originate TLS.
-* **Compression** buffers at most one encoder window per response, but it does cost CPU on the worker threads that also serve traffic; there is no separate compression pool and no pre-compressed (`.gz`/`.br`) file serving, as Velox serves no files.
+* **Compression** costs CPU (on a dedicated pool, not the event loop) and one encoder per in-flight response, bounded by `max_concurrent_encoders`; beyond it, responses are sent uncompressed. There is no pre-compressed (`.gz`/`.br`) file serving, as Velox serves no files.
+* **The cache** never serves stale entries, does not revalidate with the backend or coalesce concurrent misses, and assumes responses depend only on method, URL, host, scheme and `Vary` headers (see its caveats). It is per-process and in-memory: a restart empties it, and several Velox instances do not share entries.
 * **PROXY protocol** is inbound only (Velox does not add one towards backends) and not available for HTTP/3.
-* **DNS names** in `backends` are resolved by the OS resolver on each *new* upstream connection; there is no background DNS refresh or SRV discovery. IP literals and Unix sockets are the fast path.
+* **DNS**: without an upstream `dns` table hostnames are resolved by the OS on each *new* connection (no background refresh). With it, `A`/`AAAA` answers are tracked, but there is no SRV or EDNS-client-subnet support, and Velox honours its own `refresh_interval` rather than record TTLs.
 * **HTTP/2 upstream uses `:authority` = backend address** (the original host travels in `X-Forwarded-Host`); HTTP/1 upstreams receive the original `Host`.
 * **HTTP/2 over cleartext (h2c) on the client side** is not served — HTTP/2 is negotiated via ALPN on the TLS listener.
 * **Streaming uploads are not retried**: only bodies up to `retry_body_buffer_bytes` with a known length are replayable on another backend; others get a single attempt.
