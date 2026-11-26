@@ -347,7 +347,16 @@ impl CacheAdmin for FakeCache {
         7
     }
     fn stats(&self) -> CacheStats {
-        CacheStats { entries: 3, bytes: 4096, max_bytes: 1 << 20, hits: 10, misses: 4, evictions: 1 }
+        CacheStats {
+            entries: 3,
+            bytes: 4096,
+            max_bytes: 1 << 20,
+            hits: 10,
+            misses: 4,
+            evictions: 1,
+            stale_served: 2,
+            coalesced: 5,
+        }
     }
 }
 

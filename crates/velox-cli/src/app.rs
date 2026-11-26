@@ -30,6 +30,8 @@ impl FileReloader {
     fn reload_inner(&self) -> Result<u64> {
         let cfg = Config::load(&self.path)?;
         cfg.validate_files()?;
+        // A reload must never swap in routes whose keys cannot be loaded.
+        velox_security::jwt::check_config(&cfg).map_err(anyhow::Error::msg)?;
         let live = self.state.load();
         let (old, new) = (&live.config.server, &cfg.server);
         if old.http_addr != new.http_addr

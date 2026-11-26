@@ -5,7 +5,7 @@
 //! [`ProxyError`] mapped to a clean 4xx/5xx; nothing on this path unwraps.
 
 use crate::body::{BodyFault, Fault, IdleBody, LimitBody};
-use crate::cache::{self, Cache, FillTicket, KeyMeta, Offer, RequestMode};
+use crate::cache::{self, Cache, Claim, Entry, FillTicket, KeyMeta, Lookup, Offer, RequestMode};
 use crate::compress;
 use crate::error::{full, simple_response, ProxyBody, ProxyError};
 use crate::io::{Activity, InflightGuard, REJECT_PATH};
@@ -14,19 +14,22 @@ use crate::shutdown::Shutdown;
 use crate::upstream::UpstreamClients;
 use arc_swap::ArcSwap;
 use bytes::Bytes;
-use http::header::{ACCEPT_ENCODING, ALT_SVC, CONNECTION, CONTENT_LENGTH, HOST, LOCATION, UPGRADE};
+use http::header::{
+    ACCEPT_ENCODING, ALT_SVC, AUTHORIZATION, CACHE_CONTROL, CONNECTION, CONTENT_LENGTH, COOKIE, HOST,
+    IF_MODIFIED_SINCE, IF_NONE_MATCH, IF_RANGE, LOCATION, PRAGMA, RANGE, UPGRADE,
+};
 use http::uri::{PathAndQuery, Scheme};
-use http::{HeaderMap, HeaderValue, Method, Request, Response, StatusCode, Uri, Version};
+use http::{HeaderMap, HeaderName, HeaderValue, Method, Request, Response, StatusCode, Uri, Version};
 use http_body::Body;
 use http_body_util::BodyExt;
 use hyper_util::rt::TokioIo;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::atomic::{AtomicU16, Ordering};
-use std::sync::{Arc, OnceLock};
-use std::time::Instant;
+use std::sync::{Arc, OnceLock, Weak};
+use std::time::{Instant, SystemTime};
 use tracing::Instrument;
 use velox_core::cache_admin::{CacheAdmin, CacheStats, PurgeRequest};
-use velox_core::config::{Algorithm, CacheConfig, CompressionConfig, Config};
+use velox_core::config::{Algorithm, CacheConfig, CompressionConfig, Config, RouteCacheConfig};
 use velox_core::cors::{self, CorsPolicy};
 use velox_core::router::Route;
 use velox_core::sanitize::{
@@ -106,6 +109,16 @@ struct ResponseCtx<'a> {
     cache: CacheCtx,
 }
 
+/// Headers carrying the verified client certificate's identity to the backend.
+pub const X_CLIENT_CERT_SUBJECT: HeaderName = HeaderName::from_static("x-client-cert-subject");
+/// See [`X_CLIENT_CERT_SUBJECT`].
+pub const X_CLIENT_CERT_SERIAL: HeaderName = HeaderName::from_static("x-client-cert-serial");
+
+/// The verified client certificate of the connection a request arrived on,
+/// attached as a request extension by the front-ends (TCP/TLS and QUIC).
+#[derive(Debug, Clone)]
+pub struct ClientCertInfo(pub Arc<velox_security::client_cert::ClientCert>);
+
 /// What the response cache wants done with this request's response.
 #[derive(Default)]
 struct CacheCtx {
@@ -115,6 +128,52 @@ struct CacheCtx {
     fill: Option<FillTicket>,
     /// A successful unsafe request invalidates this URL.
     invalidate: Option<(Arc<Cache>, Arc<str>)>,
+    /// An expired entry that may be served if the backend fails (`stale-if-error`).
+    stale: Option<StaleFallback>,
+}
+
+/// What it takes to answer from an expired entry when the backend is failing.
+struct StaleFallback {
+    entry: Arc<Entry>,
+    request_headers: HeaderMap,
+    head: bool,
+    route: Arc<str>,
+}
+
+/// The parts of a request the cache stage reads. (`ProxyBody` is `Send` but not
+/// `Sync`, so a `&Request<ProxyBody>` cannot be held across an `await`; these
+/// borrows can.)
+struct ReqView<'a> {
+    method: &'a Method,
+    headers: &'a HeaderMap,
+    uri: &'a Uri,
+    has_body: bool,
+    internal: bool,
+    /// The connection presented a verified client certificate.
+    authenticated: bool,
+}
+
+/// Marks the internal request a background revalidation sends through the
+/// normal pipeline: it skips client-facing gates (rate limit, ACLs, …), is never
+/// answered from the cache, and its response fills the cache like any miss.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct Revalidation;
+
+/// Everything a background revalidation needs; owned by its task.
+struct RevalidationJob {
+    cache: Arc<Cache>,
+    key: Arc<str>,
+    meta: Arc<KeyMeta>,
+    stale: Arc<Entry>,
+    rc: RouteCacheConfig,
+    route: Arc<str>,
+    request_headers: HeaderMap,
+    target: PathAndQuery,
+    authority: HeaderValue,
+    conn: ConnMeta,
+    max_bytes: u64,
+    /// Keeps the object "in flight" until the refresh is stored or abandoned.
+    _leader: cache::FlightLeader,
 }
 
 /// The request's `Accept-Encoding` as one value (several header lines are joined).
@@ -147,6 +206,9 @@ pub struct Proxy {
     clients: UpstreamClients,
     compressor: Arc<compress::Compressor>,
     cache: OnceLock<Arc<Cache>>,
+    jwt: velox_security::JwtRegistry,
+    /// A handle to ourselves, so background work (revalidation) can be spawned.
+    me: Weak<Proxy>,
     derived: ArcSwap<(u64, Arc<Derived>)>,
     bound_https: AtomicU16,
     bound_h3: AtomicU16,
@@ -201,11 +263,13 @@ impl Proxy {
         let derived = Arc::new(Derived::build(&state.load().config, 0, 0));
         let generation = state.load().generation;
         let worker_threads = state.load().config.compression.worker_threads;
-        Arc::new(Self {
+        Arc::new_cyclic(|me| Self {
+            me: me.clone(),
             state,
             clients: UpstreamClients::new(Arc::clone(&metrics)),
             compressor: compress::Compressor::new(Arc::clone(&metrics), worker_threads),
             cache: OnceLock::new(),
+            jwt: velox_security::JwtRegistry::new(),
             metrics,
             limiters: RateLimiters::new(),
             conn_limiter: ConnectionLimiter::new(),
@@ -256,6 +320,258 @@ impl Proxy {
         self.cache.get_or_init(|| Arc::new(Cache::new(cfg.shards)))
     }
 
+    /// The response for a cache `entry`, evaluated against the request's
+    /// conditionals and compressed per client like any other.
+    fn cached_response(
+        &self,
+        entry: &Entry,
+        request_headers: &HeaderMap,
+        head: bool,
+        compress: Option<&CompressCtx<'_>>,
+        tag: &'static str,
+    ) -> Response<ProxyBody> {
+        let hit = cache::serve_hit(entry, request_headers, Instant::now());
+        let body =
+            if head || hit.status == StatusCode::NOT_MODIFIED { ProxyBody::Empty } else { ProxyBody::full(hit.body) };
+        let mut resp = Response::new(ProxyBody::Empty);
+        *resp.status_mut() = hit.status;
+        *resp.headers_mut() = hit.headers;
+        let (mut parts, _) = resp.into_parts();
+        parts.headers.insert(cache::X_CACHE, HeaderValue::from_static(tag));
+        let ended = body.is_end_stream();
+        let body = self.apply_compression(compress, ended, &mut parts, body);
+        Response::from_parts(parts, body)
+    }
+
+    /// The cache's part of a request: answer from it if possible, otherwise
+    /// decide how the fetch should feed it. `None` means "go to the backend"
+    /// (with `out` describing what to do with the response).
+    ///
+    /// * fresh entry → answered (`HIT`);
+    /// * expired inside its `stale-while-revalidate` window → answered at once
+    ///   (`REVALIDATING`) while one background request refreshes it;
+    /// * expired inside its `stale-if-error` window → remembered in `out`, used
+    ///   only if the backend then fails (`STALE`);
+    /// * a miss while another request is already fetching the same object →
+    ///   wait for it (bounded) and share the result.
+    #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+    async fn cache_stage(
+        &self,
+        rc: &RouteCacheConfig,
+        route: &Route,
+        cfg: &Config,
+        authority: &str,
+        host: &str,
+        req: &ReqView<'_>,
+        conn: ConnMeta,
+        compress: Option<&CompressCtx<'_>>,
+        out: &mut CacheCtx,
+    ) -> Option<Response<ProxyBody>> {
+        let cache = self.cache(&cfg.cache);
+        let (internal, has_body) = (req.internal, req.has_body);
+        // A revalidation always goes to the backend, and fills the cache.
+        let mode = if internal {
+            RequestMode::Refresh
+        } else if req.authenticated {
+            // The backend sees who is asking and may personalise: never share.
+            RequestMode::Bypass("client-cert")
+        } else {
+            cache::classify_request(req.method, req.headers, has_body, rc.allow_cookies)
+        };
+        let target =
+            if rc.ignore_query { req.uri.path() } else { req.uri.path_and_query().map_or("/", PathAndQuery::as_str) };
+        let meta = Arc::new(KeyMeta::new(&route.id, host, conn.tls, target));
+        let key = meta.key()?;
+        let mut leader = None;
+        match mode {
+            RequestMode::Bypass(why) => {
+                self.metrics.cache_bypassed(why);
+                out.tag = Some(cache::tag::BYPASS);
+                // A successful write to this URL makes what we hold stale.
+                if matches!(*req.method, Method::POST | Method::PUT | Method::PATCH | Method::DELETE) {
+                    out.invalidate = Some((Arc::clone(cache), Arc::clone(&key)));
+                }
+                return None;
+            }
+            RequestMode::Normal => {
+                let head = *req.method == Method::HEAD;
+                match cache.lookup(&key, req.headers, Instant::now()) {
+                    Lookup::Fresh(entry) => {
+                        cache.count_hit();
+                        self.metrics.cache_hit(&route.id);
+                        return Some(self.cached_response(&entry, req.headers, head, compress, cache::tag::HIT));
+                    }
+                    Lookup::Stale { entry, while_revalidate, if_error } => {
+                        if while_revalidate {
+                            // Serve now; refresh once, in the background.
+                            self.start_revalidation(cache, &key, &meta, &entry, rc, route, cfg, authority, req, conn);
+                            cache.count_stale();
+                            self.metrics.cache_stale_served(&route.id, "swr");
+                            return Some(self.cached_response(
+                                &entry,
+                                req.headers,
+                                head,
+                                compress,
+                                cache::tag::REVALIDATING,
+                            ));
+                        }
+                        if if_error {
+                            out.stale = Some(StaleFallback {
+                                entry,
+                                request_headers: req.headers.clone(),
+                                head,
+                                route: Arc::clone(&route.id),
+                            });
+                        }
+                        cache.count_miss();
+                        self.metrics.cache_miss(&route.id);
+                    }
+                    Lookup::Miss => {
+                        cache.count_miss();
+                        self.metrics.cache_miss(&route.id);
+                    }
+                }
+                // Collapse concurrent misses on this object into one fetch.
+                if rc.coalesce && *req.method == Method::GET {
+                    match cache.claim(cache.flight_key(&key, req.headers)) {
+                        Claim::Leader(guard) => leader = Some(guard),
+                        Claim::Follower(rx) => {
+                            if cache::wait_for_flight(rx, rc.coalesce_timeout).await {
+                                if let Lookup::Fresh(entry) = cache.lookup(&key, req.headers, Instant::now()) {
+                                    cache.count_coalesced();
+                                    self.metrics.cache_coalesced(&route.id);
+                                    return Some(self.cached_response(
+                                        &entry,
+                                        req.headers,
+                                        false,
+                                        compress,
+                                        cache::tag::HIT,
+                                    ));
+                                }
+                                // The leader's response was not cacheable (or not for
+                                // our variant), or it failed: fetch for ourselves.
+                            } else {
+                                self.metrics.cache_coalesce_timeout(&route.id);
+                            }
+                        }
+                    }
+                }
+            }
+            RequestMode::Refresh => {
+                if !internal {
+                    cache.count_miss();
+                    self.metrics.cache_miss(&route.id);
+                }
+            }
+        }
+        out.tag = Some(cache::tag::MISS);
+        // Only a `GET` is stored (a `HEAD` is answered from one).
+        if *req.method == Method::GET {
+            out.fill = Some(FillTicket {
+                cache: Arc::clone(cache),
+                metrics: Arc::clone(&self.metrics),
+                key,
+                meta,
+                route: rc.clone(),
+                request_headers: req.headers.clone(),
+                max_bytes: cfg.cache.max_bytes,
+                max_entry_bytes: cfg.cache.max_entry_bytes,
+                leader,
+            });
+        }
+        None
+    }
+
+    /// Start the one background refresh of a stale object (if none is running).
+    #[allow(clippy::too_many_arguments)]
+    fn start_revalidation(
+        &self,
+        cache: &Arc<Cache>,
+        key: &Arc<str>,
+        meta: &Arc<KeyMeta>,
+        entry: &Arc<Entry>,
+        rc: &RouteCacheConfig,
+        route: &Route,
+        cfg: &Config,
+        authority: &str,
+        req: &ReqView<'_>,
+        conn: ConnMeta,
+    ) {
+        let Claim::Leader(leader) = cache.claim(cache.flight_key(key, req.headers)) else {
+            return; // someone is already refreshing it
+        };
+        let (Some(me), Ok(authority), Some(target)) =
+            (self.me.upgrade(), HeaderValue::from_str(authority), req.uri.path_and_query().cloned())
+        else {
+            return;
+        };
+        let job = RevalidationJob {
+            cache: Arc::clone(cache),
+            key: Arc::clone(key),
+            meta: Arc::clone(meta),
+            stale: Arc::clone(entry),
+            rc: rc.clone(),
+            route: Arc::clone(&route.id),
+            request_headers: req.headers.clone(),
+            target,
+            authority,
+            conn,
+            max_bytes: cfg.cache.max_bytes,
+            _leader: leader,
+        };
+        self.shutdown.tasks.spawn(async move { me.run_revalidation(job).await });
+    }
+
+    /// Refresh a stale entry: a conditional `GET` through the normal pipeline.
+    /// `304` revives the stored body; a new `200` replaces it; anything else
+    /// leaves the stale entry for its remaining window.
+    async fn run_revalidation(self: Arc<Self>, job: RevalidationJob) {
+        let mut headers = job.request_headers.clone();
+        // The refresh speaks for the object, not for the client that triggered it.
+        for name in [COOKIE, AUTHORIZATION, RANGE, IF_RANGE, IF_NONE_MATCH, IF_MODIFIED_SINCE, CACHE_CONTROL, PRAGMA] {
+            headers.remove(name);
+        }
+        if !headers.contains_key(HOST) {
+            headers.insert(HOST, job.authority.clone());
+        }
+        let (etag, last_modified) = job.stale.validators();
+        if let Some(e) = etag {
+            headers.insert(IF_NONE_MATCH, e.clone());
+        }
+        if let Some(lm) = last_modified {
+            headers.insert(IF_MODIFIED_SINCE, lm);
+        }
+        let mut req = Request::new(ProxyBody::Empty);
+        let Ok(uri) = Uri::builder().path_and_query(job.target.clone()).build() else { return };
+        *req.uri_mut() = uri;
+        *req.headers_mut() = headers;
+        req.extensions_mut().insert(Revalidation);
+
+        let resp = self.handle(req, job.conn, None).await;
+        let wait = self.state.load().config.timeouts.upstream_response.saturating_mul(2);
+        let result = if resp.status() == StatusCode::NOT_MODIFIED {
+            let refreshed =
+                job.cache.refresh_not_modified(&job.key, &job.meta, &job.stale, resp.headers(), &job.rc, job.max_bytes);
+            if refreshed {
+                "not_modified"
+            } else {
+                "error"
+            }
+        } else {
+            let ok = resp.status().is_success() || resp.status() == StatusCode::NOT_FOUND;
+            // Drive the body to its end so the fill completes and is stored.
+            let drained = tokio::time::timeout(wait, resp.into_body().collect()).await.is_ok_and(|r| r.is_ok());
+            if ok && drained {
+                "updated"
+            } else {
+                "error"
+            }
+        };
+        self.metrics.cache_revalidation(&job.route, result);
+        let stats = job.cache.stats();
+        self.metrics.cache_size(stats.entries, stats.bytes);
+    }
+
     /// Compress `body` if the route wants it and the response is eligible.
     fn apply_compression(
         &self,
@@ -290,6 +606,7 @@ impl Proxy {
                 .map(String::as_str),
         );
         self.clients.retain(snap.upstreams.values().map(|g| &**g));
+        self.jwt.retain(snap.config.routes.iter().filter_map(|r| r.jwt.as_ref()));
     }
 
     fn derived(&self, snap: &Snapshot) -> Arc<Derived> {
@@ -438,6 +755,32 @@ impl Proxy {
         let group: &'s UpstreamGroup = &route.upstream;
         trace.route = Some(&route.id);
         trace.upstream = Some(&group.name);
+        // A background revalidation is Velox talking to itself on a client's
+        // behalf: no client-facing gates apply and nothing is compressed for it.
+        let internal = req.extensions().get::<Revalidation>().is_some();
+
+        // CORS: remember the policy so every response (even a 429 or 502 that
+        // Velox generates) carries it; preflights are answered below.
+        if let Some(policy) = &route.cors {
+            trace.cors = Some((policy, req.headers().get(cors::ORIGIN).cloned()));
+        }
+
+        // ---- client identity + access lists ----
+        // Resolved first (after PROXY protocol / trusted proxies) so a refused
+        // address gets nothing — not even a redirect — and costs no rate-limit state.
+        let client_ip = resolve_client_ip(req.headers(), conn.peer.ip(), &cfg.security.trusted_proxies);
+        trace.client_ip = Some(client_ip);
+        if !internal {
+            let refusal = snap
+                .acl
+                .check(client_ip)
+                .map_err(|d| ("global", d))
+                .and_then(|()| route.acl.check(client_ip).map_err(|d| ("route", d)));
+            if let Err((scope, why)) = refusal {
+                self.metrics.acl_denied(&route.id, scope, why.reason());
+                return Err(ProxyError::Forbidden);
+            }
+        }
 
         // A TLS-terminating load balancer in front of us has already done the
         // upgrade: redirecting its plain-HTTP hop again would loop forever.
@@ -448,16 +791,8 @@ impl Proxy {
             return redirect_to_https(route.canonical_host.as_deref().unwrap_or(host), derived.https_port, req.uri());
         }
 
-        // CORS: remember the policy so every response (even a 429 or 502 that
-        // Velox generates) carries it; preflights are answered below.
-        if let Some(policy) = &route.cors {
-            trace.cors = Some((policy, req.headers().get(cors::ORIGIN).cloned()));
-        }
-
-        // ---- client identity + rate limit ----
-        let client_ip = resolve_client_ip(req.headers(), conn.peer.ip(), &cfg.security.trusted_proxies);
-        trace.client_ip = Some(client_ip);
-        if let Some(policy) = &route.rate_limit {
+        // ---- rate limit ----
+        if let Some(policy) = route.rate_limit.as_ref().filter(|_| !internal) {
             let limiter = self.limiters.get(&route.id, policy);
             let key = rate_key(&limiter, &policy.key, req.headers(), client_ip);
             if let Decision::Limited { retry_after } = limiter.check(key) {
@@ -489,7 +824,41 @@ impl Proxy {
             }
         }
 
-        let compress = route.compress.unwrap_or(cfg.compression.enabled).then(|| CompressCtx {
+        // ---- edge JWT verification ----
+        if let Some(jwt) = route.jwt.as_ref().filter(|_| !internal) {
+            // Claims reach the backend only from a verified token: whatever the
+            // client put in `X-Jwt-*` is discarded first.
+            let spoofed: Vec<HeaderName> =
+                req.headers().keys().filter(|k| k.as_str().starts_with("x-jwt-")).cloned().collect();
+            for name in spoofed {
+                req.headers_mut().remove(name);
+            }
+            match self.jwt.verify(jwt, req.headers(), SystemTime::now()) {
+                Ok(Some(claims)) => {
+                    for claim in &jwt.forward_claims {
+                        let value = claims.get(claim).and_then(velox_security::jwt::claim_header_text);
+                        let header = HeaderName::from_bytes(format!("x-jwt-{}", claim.to_ascii_lowercase()).as_bytes());
+                        if let (Some(text), Ok(name)) = (value, header) {
+                            if let Ok(v) = HeaderValue::from_str(&text) {
+                                req.headers_mut().insert(name, v);
+                            }
+                        }
+                    }
+                }
+                Ok(None) => {} // no token, and the route does not require one
+                Err(why) => {
+                    self.metrics.jwt_rejected(&route.id, why.reason());
+                    tracing::debug!(route = &*route.id, reason = why.reason(), "token refused");
+                    return Err(match why {
+                        velox_security::jwt::JwtError::Missing => ProxyError::Unauthorized { invalid: false },
+                        velox_security::jwt::JwtError::Unavailable => ProxyError::AuthUnavailable,
+                        _ => ProxyError::Unauthorized { invalid: true },
+                    });
+                }
+            }
+        }
+
+        let compress = (route.compress.unwrap_or(cfg.compression.enabled) && !internal).then(|| CompressCtx {
             cfg: &cfg.compression,
             accept: accept_encoding(req.headers()),
             head: req.method() == Method::HEAD,
@@ -498,66 +867,18 @@ impl Proxy {
         // ---- response cache ----
         let mut cache_ctx = CacheCtx::default();
         if let Some(rc) = &route.cache {
-            let cache = self.cache(&cfg.cache);
-            let has_body = !(req.body().is_end_stream() || req.body().size_hint().exact() == Some(0));
-            let mode = cache::classify_request(req.method(), req.headers(), has_body, rc.allow_cookies);
-            let target = if rc.ignore_query {
-                req.uri().path()
-            } else {
-                req.uri().path_and_query().map_or("/", PathAndQuery::as_str)
+            let view = ReqView {
+                method: req.method(),
+                headers: req.headers(),
+                uri: req.uri(),
+                has_body: !(req.body().is_end_stream() || req.body().size_hint().exact() == Some(0)),
+                internal,
+                authenticated: req.extensions().get::<ClientCertInfo>().is_some(),
             };
-            let meta = Arc::new(KeyMeta::new(&route.id, host, conn.tls, target));
-            if let Some(key) = meta.key() {
-                match mode {
-                    RequestMode::Normal => {
-                        if let Some(entry) = cache.get(&key, req.headers(), Instant::now()) {
-                            self.metrics.cache_hit(&route.id);
-                            let hit = cache::serve_hit(&entry, req.headers(), Instant::now());
-                            let body = if req.method() == Method::HEAD || hit.status == StatusCode::NOT_MODIFIED {
-                                ProxyBody::Empty
-                            } else {
-                                ProxyBody::full(hit.body)
-                            };
-                            let mut resp = Response::new(ProxyBody::Empty);
-                            *resp.status_mut() = hit.status;
-                            *resp.headers_mut() = hit.headers;
-                            let (mut parts, _) = resp.into_parts();
-                            parts.headers.insert(cache::X_CACHE, HeaderValue::from_static("hit"));
-                            let ended = body.is_end_stream();
-                            let body = self.apply_compression(compress.as_ref(), ended, &mut parts, body);
-                            return Ok(Response::from_parts(parts, body));
-                        }
-                        self.metrics.cache_miss(&route.id);
-                    }
-                    RequestMode::Refresh => {
-                        cache.count_miss();
-                        self.metrics.cache_miss(&route.id);
-                    }
-                    RequestMode::Bypass(why) => {
-                        self.metrics.cache_bypassed(why);
-                        cache_ctx.tag = Some("bypass");
-                        // A successful write to this URL makes what we hold stale.
-                        if matches!(*req.method(), Method::POST | Method::PUT | Method::PATCH | Method::DELETE) {
-                            cache_ctx.invalidate = Some((Arc::clone(cache), Arc::clone(&key)));
-                        }
-                    }
-                }
-                if !matches!(mode, RequestMode::Bypass(_)) {
-                    cache_ctx.tag = Some("miss");
-                    // Only a `GET` is stored (a `HEAD` is answered from one).
-                    if req.method() == Method::GET {
-                        cache_ctx.fill = Some(FillTicket {
-                            cache: Arc::clone(cache),
-                            metrics: Arc::clone(&self.metrics),
-                            key,
-                            meta,
-                            route: rc.clone(),
-                            request_headers: req.headers().clone(),
-                            max_bytes: cfg.cache.max_bytes,
-                            max_entry_bytes: cfg.cache.max_entry_bytes,
-                        });
-                    }
-                }
+            let answer =
+                self.cache_stage(rc, route, cfg, authority, host, &view, conn, compress.as_ref(), &mut cache_ctx).await;
+            if let Some(resp) = answer {
+                return Ok(resp);
             }
         }
 
@@ -569,6 +890,7 @@ impl Proxy {
         let ws = req.version() == Version::HTTP_11 && is_websocket_upgrade(req.headers());
         let client_upgrade = ws.then(|| hyper::upgrade::on(&mut req));
         let ws_proto = ws.then(|| req.headers().get(UPGRADE).cloned()).flatten();
+        let client_cert = req.extensions().get::<ClientCertInfo>().cloned();
         let (mut parts, body) = req.into_parts();
 
         let idle = cfg.timeouts.request_body_idle;
@@ -601,6 +923,22 @@ impl Proxy {
         // ---- forwarded headers ----
         let mut headers = std::mem::take(&mut parts.headers);
         strip_hop_by_hop(&mut headers);
+        // Client-certificate identity: believed only from our own verified
+        // handshake, or from a trusted proxy that performed one for us. Anyone
+        // else's `X-Client-Cert-*` is discarded before the backend can see it.
+        let peer_trusted = cfg.security.trusted_proxies.iter().any(|n| n.contains(&conn.peer.ip()));
+        if client_cert.is_some() || !peer_trusted {
+            headers.remove(X_CLIENT_CERT_SUBJECT);
+            headers.remove(X_CLIENT_CERT_SERIAL);
+        }
+        if let Some(cert) = &client_cert {
+            if let (Ok(subject), Ok(serial)) =
+                (HeaderValue::from_str(&cert.0.subject), HeaderValue::from_str(&cert.0.serial))
+            {
+                headers.insert(X_CLIENT_CERT_SUBJECT, subject);
+                headers.insert(X_CLIENT_CERT_SERIAL, serial);
+            }
+        }
         if ws {
             headers.insert(CONNECTION, HeaderValue::from_static("upgrade"));
             if let Some(u) = ws_proto {
@@ -724,6 +1062,12 @@ impl Proxy {
                     if record_outcome(group, backend, Outcome::Response { status }) {
                         self.metrics.backend_ejected(&group.name, &backend.name);
                     }
+                    // `stale-if-error`: a failing backend is answered from the expired copy.
+                    if matches!(status, 500 | 502 | 503 | 504) {
+                        if let Some(stale) = cache_ctx.stale.take() {
+                            return Ok(self.stale_if_error(stale, compress.as_ref()));
+                        }
+                    }
                     return self.finish_response(
                         resp,
                         active,
@@ -754,7 +1098,7 @@ impl Proxy {
                 break;
             }
         }
-        Err(last_err.unwrap_or_else(|| {
+        let failure = last_err.unwrap_or_else(|| {
             // No backend was usable at all. Distinguish "all full" (shed load,
             // the pool is fine) from "all down" (an outage).
             if saturated || group.any_saturated() {
@@ -763,7 +1107,22 @@ impl Proxy {
             } else {
                 ProxyError::NoHealthyUpstream
             }
-        }))
+        });
+        // Every attempt failed. If an expired copy may be served in that case
+        // (`stale-if-error`), do so rather than surface the error.
+        if let Some(stale) = cache_ctx.stale.take() {
+            return Ok(self.stale_if_error(stale, compress.as_ref()));
+        }
+        Err(failure)
+    }
+
+    /// Answer from an expired entry because the backend is failing.
+    fn stale_if_error(&self, stale: StaleFallback, compress: Option<&CompressCtx<'_>>) -> Response<ProxyBody> {
+        if let Some(cache) = self.cache.get() {
+            cache.count_stale();
+        }
+        self.metrics.cache_stale_served(&stale.route, "sie");
+        self.cached_response(&stale.entry, &stale.request_headers, stale.head, compress, cache::tag::STALE)
     }
 
     fn finish_response(
@@ -848,7 +1207,7 @@ impl Proxy {
             body = filled;
             if let Offer::Pass(why) = offer {
                 self.metrics.cache_bypassed(why);
-                tag = Some("pass");
+                tag = Some(cache::tag::PASS);
             }
         }
         let body = self.apply_compression(compress.as_ref(), ended, &mut parts, body);

@@ -54,12 +54,28 @@ use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant, SystemTime};
+use tokio::sync::watch;
 use velox_core::cache_admin::{CacheAdmin, CacheStats, PurgeRequest};
 use velox_core::config::RouteCacheConfig;
 use velox_telemetry::Metrics;
 
 /// Response header describing how the cache treated the request.
 pub const X_CACHE: HeaderName = HeaderName::from_static("x-velox-cache");
+/// `X-Velox-Cache` values.
+pub mod tag {
+    /// Served from a fresh entry.
+    pub const HIT: &str = "HIT";
+    /// Fetched from the backend (and stored if cacheable).
+    pub const MISS: &str = "MISS";
+    /// Fetched from the backend; the response was not cacheable.
+    pub const PASS: &str = "PASS";
+    /// The request was not eligible for the cache.
+    pub const BYPASS: &str = "BYPASS";
+    /// Served from an expired entry because the backend is failing (`stale-if-error`).
+    pub const STALE: &str = "STALE";
+    /// Served from an expired entry while it is being refreshed (`stale-while-revalidate`).
+    pub const REVALIDATING: &str = "REVALIDATING";
+}
 /// `Age`.
 const AGE: HeaderName = HeaderName::from_static("age");
 
@@ -87,6 +103,12 @@ pub struct CacheControl {
     pub max_age: Option<u64>,
     /// `s-maxage`, same rule.
     pub s_maxage: Option<u64>,
+    /// `stale-while-revalidate` (RFC 5861); invalid counts as absent.
+    pub stale_while_revalidate: Option<u64>,
+    /// `stale-if-error` (RFC 5861); invalid counts as absent.
+    pub stale_if_error: Option<u64>,
+    /// `must-revalidate` or `proxy-revalidate`: stale entries must not be served.
+    pub must_revalidate: bool,
 }
 
 fn delta_seconds(v: &str) -> u64 {
@@ -123,6 +145,17 @@ impl CacheControl {
                     cc.max_age.get_or_insert_with(|| value.map_or(0, delta_seconds));
                 } else if name.eq_ignore_ascii_case("s-maxage") {
                     cc.s_maxage.get_or_insert_with(|| value.map_or(0, delta_seconds));
+                } else if name.eq_ignore_ascii_case("stale-while-revalidate") {
+                    if let Some(v) = value.filter(|v| !v.trim().is_empty()) {
+                        cc.stale_while_revalidate.get_or_insert_with(|| delta_seconds(v));
+                    }
+                } else if name.eq_ignore_ascii_case("stale-if-error") {
+                    if let Some(v) = value.filter(|v| !v.trim().is_empty()) {
+                        cc.stale_if_error.get_or_insert_with(|| delta_seconds(v));
+                    }
+                } else if name.eq_ignore_ascii_case("must-revalidate") || name.eq_ignore_ascii_case("proxy-revalidate")
+                {
+                    cc.must_revalidate = true;
                 }
             }
         }
@@ -187,7 +220,14 @@ pub struct Storable {
     pub upstream_age: u64,
     /// Request headers the response varies on (sorted, unique).
     pub vary: Vec<HeaderName>,
+    /// How long past expiry it may be served while being refreshed.
+    pub stale_while_revalidate: Duration,
+    /// How long past expiry it may be served if the backend is failing.
+    pub stale_if_error: Duration,
 }
+
+/// Hard cap on any stale window, whatever the backend or the route asks for.
+pub const MAX_STALE: Duration = Duration::from_secs(86_400);
 
 const CACHEABLE_STATUS: [u16; 11] = [200, 203, 204, 300, 301, 308, 404, 405, 410, 414, 501];
 
@@ -273,7 +313,21 @@ pub fn evaluate_response(
     if lifetime.is_zero() {
         return Err("expired");
     }
-    Ok(Storable { lifetime, upstream_age, vary })
+    // RFC 5861 windows: the response's own directive wins over the route default;
+    // `must-revalidate` forbids serving stale at all.
+    let window = |own: Option<u64>, default: Option<Duration>| -> Duration {
+        if cc.must_revalidate {
+            return Duration::ZERO;
+        }
+        own.map(Duration::from_secs).or(default).unwrap_or_default().min(MAX_STALE)
+    };
+    Ok(Storable {
+        lifetime,
+        upstream_age,
+        vary,
+        stale_while_revalidate: window(cc.stale_while_revalidate, route.stale_while_revalidate),
+        stale_if_error: window(cc.stale_if_error, route.stale_if_error),
+    })
 }
 
 /// The request's value(s) of header `name`, joined (for `Vary` comparison).
@@ -308,16 +362,54 @@ pub struct Entry {
     size: usize,
     etag: Option<HeaderValue>,
     last_modified: Option<SystemTime>,
+    stale_while_revalidate: Duration,
+    stale_if_error: Duration,
+}
+
+/// Where an entry is in its life.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Freshness {
+    /// Within its lifetime.
+    Fresh,
+    /// Past expiry but inside a stale window.
+    Stale {
+        /// May be served right away while a refresh runs.
+        while_revalidate: bool,
+        /// May be served if the backend is failing.
+        if_error: bool,
+    },
+    /// Past every window: useless, to be dropped.
+    Dead,
 }
 
 impl Entry {
+    /// Classify against `now`.
+    pub fn freshness(&self, now: Instant) -> Freshness {
+        if now < self.fresh_until {
+            return Freshness::Fresh;
+        }
+        let over = now.saturating_duration_since(self.fresh_until);
+        let (swr, sie) = (over < self.stale_while_revalidate, over < self.stale_if_error);
+        if swr || sie {
+            Freshness::Stale { while_revalidate: swr, if_error: sie }
+        } else {
+            Freshness::Dead
+        }
+    }
+
+    /// The validators a revalidation request can send.
+    pub fn validators(&self) -> (Option<&HeaderValue>, Option<HeaderValue>) {
+        let lm = self.headers.get(LAST_MODIFIED).cloned();
+        (self.etag.as_ref(), lm)
+    }
+
     /// Seconds old, as `Age` would report it.
     pub fn age(&self, now: Instant) -> u64 {
         self.base_age.saturating_add(now.saturating_duration_since(self.stored_at).as_secs())
     }
 
-    fn is_fresh(&self, now: Instant) -> bool {
-        now < self.fresh_until
+    fn is_alive(&self, now: Instant) -> bool {
+        self.freshness(now) != Freshness::Dead
     }
 
     fn matches(&self, request: &HeaderMap) -> bool {
@@ -380,11 +472,16 @@ struct Slot {
     meta: Arc<KeyMeta>,
     tick: u64,
     bytes: usize,
+    /// The `Vary` header names of the most recently stored response: what a
+    /// new request's in-flight fetch is keyed on.
+    vary_names: Vec<HeaderName>,
 }
 
 #[derive(Default)]
 struct Shard {
     map: HashMap<Arc<str>, Slot>,
+    /// Fetches in progress (see [`Cache::claim`]).
+    flights: HashMap<Arc<str>, watch::Receiver<bool>>,
     /// LRU order: smallest tick = least recently used.
     lru: BTreeMap<u64, Arc<str>>,
     tick: u64,
@@ -418,7 +515,9 @@ impl Shard {
             meta: Arc::clone(meta),
             tick: 0,
             bytes: 0,
+            vary_names: Vec::new(),
         });
+        slot.vary_names = entry.vary.iter().map(|(n, _)| n.clone()).collect();
         let (mut freed_bytes, mut freed_entries) = (0usize, 0usize);
         slot.variants.retain(|v| {
             let same = v.vary == entry.vary;
@@ -464,8 +563,8 @@ impl Shard {
     fn prune(&mut self, key: &Arc<str>, now: Instant) {
         let Some(slot) = self.map.get_mut(key) else { return };
         let before = slot.variants.len();
-        let freed: usize = slot.variants.iter().filter(|v| !v.is_fresh(now)).map(|v| v.size).sum();
-        slot.variants.retain(|v| v.is_fresh(now));
+        let freed: usize = slot.variants.iter().filter(|v| !v.is_alive(now)).map(|v| v.size).sum();
+        slot.variants.retain(|v| v.is_alive(now));
         slot.bytes -= freed;
         self.bytes -= freed;
         self.entries -= before - slot.variants.len();
@@ -485,12 +584,68 @@ pub struct Cache {
     hits: AtomicU64,
     misses: AtomicU64,
     evictions: AtomicU64,
+    stale_served: AtomicU64,
+    coalesced: AtomicU64,
 }
 
 impl std::fmt::Debug for Cache {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Cache").field("shards", &self.shards.len()).field("stats", &self.stats()).finish()
     }
+}
+
+/// The result of [`Cache::lookup`].
+#[derive(Debug)]
+pub enum Lookup {
+    /// A fresh entry.
+    Fresh(Arc<Entry>),
+    /// Expired, but inside a stale window.
+    Stale {
+        /// The entry.
+        entry: Arc<Entry>,
+        /// May be served now while a refresh runs.
+        while_revalidate: bool,
+        /// May be served if the backend is failing.
+        if_error: bool,
+    },
+    /// Nothing usable.
+    Miss,
+}
+
+/// The result of [`Cache::claim`].
+#[derive(Debug)]
+pub enum Claim {
+    /// You fetch.
+    Leader(FlightLeader),
+    /// Someone else is fetching: wait on this.
+    Follower(watch::Receiver<bool>),
+}
+
+/// Held by the request that is fetching an object. Dropping it — because the
+/// response was stored, was not cacheable, failed, or the client went away —
+/// wakes everyone waiting on the fetch.
+pub struct FlightLeader {
+    cache: Arc<Cache>,
+    flight_key: Arc<str>,
+    tx: watch::Sender<bool>,
+}
+
+impl std::fmt::Debug for FlightLeader {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("FlightLeader").finish_non_exhaustive()
+    }
+}
+
+impl Drop for FlightLeader {
+    fn drop(&mut self) {
+        Cache::lock(self.cache.shard(&self.flight_key)).flights.remove(&self.flight_key);
+        let _ = self.tx.send(true);
+    }
+}
+
+/// Wait until the fetch behind `rx` is over, at most `limit`. `true` if it ended.
+pub async fn wait_for_flight(mut rx: watch::Receiver<bool>, limit: Duration) -> bool {
+    tokio::time::timeout(limit, rx.wait_for(|done| *done)).await.is_ok_and(|r| r.is_ok())
 }
 
 /// What an insertion did.
@@ -514,6 +669,8 @@ impl Cache {
             hits: AtomicU64::new(0),
             misses: AtomicU64::new(0),
             evictions: AtomicU64::new(0),
+            stale_served: AtomicU64::new(0),
+            coalesced: AtomicU64::new(0),
         }
     }
 
@@ -539,25 +696,149 @@ impl Cache {
         adjust(&self.bytes, before.1, after.1);
     }
 
-    /// A fresh entry for `key` whose `Vary` request headers match `request`.
-    /// Counts a hit or a miss.
-    pub fn get(&self, key: &Arc<str>, request: &HeaderMap, now: Instant) -> Option<Arc<Entry>> {
+    /// Find the entry for `key` whose `Vary` headers match `request`: a fresh
+    /// one if there is, otherwise one still inside a stale window. Counts
+    /// nothing — callers decide what the outcome means ([`Cache::count_hit`] …).
+    pub fn lookup(&self, key: &Arc<str>, request: &HeaderMap, now: Instant) -> Lookup {
         let mut shard = Self::lock(self.shard(key));
         let before = (shard.entries, shard.bytes);
         shard.prune(key, now);
-        let found = shard.map.get(key).and_then(|slot| slot.variants.iter().find(|v| v.matches(request)).cloned());
+        let found = shard.map.get(key).and_then(|slot| {
+            let mut stale = None;
+            for v in slot.variants.iter().filter(|v| v.matches(request)) {
+                match v.freshness(now) {
+                    Freshness::Fresh => return Some(Lookup::Fresh(Arc::clone(v))),
+                    Freshness::Stale { while_revalidate, if_error } => {
+                        stale = Some(Lookup::Stale { entry: Arc::clone(v), while_revalidate, if_error });
+                    }
+                    Freshness::Dead => {}
+                }
+            }
+            stale
+        });
         if found.is_some() {
             shard.touch(key);
         }
         let after = (shard.entries, shard.bytes);
         drop(shard);
         self.account(before, after);
-        if found.is_some() {
-            self.hits.fetch_add(1, Ordering::Relaxed);
-        } else {
-            self.misses.fetch_add(1, Ordering::Relaxed);
+        found.unwrap_or(Lookup::Miss)
+    }
+
+    /// A *fresh* entry for `key` matching `request`; counts a hit or a miss.
+    pub fn get(&self, key: &Arc<str>, request: &HeaderMap, now: Instant) -> Option<Arc<Entry>> {
+        match self.lookup(key, request, now) {
+            Lookup::Fresh(e) => {
+                self.count_hit();
+                Some(e)
+            }
+            _ => {
+                self.count_miss();
+                None
+            }
         }
-        found
+    }
+
+    /// Count a request answered from a fresh entry.
+    pub fn count_hit(&self) {
+        self.hits.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Count a request answered with a stale entry.
+    pub fn count_stale(&self) {
+        self.stale_served.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Count a request that waited for another's fetch.
+    pub fn count_coalesced(&self) {
+        self.coalesced.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// The key concurrent misses are collapsed on: the URL plus the request's
+    /// values of the headers the stored response (if any) varies on, so a
+    /// French and an English request for the same URL do not wait for each other.
+    pub fn flight_key(&self, key: &Arc<str>, request: &HeaderMap) -> Arc<str> {
+        let hint: Vec<HeaderName> = {
+            let shard = Self::lock(self.shard(key));
+            shard.map.get(key).map(|s| s.vary_names.clone()).unwrap_or_default()
+        };
+        if hint.is_empty() {
+            return Arc::clone(key);
+        }
+        let mut out = String::from(&**key);
+        for name in &hint {
+            out.push('\0');
+            out.push_str(name.as_str());
+            out.push('=');
+            if let Some(v) = request_value(request, name) {
+                out.push_str(&String::from_utf8_lossy(&v));
+            }
+        }
+        Arc::from(out)
+    }
+
+    /// Take part in the fetch for `flight_key`: the first caller becomes the
+    /// **leader** (and must fetch); later callers get a receiver that fires when
+    /// the leader's guard is dropped — stored, abandoned or failed alike.
+    pub fn claim(self: &Arc<Self>, flight_key: Arc<str>) -> Claim {
+        let mut shard = Self::lock(self.shard(&flight_key));
+        if let Some(rx) = shard.flights.get(&flight_key) {
+            return Claim::Follower(rx.clone());
+        }
+        let (tx, rx) = watch::channel(false);
+        shard.flights.insert(Arc::clone(&flight_key), rx);
+        Claim::Leader(FlightLeader { cache: Arc::clone(self), flight_key, tx })
+    }
+
+    /// Is a fetch for `flight_key` in progress?
+    pub fn in_flight(&self, flight_key: &str) -> bool {
+        Self::lock(self.shard(flight_key)).flights.contains_key(flight_key)
+    }
+
+    /// A `304 Not Modified` proved `stale` is still current: merge the 304's
+    /// headers (RFC 9111 §4.3.4), re-evaluate freshness, and store the same body
+    /// as a fresh entry. If the merged headers are no longer cacheable the URL is
+    /// dropped instead. Returns whether a fresh entry was stored.
+    pub fn refresh_not_modified(
+        &self,
+        key: &Arc<str>,
+        meta: &Arc<KeyMeta>,
+        stale: &Entry,
+        not_modified: &HeaderMap,
+        route: &RouteCacheConfig,
+        max_bytes: u64,
+    ) -> bool {
+        let mut merged = stale.headers.clone();
+        for (name, value) in not_modified {
+            // The 304 describes the validators and caching metadata, not the content.
+            if matches!(
+                name.as_str(),
+                "content-length" | "content-encoding" | "content-range" | "transfer-encoding" | "age" | "x-velox-cache"
+            ) {
+                continue;
+            }
+            merged.insert(name.clone(), value.clone());
+        }
+        let Ok(storable) = evaluate_response(stale.status, &merged, route, SystemTime::now()) else {
+            self.invalidate(key);
+            return false;
+        };
+        let now = Instant::now();
+        let entry = Entry {
+            status: stale.status,
+            etag: merged.get(ETAG).cloned(),
+            last_modified: http_date(&merged, &LAST_MODIFIED),
+            size: estimate_size(key, &merged, &stale.body),
+            headers: merged,
+            body: stale.body.clone(),
+            vary: stale.vary.clone(),
+            stored_at: now,
+            fresh_until: now + storable.lifetime,
+            base_age: storable.upstream_age,
+            stale_while_revalidate: storable.stale_while_revalidate,
+            stale_if_error: storable.stale_if_error,
+        };
+        self.insert(key, meta, entry, max_bytes).stored
     }
 
     /// Count a lookup that was skipped but still goes to the backend.
@@ -641,6 +922,8 @@ impl Cache {
             hits: self.hits.load(Ordering::Relaxed),
             misses: self.misses.load(Ordering::Relaxed),
             evictions: self.evictions.load(Ordering::Relaxed),
+            stale_served: self.stale_served.load(Ordering::Relaxed),
+            coalesced: self.coalesced.load(Ordering::Relaxed),
         }
     }
 }
@@ -737,6 +1020,8 @@ pub struct FillTicket {
     pub max_bytes: u64,
     /// `[cache].max_entry_bytes`.
     pub max_entry_bytes: u64,
+    /// Held while the fetch is in progress so concurrent misses can wait on it.
+    pub leader: Option<FlightLeader>,
 }
 
 impl std::fmt::Debug for FillTicket {
@@ -764,6 +1049,8 @@ struct Pending {
     storable: Storable,
     vary: Vec<(HeaderName, Option<Bytes>)>,
     max_bytes: u64,
+    /// Released (waking followers) when this fill is stored or abandoned.
+    _leader: Option<FlightLeader>,
 }
 
 impl Pending {
@@ -784,6 +1071,8 @@ impl Pending {
             fresh_until: now + self.storable.lifetime,
             base_age: self.storable.upstream_age,
             size,
+            stale_while_revalidate: self.storable.stale_while_revalidate,
+            stale_if_error: self.storable.stale_if_error,
         };
         let done = self.cache.insert(&self.key, &self.meta, entry, self.max_bytes);
         if done.stored {
@@ -825,6 +1114,7 @@ impl FillTicket {
             headers: stored_headers,
             storable,
             max_bytes: self.max_bytes,
+            _leader: self.leader,
         };
         // A body that is already complete (204, `Content-Length: 0`) is never
         // polled by the server, so it is stored right here.
@@ -1109,6 +1399,8 @@ mod tests {
             stored_at: now,
             fresh_until: now + lifetime,
             base_age: 0,
+            stale_while_revalidate: Duration::ZERO,
+            stale_if_error: Duration::ZERO,
         }
     }
 
@@ -1350,6 +1642,7 @@ mod tests {
                 request_headers: request,
                 max_bytes: BIG,
                 max_entry_bytes: max_entry,
+                leader: None,
             },
             key,
         )
@@ -1578,5 +1871,229 @@ mod tests {
             accepted > 1_000 && rejected > 1_000,
             "the generator should exercise both outcomes ({accepted}/{rejected})"
         );
+    }
+
+    // ---- RFC 5861: stale-while-revalidate / stale-if-error ----
+
+    fn eval_route(pairs: &[(&str, &str)], route: &RouteCacheConfig) -> Result<Storable, &'static str> {
+        evaluate_response(StatusCode::OK, &hm(pairs), route, SystemTime::now())
+    }
+
+    #[test]
+    fn stale_directives_are_parsed_and_bounded() {
+        let r = eval(&[("cache-control", "max-age=60, stale-while-revalidate=30, stale-if-error=600")]).unwrap();
+        assert_eq!((r.stale_while_revalidate, r.stale_if_error), (Duration::from_secs(30), Duration::from_secs(600)));
+        assert_eq!(eval(&[("cache-control", "max-age=60")]).unwrap().stale_while_revalidate, Duration::ZERO);
+        // Malformed values count as absent (never as "forever").
+        for bad in [
+            "stale-while-revalidate=abc",
+            "stale-while-revalidate",
+            "stale-while-revalidate=-1",
+            "stale-while-revalidate=",
+        ] {
+            let r = eval(&[("cache-control", &format!("max-age=60, {bad}"))]).unwrap();
+            assert_eq!(r.stale_while_revalidate, Duration::ZERO, "{bad}");
+        }
+        // Capped at a day, whatever is asked.
+        let r = eval(&[("cache-control", "max-age=60, stale-if-error=99999999999")]).unwrap();
+        assert_eq!(r.stale_if_error, MAX_STALE);
+        // `must-revalidate` / `proxy-revalidate` forbid serving stale at all.
+        for cc in [
+            "max-age=60, must-revalidate, stale-while-revalidate=30, stale-if-error=30",
+            "max-age=60, proxy-revalidate, stale-if-error=30",
+        ] {
+            let r = eval(&[("cache-control", cc)]).unwrap();
+            assert_eq!((r.stale_while_revalidate, r.stale_if_error), (Duration::ZERO, Duration::ZERO), "{cc}");
+        }
+    }
+
+    #[test]
+    fn route_defaults_apply_only_when_the_response_is_silent() {
+        let route = RouteCacheConfig {
+            stale_while_revalidate: Some(Duration::from_secs(5)),
+            stale_if_error: Some(Duration::from_secs(50)),
+            ..route()
+        };
+        let silent = eval_route(&[("cache-control", "max-age=60")], &route).unwrap();
+        assert_eq!(
+            (silent.stale_while_revalidate, silent.stale_if_error),
+            (Duration::from_secs(5), Duration::from_secs(50))
+        );
+        let own = eval_route(&[("cache-control", "max-age=60, stale-while-revalidate=1")], &route).unwrap();
+        assert_eq!((own.stale_while_revalidate, own.stale_if_error), (Duration::from_secs(1), Duration::from_secs(50)));
+        let explicit_zero = eval_route(&[("cache-control", "max-age=60, stale-if-error=0")], &route).unwrap();
+        assert_eq!(explicit_zero.stale_if_error, Duration::ZERO, "an explicit 0 turns it off");
+        let strict = eval_route(&[("cache-control", "max-age=60, must-revalidate")], &route).unwrap();
+        assert_eq!((strict.stale_while_revalidate, strict.stale_if_error), (Duration::ZERO, Duration::ZERO));
+        let huge = RouteCacheConfig { stale_if_error: Some(Duration::from_secs(10 * 86_400)), ..route.clone() };
+        assert_eq!(eval_route(&[("cache-control", "max-age=60")], &huge).unwrap().stale_if_error, MAX_STALE);
+    }
+
+    /// An entry that expired `over` ago and has the given stale windows.
+    fn expired(over: Duration, swr: u64, sie: u64) -> Entry {
+        let mut e = entry("old", Duration::from_secs(60), vec![]);
+        let now = Instant::now();
+        e.fresh_until = now.checked_sub(over).expect("monotonic clock far enough from its origin");
+        e.stored_at = e.fresh_until.checked_sub(Duration::from_secs(60)).unwrap_or(e.fresh_until);
+        e.stale_while_revalidate = Duration::from_secs(swr);
+        e.stale_if_error = Duration::from_secs(sie);
+        e
+    }
+
+    #[test]
+    fn entries_move_through_fresh_stale_and_dead() {
+        let now = Instant::now();
+        assert_eq!(entry("x", Duration::from_secs(5), vec![]).freshness(now), Freshness::Fresh);
+        let e = expired(Duration::from_secs(10), 30, 300);
+        assert_eq!(e.freshness(Instant::now()), Freshness::Stale { while_revalidate: true, if_error: true });
+        // Past the swr window but inside sie, and the reverse.
+        let e = expired(Duration::from_secs(100), 30, 300);
+        assert_eq!(e.freshness(Instant::now()), Freshness::Stale { while_revalidate: false, if_error: true });
+        let e = expired(Duration::from_secs(10), 30, 5);
+        assert_eq!(e.freshness(Instant::now()), Freshness::Stale { while_revalidate: true, if_error: false });
+        // No windows, or past all of them: dead.
+        assert_eq!(expired(Duration::from_secs(1), 0, 0).freshness(Instant::now()), Freshness::Dead);
+        assert_eq!(expired(Duration::from_secs(1000), 30, 300).freshness(Instant::now()), Freshness::Dead);
+    }
+
+    #[test]
+    fn lookup_serves_stale_inside_its_windows_and_reclaims_it_after() {
+        let c = Cache::new(1);
+        let (key, m) = meta("r", "h", "/s");
+        let req = hm(&[]);
+        assert!(matches!(c.lookup(&key, &req, Instant::now()), Lookup::Miss));
+        c.insert(&key, &m, expired(Duration::from_secs(10), 30, 300), BIG);
+        match c.lookup(&key, &req, Instant::now()) {
+            Lookup::Stale { entry, while_revalidate, if_error } => {
+                assert_eq!(entry.body, "old");
+                assert!(while_revalidate && if_error);
+            }
+            other => panic!("{other:?}"),
+        }
+        // `get` only ever returns fresh entries (and counts the rest as misses).
+        assert!(c.get(&key, &req, Instant::now()).is_none());
+        assert_eq!((c.stats().hits, c.stats().misses), (0, 1));
+        // A fresh variant is preferred over a stale one for the same request.
+        c.insert(&key, &m, entry("new", Duration::from_secs(60), vec![]), BIG);
+        assert!(matches!(c.lookup(&key, &req, Instant::now()), Lookup::Fresh(e) if e.body == "new"));
+        // Dead entries are reclaimed, bytes and all.
+        let (k2, m2) = meta("r", "h", "/dead");
+        c.insert(&k2, &m2, expired(Duration::from_secs(5), 1, 1), BIG);
+        let before = c.stats().bytes;
+        assert!(matches!(c.lookup(&k2, &req, Instant::now()), Lookup::Miss));
+        assert!(c.stats().bytes < before, "{} < {before}", c.stats().bytes);
+    }
+
+    #[tokio::test]
+    async fn a_304_revives_the_stored_body_with_the_merged_headers() {
+        let c = Arc::new(Cache::new(1));
+        let (key, m) = meta("r", "h", "/r");
+        let mut old = expired(Duration::from_secs(10), 60, 60);
+        old.headers.insert(CACHE_CONTROL, hv("max-age=60"));
+        old.headers.insert(CONTENT_LENGTH, hv("3")); // stored entries always carry their length
+        c.insert(&key, &m, old, BIG);
+        let Lookup::Stale { entry: stale, .. } = c.lookup(&key, &hm(&[]), Instant::now()) else {
+            panic!("expected stale")
+        };
+        // The 304 extends freshness and brings a new validator; content headers in it are ignored.
+        let not_modified =
+            hm(&[("cache-control", "max-age=300"), ("etag", "\"v2\""), ("content-length", "0"), ("age", "7")]);
+        assert!(c.refresh_not_modified(&key, &m, &stale, &not_modified, &route(), BIG));
+        let Lookup::Fresh(fresh) = c.lookup(&key, &hm(&[]), Instant::now()) else { panic!("expected fresh") };
+        assert_eq!(fresh.body, "old", "no body was transferred");
+        assert_eq!(fresh.headers[CACHE_CONTROL], "max-age=300");
+        assert_eq!(fresh.headers[ETAG], "\"v2\"");
+        assert_eq!(fresh.headers[CONTENT_LENGTH], "3", "the 304's Content-Length must not clobber the stored one");
+        assert_eq!(c.stats().entries, 1, "the stale copy was replaced, not duplicated");
+        // A 304 that makes the object uncacheable drops it.
+        let Lookup::Fresh(cur) = c.lookup(&key, &hm(&[]), Instant::now()) else { panic!() };
+        assert!(!c.refresh_not_modified(&key, &m, &cur, &hm(&[("cache-control", "no-store")]), &route(), BIG));
+        assert!(matches!(c.lookup(&key, &hm(&[]), Instant::now()), Lookup::Miss));
+    }
+
+    // ---- request coalescing ----
+
+    #[tokio::test]
+    async fn the_first_miss_leads_and_the_rest_follow_until_the_leader_is_done() {
+        let c = Arc::new(Cache::new(2));
+        let (key, _) = meta("r", "h", "/c");
+        let Claim::Leader(leader) = c.claim(Arc::clone(&key)) else { panic!("first claim must lead") };
+        assert!(c.in_flight(&key));
+        let followers: Vec<_> = (0..10)
+            .map(|_| match c.claim(Arc::clone(&key)) {
+                Claim::Follower(rx) => tokio::spawn(wait_for_flight(rx, Duration::from_secs(5))),
+                Claim::Leader(_) => panic!("only one leader per object"),
+            })
+            .collect();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(followers.iter().all(|f| !f.is_finished()), "followers wait while the leader works");
+        drop(leader);
+        for f in followers {
+            assert!(f.await.unwrap(), "every follower is released when the leader finishes");
+        }
+        assert!(!c.in_flight(&key), "the flight is gone");
+        assert!(matches!(c.claim(Arc::clone(&key)), Claim::Leader(_)), "the next miss leads again");
+    }
+
+    #[tokio::test]
+    async fn waiting_is_bounded_and_waiters_can_give_up() {
+        let c = Arc::new(Cache::new(1));
+        let (key, _) = meta("r", "h", "/slow");
+        let Claim::Leader(_leader) = c.claim(Arc::clone(&key)) else { panic!() };
+        let Claim::Follower(rx) = c.claim(Arc::clone(&key)) else { panic!() };
+        let t0 = Instant::now();
+        assert!(!wait_for_flight(rx, Duration::from_millis(100)).await, "timed out, not finished");
+        assert!(t0.elapsed() < Duration::from_secs(2));
+    }
+
+    #[tokio::test]
+    async fn flights_are_keyed_on_the_stored_vary_so_variants_do_not_wait_for_each_other() {
+        let c = Arc::new(Cache::new(2));
+        let (key, m) = meta("r", "h", "/v");
+        // Before anything is stored there is nothing to vary on: one flight per URL.
+        let en = hm(&[("accept-language", "en")]);
+        let fr = hm(&[("accept-language", "fr")]);
+        assert_eq!(c.flight_key(&key, &en), c.flight_key(&key, &fr));
+        let lang = HeaderName::from_static("accept-language");
+        c.insert(&key, &m, entry("x", Duration::from_secs(60), vec![(lang, Some(Bytes::from("en")))]), BIG);
+        // Once the response is known to vary on Accept-Language, the languages separate.
+        let (k_en, k_fr) = (c.flight_key(&key, &en), c.flight_key(&key, &fr));
+        assert_ne!(k_en, k_fr);
+        let Claim::Leader(_a) = c.claim(k_en) else { panic!() };
+        assert!(matches!(c.claim(k_fr), Claim::Leader(_)), "a French request does not wait for an English fetch");
+    }
+
+    #[tokio::test]
+    async fn the_leader_is_released_whether_its_fill_is_stored_abandoned_or_passed_over() {
+        let cacheable = hm(&[("cache-control", "max-age=60")]);
+        type Frames = Vec<Result<Frame<Bytes>, BoxError>>;
+        let outcomes: Vec<(&str, HeaderMap, Frames, bool)> = vec![
+            ("stored", cacheable.clone(), vec![data("ok")], true),
+            ("pass", hm(&[("cache-control", "private")]), vec![data("ok")], false),
+            ("upstream error", cacheable.clone(), vec![data("par"), Err("boom".into())], false),
+        ];
+        for (label, headers, frames, stored) in outcomes {
+            let cache = Arc::new(Cache::new(1)); // a clean slate per outcome
+            let (mut t, key) = ticket(&cache, route(), hm(&[]), 1024);
+            let Claim::Leader(guard) = cache.claim(Arc::clone(&key)) else { panic!("{label}") };
+            t.leader = Some(guard);
+            let Claim::Follower(rx) = cache.claim(Arc::clone(&key)) else { panic!("{label}") };
+            let waiter = tokio::spawn(wait_for_flight(rx, Duration::from_secs(5)));
+            let (_, body) = t.offer(StatusCode::OK, &headers, body_of(frames));
+            drain(body).await;
+            assert!(waiter.await.unwrap(), "{label}: the follower was released");
+            assert_eq!(cache.get(&key, &hm(&[]), Instant::now()).is_some(), stored, "{label}");
+        }
+        // A client that disconnects mid-body also releases the followers.
+        let cache = Arc::new(Cache::new(1));
+        let (mut t, key) = ticket(&cache, route(), hm(&[]), 1024);
+        let flight: Arc<str> = Arc::from(format!("{key}-gone"));
+        let Claim::Leader(guard) = cache.claim(Arc::clone(&flight)) else { panic!() };
+        t.leader = Some(guard);
+        let Claim::Follower(rx) = cache.claim(Arc::clone(&flight)) else { panic!() };
+        let (_, mut body) = t.offer(StatusCode::OK, &cacheable, body_of(vec![data("a"), data("b")]));
+        let _ = body.frame().await;
+        drop(body);
+        assert!(wait_for_flight(rx, Duration::from_secs(1)).await);
     }
 }

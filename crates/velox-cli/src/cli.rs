@@ -42,6 +42,26 @@ pub enum Command {
         #[arg(long)]
         admin: Option<SocketAddr>,
     },
+    /// Check this machine and configuration before going to production:
+    /// config validity, open-files limit, UDP buffers for HTTP/3, listen
+    /// backlog, certificate expiry, free listen ports.
+    Doctor {
+        /// Path to `velox.toml`.
+        #[arg(short, long, default_value = "velox.toml")]
+        config: PathBuf,
+        /// Warn when a certificate expires within this many days.
+        #[arg(long, default_value_t = 14)]
+        warn_days: i64,
+        /// Also try to connect to every backend.
+        #[arg(long)]
+        check_backends: bool,
+        /// Machine-readable output.
+        #[arg(long)]
+        json: bool,
+        /// Treat warnings as failures (non-zero exit).
+        #[arg(long)]
+        strict: bool,
+    },
     /// Print version information.
     Version,
 }
@@ -75,6 +95,24 @@ pub async fn run(cli: Cli) -> Result<()> {
             }
         }
         Command::Start { config } => start(&config).await,
+        Command::Doctor { config, warn_days, check_backends, json, strict } => {
+            let opts = crate::doctor::Options { warn_days, check_backends };
+            let report = crate::doctor::run(&config, &crate::doctor::RealHost, &opts).await;
+            if json {
+                println!("{}", report.render_json());
+            } else {
+                print!("{}", report.render_text());
+            }
+            if report.exit_code(strict) != 0 {
+                bail!(
+                    "doctor found {} failure(s) and {} warning(s){}",
+                    report.count(crate::doctor::Status::Fail),
+                    report.count(crate::doctor::Status::Warn),
+                    if strict { " (--strict)" } else { "" }
+                );
+            }
+            Ok(())
+        }
     }
 }
 
@@ -82,6 +120,8 @@ pub async fn run(cli: Cli) -> Result<()> {
 pub fn validate(path: &Path) -> Result<String> {
     let cfg = Config::load(path)?;
     cfg.validate_files()?;
+    // Key material (JWT secrets / public keys / JWKS) must actually parse.
+    velox_security::jwt::check_config(&cfg).map_err(anyhow::Error::msg)?;
     let backends: usize = cfg.upstreams.iter().map(|u| u.backends.len()).sum();
     Ok(format!(
         "{}: OK ({} route(s), {} upstream(s), {} backend(s), {} tcp proxy(ies))",
@@ -120,6 +160,7 @@ pub async fn admin_post(addr: SocketAddr, path: &str, token: Option<&str>) -> Re
 async fn start(path: &Path) -> Result<()> {
     let cfg = Config::load(path)?;
     cfg.validate_files()?;
+    velox_security::jwt::check_config(&cfg).map_err(anyhow::Error::msg)?;
     velox_telemetry::init_logging(&cfg.telemetry)?;
     let app = App::start(cfg, Some(path.to_owned())).await?;
     wait_for_signals(&app).await?;
@@ -171,6 +212,27 @@ mod tests {
         let c = Cli::try_parse_from(["velox", "reload", "--admin", "127.0.0.1:9901"]).unwrap();
         assert!(matches!(c.command, Command::Reload { admin: Some(_), .. }));
         assert!(Cli::try_parse_from(["velox", "bogus"]).is_err());
+        let c = Cli::try_parse_from([
+            "velox",
+            "doctor",
+            "-c",
+            "d.toml",
+            "--warn-days",
+            "30",
+            "--check-backends",
+            "--json",
+            "--strict",
+        ])
+        .unwrap();
+        assert!(matches!(
+            c.command,
+            Command::Doctor { warn_days: 30, check_backends: true, json: true, strict: true, .. }
+        ));
+        let c = Cli::try_parse_from(["velox", "doctor"]).unwrap();
+        assert!(matches!(
+            c.command,
+            Command::Doctor { warn_days: 14, check_backends: false, json: false, strict: false, .. }
+        ));
     }
 
     #[test]

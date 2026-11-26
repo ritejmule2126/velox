@@ -46,6 +46,19 @@ pub enum ProxyError {
     /// The backend sent something unusable.
     #[error("bad upstream response: {0}")]
     BadGateway(String),
+    /// No valid token. `invalid` distinguishes "a token was presented and is
+    /// bad" (`error="invalid_token"`) from "none was presented" (RFC 6750 §3).
+    #[error("authentication required")]
+    Unauthorized {
+        /// A token was presented but refused.
+        invalid: bool,
+    },
+    /// The route's verification keys could not be loaded (fail closed).
+    #[error("authentication is temporarily unavailable")]
+    AuthUnavailable,
+    /// The client's address is not allowed (global or route ACL).
+    #[error("client address refused by an access list")]
+    Forbidden,
     /// A CORS preflight the route's policy does not allow.
     #[error("cors preflight refused")]
     CorsDenied,
@@ -66,7 +79,9 @@ impl ProxyError {
             Self::NoHealthyUpstream | Self::UpstreamSaturated => StatusCode::SERVICE_UNAVAILABLE,
             Self::UpstreamConnect(_) | Self::BadGateway(_) => StatusCode::BAD_GATEWAY,
             Self::UpstreamTimeout => StatusCode::GATEWAY_TIMEOUT,
-            Self::CorsDenied => StatusCode::FORBIDDEN,
+            Self::CorsDenied | Self::Forbidden => StatusCode::FORBIDDEN,
+            Self::Unauthorized { .. } => StatusCode::UNAUTHORIZED,
+            Self::AuthUnavailable => StatusCode::SERVICE_UNAVAILABLE,
             Self::Internal(_) => StatusCode::INTERNAL_SERVER_ERROR,
         }
     }
@@ -84,6 +99,11 @@ impl ProxyError {
             Self::UpstreamConnect(_) | Self::BadGateway(_) => "bad gateway",
             Self::UpstreamTimeout => "upstream timed out",
             Self::CorsDenied => "cross-origin request not allowed",
+            // Deliberately vague: do not say which list, or that one exists.
+            Self::Forbidden => "forbidden",
+            // Never say *why* a token failed: that helps an attacker, not a client.
+            Self::Unauthorized { .. } => "unauthorized",
+            Self::AuthUnavailable => "authentication is temporarily unavailable",
             Self::Internal(_) => "internal error",
         }
     }
@@ -99,8 +119,16 @@ impl ProxyError {
                     resp.headers_mut().insert(header::RETRY_AFTER, v);
                 }
             }
-            Self::NoHealthyUpstream | Self::UpstreamSaturated => {
+            Self::NoHealthyUpstream | Self::UpstreamSaturated | Self::AuthUnavailable => {
                 resp.headers_mut().insert(header::RETRY_AFTER, HeaderValue::from_static("1"));
+            }
+            Self::Unauthorized { invalid } => {
+                let challenge = if *invalid {
+                    HeaderValue::from_static("Bearer realm=\"velox\", error=\"invalid_token\"")
+                } else {
+                    HeaderValue::from_static("Bearer realm=\"velox\"")
+                };
+                resp.headers_mut().insert(header::WWW_AUTHENTICATE, challenge);
             }
             _ => {}
         }
@@ -143,6 +171,9 @@ mod tests {
             (ProxyError::NoHealthyUpstream, 503),
             (ProxyError::UpstreamSaturated, 503),
             (ProxyError::CorsDenied, 403),
+            (ProxyError::Forbidden, 403),
+            (ProxyError::Unauthorized { invalid: true }, 401),
+            (ProxyError::AuthUnavailable, 503),
             (ProxyError::UpstreamConnect("x".into()), 502),
             (ProxyError::BadGateway("x".into()), 502),
             (ProxyError::UpstreamTimeout, 504),

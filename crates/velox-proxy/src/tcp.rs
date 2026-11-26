@@ -1,7 +1,7 @@
 //! TCP front-end: plain HTTP/1.1 and TLS with ALPN-selected HTTP/2 or HTTP/1.1.
 
 use crate::error::{BoxError, ProxyBody};
-use crate::handler::{ConnMeta, Proxy};
+use crate::handler::{ClientCertInfo, ConnMeta, Proxy};
 use crate::io::{Activity, ConnIo, IoTimeouts};
 use crate::proxy_protocol;
 use crate::socket;
@@ -18,6 +18,7 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio_rustls::TlsAcceptor;
 use velox_core::sanitize::{H1Guard, H1Limits};
 use velox_core::Config;
+use velox_security::client_cert::ClientCert;
 use velox_telemetry::Protocol;
 
 /// How a TCP listener treats accepted sockets.
@@ -133,7 +134,7 @@ async fn serve(stream: TcpStream, peer: SocketAddr, mode: Mode, proxy: Arc<Proxy
     let cfg = Arc::clone(&snap.config);
     drop(snap);
     match mode {
-        Mode::Plain => serve_h1(stream, peer, false, &proxy, &cfg).await,
+        Mode::Plain => serve_h1(stream, peer, false, None, &proxy, &cfg).await,
         Mode::Tls(acceptor) => {
             let handshake = tokio::time::timeout(cfg.timeouts.tls_handshake, acceptor.accept(stream)).await;
             let tls = match handshake {
@@ -149,10 +150,12 @@ async fn serve(stream: TcpStream, peer: SocketAddr, mode: Mode, proxy: Arc<Proxy
                 }
             };
             let h2 = tls.get_ref().1.alpn_protocol() == Some(b"h2");
+            // The chain was verified by the handshake; this is who it names.
+            let client_cert = ClientCert::from_chain(tls.get_ref().1.peer_certificates()).map(Arc::new);
             if h2 {
-                serve_h2(tls, peer, &proxy, &cfg).await;
+                serve_h2(tls, peer, client_cert, &proxy, &cfg).await;
             } else {
-                serve_h1(tls, peer, true, &proxy, &cfg).await;
+                serve_h1(tls, peer, true, client_cert, &proxy, &cfg).await;
             }
         }
     }
@@ -190,8 +193,14 @@ fn to_proxy_request(req: hyper::Request<Incoming>) -> hyper::Request<ProxyBody> 
     req.map(|b| if b.is_end_stream() { ProxyBody::Empty } else { ProxyBody::boxed(b) })
 }
 
-async fn serve_h1<T>(io: T, peer: SocketAddr, tls: bool, proxy: &Arc<Proxy>, cfg: &Config)
-where
+async fn serve_h1<T>(
+    io: T,
+    peer: SocketAddr,
+    tls: bool,
+    client_cert: Option<Arc<ClientCert>>,
+    proxy: &Arc<Proxy>,
+    cfg: &Config,
+) where
     T: AsyncRead + AsyncWrite + Send + Unpin + 'static,
 {
     let _open = proxy.metrics().connection_opened(Protocol::H1);
@@ -208,7 +217,14 @@ where
     let svc = service_fn(move |req: hyper::Request<Incoming>| {
         let proxy = Arc::clone(&svc_proxy);
         let activity = Arc::clone(&activity);
-        async move { Ok::<_, Infallible>(proxy.handle(to_proxy_request(req), meta, Some(&activity)).await) }
+        let client_cert = client_cert.clone();
+        async move {
+            let mut req = to_proxy_request(req);
+            if let Some(cert) = client_cert {
+                req.extensions_mut().insert(ClientCertInfo(cert));
+            }
+            Ok::<_, Infallible>(proxy.handle(req, meta, Some(&activity)).await)
+        }
     });
     let mut builder = hyper::server::conn::http1::Builder::new();
     builder
@@ -220,7 +236,7 @@ where
     drive(conn, proxy, peer).await;
 }
 
-async fn serve_h2<T>(io: T, peer: SocketAddr, proxy: &Arc<Proxy>, cfg: &Config)
+async fn serve_h2<T>(io: T, peer: SocketAddr, client_cert: Option<Arc<ClientCert>>, proxy: &Arc<Proxy>, cfg: &Config)
 where
     T: AsyncRead + AsyncWrite + Send + Unpin + 'static,
 {
@@ -232,7 +248,14 @@ where
     let svc = service_fn(move |req: hyper::Request<Incoming>| {
         let proxy = Arc::clone(&svc_proxy);
         let activity = Arc::clone(&activity);
-        async move { Ok::<_, Infallible>(proxy.handle(to_proxy_request(req), meta, Some(&activity)).await) }
+        let client_cert = client_cert.clone();
+        async move {
+            let mut req = to_proxy_request(req);
+            if let Some(cert) = client_cert {
+                req.extensions_mut().insert(ClientCertInfo(cert));
+            }
+            Ok::<_, Infallible>(proxy.handle(req, meta, Some(&activity)).await)
+        }
     });
     let mut builder = hyper::server::conn::http2::Builder::new(TokioExecutor::new());
     builder

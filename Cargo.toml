@@ -66,6 +66,9 @@ quinn = { version = "0.11", default-features = false, features = ["runtime-tokio
 h3 = "0.0.8"
 h3-quinn = "0.0.10"
 webpki-roots = "1"
+ring = "0.17"
+x509-parser = { version = "0.18", default-features = false }
+base64 = "0.22"
 httpdate = "1"
 rcgen = { version = "0.13", default-features = false, features = ["ring", "pem"] }
 socket2 = { version = "0.5", features = ["all"] }
@@ -92,6 +95,9 @@ flate2 = { version = "1", default-features = false, features = ["rust_backend"] 
 brotli = { version = "8", default-features = false, features = ["std"] }
 zstd = { version = "0.13", default-features = false }
 
+# allocator (registered only by the `velox` binary, behind a default-on feature)
+mimalloc = { version = "0.1", default-features = false }
+
 # misc
 clap = { version = "4", features = ["derive"] }
 fastrand = "2"
@@ -100,3 +106,4 @@ fastrand = "2"
 proptest = "1"
 criterion = { version = "0.5", default-features = false, features = ["cargo_bench_support"] }
 tempfile = "3"
+time = "0.3"

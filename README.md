@@ -268,7 +268,7 @@ What is cached is deliberately conservative — Velox implements the shared-cach
 * **Keys** are route + host (case-insensitive) + scheme + path and query. HTTP and HTTPS are separate because Velox tells the backend which one the client used. `ignore_query = true` drops the query for busting parameters.
 * **Invalidation**: a successful `POST`/`PUT`/`PATCH`/`DELETE` to a URL drops it (RFC 9111 §4.4), and the admin API purges on demand.
 * Compression and CORS are applied **per client on the way out**, to hits and misses alike, so one stored object serves identity, gzip and brotli clients and every allowed origin.
-* Every response on a caching route carries `X-Velox-Cache: hit | miss | pass | bypass` (and hits carry `Age`).
+* Every response on a caching route carries `X-Velox-Cache: HIT | MISS | PASS | BYPASS | STALE | REVALIDATING` (and cached responses carry `Age`).
 
 ```bash
 curl -XPOST localhost:9901/admin/v1/cache/purge -H 'content-type: application/json' \
@@ -276,7 +276,18 @@ curl -XPOST localhost:9901/admin/v1/cache/purge -H 'content-type: application/js
 curl localhost:9901/admin/v1/cache                           # entries, bytes, hits, misses, evictions
 ```
 
-Purge selectors are `all`, `route`, `host`, `path` (exact, with query) and `path_prefix`, ANDed; a request that selects nothing is refused (`{}` never means "everything"). Metrics: `velox_cache_hits_total{route}`, `velox_cache_misses_total{route}`, `velox_cache_bypass_total{reason}`, `velox_cache_stores_total`, `velox_cache_evictions_total`, `velox_cache_purged_total`, and the `velox_cache_entries` / `velox_cache_bytes` gauges. **Caveats**: it assumes the backend's answer depends only on method, URL, host and its own `Vary` headers — do not cache routes that personalise by client IP (`X-Forwarded-For`) or other unkeyed headers. Concurrent misses are not coalesced (each reaches the backend), stale entries are never served, and each in-flight cacheable miss buffers up to `max_entry_bytes`.
+Purge selectors are `all`, `route`, `host`, `path` (exact, with query) and `path_prefix`, ANDed; a request that selects nothing is refused (`{}` never means "everything"). Metrics: `velox_cache_hits_total{route}`, `velox_cache_misses_total{route}`, `velox_cache_bypass_total{reason}`, `velox_cache_stores_total`, `velox_cache_evictions_total`, `velox_cache_purged_total`, and the `velox_cache_entries` / `velox_cache_bytes` gauges. **Caveats**: it assumes the backend's answer depends only on method, URL, host and its own `Vary` headers — do not cache routes that personalise by client IP (`X-Forwarded-For`) or other unkeyed headers. Each in-flight cacheable miss buffers up to `max_entry_bytes`.
+
+#### Stampede protection and stale serving
+
+```toml
+cache = { coalesce = true, coalesce_timeout = "10s", stale_while_revalidate = "30s", stale_if_error = "5m" }
+```
+
+* **Request coalescing (singleflight).** When many requests miss on the same object at once, only the first (the *leader*) goes to the backend; the rest wait for it and are answered from what it stored (`velox_cache_coalesced_total`). "Same object" means the same URL *and* the same values of the headers the stored response varies on, so French and English requests do not queue behind each other. The leader's claim is released whichever way its fetch ends — stored, not cacheable, failed, or the client hanging up mid-download — and then waiting requests simply fetch for themselves: a non-cacheable response or a failing leader never makes followers inherit the outcome or wait in line. Waiting is bounded by `coalesce_timeout` (`velox_cache_coalesce_timeouts_total`); `coalesce = false` turns it off. Ten simultaneous misses on a 300 ms backend make **one** backend request and finish in about one round trip.
+* **`stale-while-revalidate` (RFC 5861).** Within the window a response's own `stale-while-revalidate=N` directive (or the route default) allows, an expired entry is served **immediately** (`X-Velox-Cache: REVALIDATING`) while **one** background request refreshes it, however many clients arrive meanwhile. The refresh is conditional (`If-None-Match` / `If-Modified-Since` from the stored validators), so an unchanged object costs a `304`, not a body; a changed one replaces the entry. It runs through the normal pipeline but speaks for the object, not for the client that triggered it: cookies, `Authorization`, ranges and the client's own conditionals are dropped, and it is never counted against that client's rate limit or ACLs. A failing refresh leaves the stale copy to serve out its window.
+* **`stale-if-error` (RFC 5861).** If the backend fails — connect error, timeout, `500`/`502`/`503`/`504` — an expired entry still inside its window is served instead (`X-Velox-Cache: STALE`), so a backend outage looks like a slightly old page, not an error. Past the window the failure is the client's again.
+* **Limits.** `must-revalidate` / `proxy-revalidate` switch both off for that response (RFC 9111 forbids serving it stale); an invalid directive value counts as absent; no window exceeds 24 h whatever is configured. Route-level `stale_while_revalidate` / `stale_if_error` supply defaults for backends that say nothing. Metrics: `velox_cache_stale_served_total{route,kind=swr|sie}`, `velox_cache_revalidations_total{route,result=updated|not_modified|error}`.
 
 ### CORS
 
@@ -308,6 +319,81 @@ dns = { refresh_interval = "10s", max_addrs = 64, ipv6 = true }
 ```
 
 With a `dns` table, every hostname backend (and `https://` ones) is looked up on its own schedule and becomes **one pool member per address**, each with its own health, ejection, `max_inflight` and in-flight accounting (the admin API shows `resolved_from`). A refresh that returns the same set changes nothing; a changed answer adds members and retires vanished ones **without touching survivors**: they keep their identity, drain flag and pooled connections, and requests already running on a retired member finish normally (an end-to-end test holds a request on an address that DNS then removes). A failed or empty lookup keeps the last good answer and retries sooner, so a DNS outage cannot empty a pool; answers are sorted and capped at `max_addrs`, so every Velox instance picks the same members from an oversized record set. For `https://` backends the certificate is verified against the **host name**, not the address it resolved to (unless `tls.server_name` says otherwise). Before the first answer the hostname backend works as before (the OS resolves it per connection). Metrics: `velox_dns_resolutions_total{upstream,result}`, `velox_dns_changes_total`.
+
+### Client certificates (inbound mutual TLS)
+
+```toml
+[tls]
+client_ca_file       = "/etc/velox/client-ca.pem"   # CAs client certificates must chain to
+# client_auth_required = true                        # default; false = anonymous clients allowed too
+```
+
+The HTTPS **and HTTP/3** listeners verify client certificates against the bundle. With `client_auth_required` (the default) a client without a valid certificate is refused during the handshake, before any HTTP is parsed (`velox_tls_handshake_errors_total`); with `false`, anonymous clients are served but a certificate that *is* presented must still verify. The verified identity reaches the backend as **`X-Client-Cert-Subject`** and **`X-Client-Cert-Serial`** (subject escaped so it cannot inject a header, serial in hex). These headers are **always stripped from clients first**: whatever a client sends is discarded, and the only identity forwarded is the one Velox's own handshake verified — or, if there was none, what a peer in `security.trusted_proxies` (a proxy that terminated mTLS itself) passed on. A certificate Velox verified always overrides a forwarded claim. Requests carrying a verified identity never use the response cache (the backend may personalise on it).
+
+The CA bundle **hot-reloads** on `SIGHUP` / `velox reload` / `POST /admin/v1/reload`: the verifier is swapped atomically, so handshakes in flight finish against the old bundle, new ones use the new one, and the listener's TLS session state survives. A bundle that fails to load rejects the whole reload and keeps the old one; removing `client_ca_file` and reloading turns client authentication off. Velox does not advertise a list of acceptable CA names in the handshake (as Envoy by default), which only matters to browsers with many client certificates. No CRL/OCSP checking is done: revoke by rotating the CA bundle or short-lived certificates.
+
+### IP access lists
+
+```toml
+[security]
+ip_allow = ["10.0.0.0/8", "2001:db8::/32"]   # if non-empty, only these may use any route
+ip_deny  = ["10.6.6.0/24"]                    # always refused; deny beats allow
+
+[[route]]
+hosts    = ["admin.example.com"]
+ip_allow = ["10.1.0.0/16"]                    # narrows further for this route
+```
+
+Lists are matched against the **resolved client address** — after PROXY protocol and `trusted_proxies` — so a deny rule judges the real client, not the load balancer, and a client cannot launder itself by prepending a harmless `X-Forwarded-For` entry (the chain is walked right-to-left past trusted hops only). IPv4-mapped IPv6 addresses (`::ffff:203.0.113.9`, which dual-stack sockets report) are matched as the IPv4 they carry, so a v4 deny rule cannot be sidestepped by the socket family. Global and route lists **both** apply, so a route can only narrow access. A refused client gets a bare `403` (no hint which list matched) *before* the HTTPS redirect, the rate limiter, CORS, JWT or any backend work; `velox_acl_denied_total{route,scope,reason}` counts them. Lists are evaluated per request (a linear scan: fine for hundreds of CIDRs), apply to L7 routes only, and reload live.
+
+### JWT verification at the edge
+
+```toml
+[[route]]
+upstream = "api"
+[route.jwt]
+algorithms     = ["RS256", "ES256"]               # allow-list; default; HS256 must be listed explicitly
+jwks_file      = "/etc/velox/jwks.json"           # or public_key_file = "pub.pem" (SPKI), or secret_file / secret_env (HS256)
+issuer         = "https://login.example.com"
+audience       = ["api"]
+leeway         = "30s"
+forward_claims = ["sub", "roles", "tenant_id"]    # → X-Jwt-sub, X-Jwt-roles, X-Jwt-tenant_id
+# required = true   header = "authorization"   scheme = "Bearer"   require_exp = true   reload_interval = "5s"
+```
+
+Invalid tokens are refused with `401` and `WWW-Authenticate: Bearer realm="velox", error="invalid_token"` (a missing one gets the plain challenge, RFC 6750) **before** the request reaches the backend; the response never says *why* (`velox_jwt_rejected_total{route,reason}` does). The verifier is deliberately strict:
+
+* **Only the listed algorithms** (`HS256`, `RS256`, `ES256`); `alg: none` and everything else is refused, names case-sensitively. Each key has a *type* and is only tried for the matching algorithm, which closes the classic confusion attack (an HS256 token "signed" with the RSA public key as the secret is rejected — there is a test that mounts it). A `crit` header is refused; tokens over 8 KiB are refused before parsing; two `Authorization` headers are ambiguous and refused.
+* **Claims**: `exp` is required and must be a number (disable with `require_exp = false`); `nbf` is enforced; `iss` must equal the configured issuer; `aud` (string or array) must contain a configured audience; `leeway` (at most 5 minutes) absorbs clock skew. Signatures use `ring` and are constant-time. HS256 secrets must be at least 32 bytes.
+* **Keys**: `public_key_file` takes PEM `PUBLIC KEY` blocks (RSA 2048–8192 or P-256); `jwks_file` takes a JWKS with RSA and P-256 keys selected by `kid` (keys marked `use: enc` are skipped, symmetric `oct` keys are rejected). Key files are re-checked every `reload_interval`: a rotation is picked up without a reload, and a half-written or unreadable file **keeps the last good keys** rather than locking everyone out. `velox validate`, startup and every reload parse the key material, so a bad file fails there with a clear message instead of on the first request.
+* **Anti-spoofing**: on a JWT route any client-sent `X-Jwt-*` header is deleted; only `forward_claims` from a verified token are added (strings, numbers, booleans and string arrays; nested values and anything unprintable are dropped).
+* `required = false` admits anonymous requests but still verifies any token that *is* presented. CORS preflights are answered before authentication (browsers cannot send credentials on them), and the `401` itself carries the route's CORS headers. A JWT route may use the response cache only if the token travels in `Authorization` (such requests never touch the cache); any other `header` plus `cache` is rejected at validation, since one token holder's response could otherwise be served to another.
+
+### Allocator, multi-core tuning and `velox doctor`
+
+**Allocator.** The `velox` binary registers [mimalloc](https://github.com/microsoft/mimalloc) as its global allocator (default-on cargo feature `mimalloc`). Only `velox-cli` does so; every library crate keeps `#![forbid(unsafe_code)]` and no opinion about allocation. Build with `cargo build --release --no-default-features` for the system allocator. `bench/alloc_compare.sh` builds both and alternates runs; see [Benchmarks](#benchmarks) for what it measured here (and why you should measure on your hardware before relying on it).
+
+**Multi-core listeners.** One accept loop is plenty for most deployments; when a single core saturates on `accept()` (very high connection churn, no keep-alive), raise `server.accept_workers` with `server.reuse_port = true`: each worker gets its own `SO_REUSEPORT` socket and the kernel spreads incoming connections across them without a shared accept queue or lock. Rules of thumb:
+
+* `accept_workers` ≤ the number of cores; leave cores for the worker threads that run requests. Past the core count it only adds contention (`velox doctor` warns).
+* Without `reuse_port` the workers share one socket and wake up together on each connection — keep `reuse_port = true` whenever `accept_workers > 1`.
+* Tokio's runtime already uses one worker thread per core; `SO_REUSEPORT` spreads *accepts*, not request processing. Velox does **not** pin threads or accept loops to cores (that needs `sched_setaffinity`, i.e. `unsafe`/libc, which this codebase forbids); if you want pinning or NUMA locality, apply it from outside with `taskset`/`numactl`, systemd `CPUAffinity=`, or the Kubernetes CPU manager (`static` policy) and size `accept_workers` and `TOKIO_WORKER_THREADS` to the cores you grant. The hash the kernel uses is per 4-tuple, so a few very busy clients can still land on one worker.
+* On Linux give the process room: `LimitNOFILE` ≥ about `2 × limits.max_connections + 512` (a client socket plus a pooled upstream socket per connection), `net.core.somaxconn` ≥ `server.backlog`, and — for HTTP/3 — `net.core.rmem_max` / `wmem_max` ≥ ~7 MiB so QUIC does not drop packets under load.
+
+**`velox doctor -c velox.toml`** checks all of that before launch and tells you the command that fixes each finding:
+
+```text
+[ OK ] config         velox.toml parses and validates
+[ OK ] allocator      mimalloc (compiled in)
+[FAIL] fd-limit       1024 descriptors cannot serve limits.max_connections = 10000 (about 20512 needed): accepting would fail with EMFILE
+                      fix: raise the hard limit (currently 4096): LimitNOFILE=20512 in the systemd unit or `--ulimit nofile=20512` for Docker
+[WARN] udp-buffers    net.core.rmem_max = 212992, wmem_max = 212992: QUIC wants at least 7340032; HTTP/3 will drop packets and stall under load
+                      fix: sysctl -w net.core.rmem_max=7500000 net.core.wmem_max=7500000   # persist in /etc/sysctl.d/
+[ OK ] tls-expiry     /etc/velox/site.crt: 63 day(s) left
+[WARN] listeners      http 0.0.0.0:80 is already in use (is another velox, or something else, running?)
+```
+
+It covers: configuration validity (including key files, JWT keys and the client CA bundle), the open-files limit against `max_connections` (fail below the client count, warn below the upstream-connection estimate), `rmem_max`/`wmem_max` for HTTP/3 and `somaxconn` against `server.backlog` (Linux; skipped elsewhere), `accept_workers` against the CPU count and `reuse_port`, certificate expiry for server certificates, the client CA bundle and upstream mTLS material (`--warn-days`, default 14; expired is a failure), and whether every listen address can be bound (privileged-port failures name `CAP_NET_BIND_SERVICE`). `--check-backends` also tries a TCP connection to each backend, `--json` emits machine-readable output, and `--strict` makes warnings fail the exit code (for CI gates). Exit code `0` unless something failed.
 
 ### Upstream HTTP versions
 
@@ -417,7 +503,10 @@ cargo fmt --all -- --check
 | **Backend TLS / mTLS** (`velox-cli/tests/e2e_upstream_tls.rs`) | A real TLS backend: custom-CA verification, SNI and name mismatch, untrusted certificate ⇒ `502` with no request sent, `insecure_skip_verify`, mTLS (anonymous client refused, identity seen by the backend), **live certificate rotation** and a broken rotation, ALPN `h2` vs `http/1.1`, mixed TLS/cleartext pools, TLS health probes flipping a backend down and up. |
 | **Circuit breaker, PROXY protocol, compression** (`velox-proxy`) | `max_inflight`: exact cap under 16-thread contention, every balancer skips full backends, `503` fast-shed vs. outage; PROXY v1/v2: parser unit + property tests (every prefix is `Incomplete`), exact-consumption on real sockets, trust list, mandatory header, per-real-client limits, TLS and L4 behind it; compression: negotiation matrix, eligibility matrix, round-trips for each codec/level/frame shape, streaming flush latency, pass-through cases, and h1/h2/h3. |
 | **Cache, CORS, DNS, trace context, H2 probes** | Cache: policy matrix (freshness sources, forbidden directives, invalid lifetimes), exact LRU eviction and byte accounting under 8-thread churn, `Vary` variants, `304`s, fill completeness (oversized, truncated, errored, trailers, client gone, and a consumer that never polls the final `None`), and end-to-end hit/miss/expiry/bypass/invalidation/cookie/scheme behaviour on h1/h2/h3 plus the admin purge API. CORS: origin-matching attack cases, preflight allow/deny, backend headers replaced on real, `429` and `502` responses. DNS: scripted resolver driving expansion, scale up/down, failure/empty answers, capping, survivors keeping state, in-flight request surviving removal, and TLS verified against the service name. `traceparent`: strict parser plus property tests. HTTP/2 probes against `h2c` and TLS (ALPN enforced). Compression: cap, offload and event-loop-stall tests. HTTP/1.0 backend normalisation. |
-| **Fuzz targets** (`fuzz/`) | `cargo-fuzz` targets for the request head, the guard stream, chunked framing, typed headers, the PROXY protocol parser, `Accept-Encoding` negotiation, `traceparent` and the cache policy, with a smuggling seed corpus in `fuzz/seeds/`. CI runs them weekly for 3 minutes each on nightly. |
+| **Coalescing and stale serving** (`velox-proxy`) | Ten concurrent misses ⇒ exactly **one** backend request (and followers fall back to their own fetch when the response is not cacheable, the leader fails, coalescing is off, or the wait times out); the flight is released on store / pass / error / client disconnect; flights are keyed on the stored `Vary`; `stale-while-revalidate` answers instantly from an expired entry, five concurrent stale requests ⇒ one conditional refresh, a `304` revives the stored body without re-sending it, a changed object replaces the stale one; `stale-if-error` over `500`/`503`/dropped connection, its window ending, `must-revalidate` forbidding it, and route-level defaults. |
+| **Zero-trust edge** (`velox-cli/tests/e2e_mtls.rs`, `velox-proxy`, `velox-security`) | Real CA and client certificates over h1, h2 and **h3**: valid client served with its identity forwarded, no certificate / untrusted CA refused in the handshake (and the backend never contacted), optional mode, header-forgery attempts (mutation-verified), trusted-proxy pass-through, **live CA reload** including a broken bundle and switching mTLS off, no cache sharing of identity-bearing requests. IP ACLs: deny/allow/precedence, IPv4-mapped IPv6, real client behind a trusted proxy and behind PROXY protocol, `X-Forwarded-For` laundering, route lists narrowing global ones, refusal before redirects and rate limiting. JWT: HS256/RS256/ES256 round trips, `alg: none` in every spelling, the HS256-with-RSA-public-key confusion attack, tampering, expiry/nbf/iss/aud edge cases, every possible truncation of a token, JWKS `kid` selection, key rotation and a broken rotation, `X-Jwt-*` spoof stripping, CORS preflight unaffected. |
+| **`velox doctor`** (`velox-cli`) | A simulated host drives every threshold (descriptor limit fail/warn/ok, UDP buffers, `somaxconn`, macOS skip, worker sizing, taken and privileged ports, certificate expiry at 90/10/−3 days and a custom threshold, broken config) plus the real binary's exit codes, `--strict`, `--json`. |
+| **Fuzz targets** (`fuzz/`) | `cargo-fuzz` targets for the request head, the guard stream, chunked framing, typed headers, the PROXY protocol parser, `Accept-Encoding` negotiation, `traceparent`, the cache policy and JWT verification, with a smuggling seed corpus in `fuzz/seeds/`. CI runs them weekly for 3 minutes each on nightly. |
 
 Run coverage-guided fuzzing locally:
 
@@ -463,12 +552,25 @@ Smoke measurement on the same laptop, loopback, `ab -k -c 64` (single-threaded c
 
 Why: a sampling profile of the proxy under this load shows ~84 % of samples are parked worker threads and, of the *active* samples, essentially all are kernel time (`kevent`, `recvfrom`, `sendto`, `writev`); `malloc` is a few percent. On macOS loopback each proxied request costs four syscalls plus polling (~45 µs of CPU in total), so saving a few hundred nanoseconds of user-space work is below 1 %. Expect user-space costs to matter more on Linux with `io_uring`-class syscall overhead, multiple NIC queues and a real load generator; measure there before tuning further.
 
+### Allocator: system vs mimalloc
+
+`bench/alloc_compare.sh` builds the `velox` binary both ways (release, fat LTO) and alternates them across three scenarios — tiny replies, 64 KiB replies proxied every time, and 64 KiB replies served from the response cache — so drift in machine load cannot favour either. Measured on an Apple-silicon laptop (10 cores) over loopback with `ab -k -c 64`, 6 s per run, median of 3 alternating rounds:
+
+| Scenario | system allocator | mimalloc | resident memory (system → mimalloc) |
+|---|---|---|---|
+| `/` (small, proxied) | 101 029 req/s | 103 734 req/s | 12.8 → 18.2 MiB |
+| `/big` (64 KiB, proxied) | 66 971 req/s | 65 150 req/s | 26.7 → 50.2 MiB |
+| `/big-cached` (64 KiB, cache hit) | 135 887 req/s | 134 422 req/s | 8.9 → 13.0 MiB |
+
+**Honest reading:** throughput is a wash. The differences (+2.7 %, −2.7 %, −1.1 %) are inside the run-to-run spread of the *same* binary (e.g. 59–68 k req/s for the system allocator on `/big`), which is what the earlier profile predicted: on loopback the proxy spends its time in `kevent`/`recvfrom`/`sendto`, and `malloc` is a few percent of the active samples, so a faster allocator has little to speed up. mimalloc used **1.4–1.9× more resident memory** here because it keeps freed pages in per-thread caches (up to 84 MiB on the 64 KiB-body run). Where mimalloc is known to pay off — many cores contending on glibc's arenas and fragmentation in long-lived Linux processes — this setup cannot show it; no Linux host was available for this change. The feature is on by default as requested; **measure on your own hardware and workload**, and build with `--no-default-features` if resident memory matters more to you than allocator contention you cannot observe.
+
 ## Known limitations
 
 * **Listener addresses need a restart**; everything else reloads live (see above).
 * **Upstream TLS** covers client-auth and custom CAs but not certificate pinning, OCSP stapling checks or CRLs; `[[tcp_proxy]]` does not originate TLS.
 * **Compression** costs CPU (on a dedicated pool, not the event loop) and one encoder per in-flight response, bounded by `max_concurrent_encoders`; beyond it, responses are sent uncompressed. There is no pre-compressed (`.gz`/`.br`) file serving, as Velox serves no files.
-* **The cache** never serves stale entries, does not revalidate with the backend or coalesce concurrent misses, and assumes responses depend only on method, URL, host, scheme and `Vary` headers (see its caveats). It is per-process and in-memory: a restart empties it, and several Velox instances do not share entries.
+* **The cache** serves stale entries only inside an explicit `stale-while-revalidate` / `stale-if-error` window, coalesces concurrent misses only within one Velox process, and assumes responses depend only on method, URL, host, scheme and `Vary` headers (see its caveats). It is per-process and in-memory: a restart empties it, and several Velox instances do not share entries (each instance sends its own revalidations and misses to the backend).
+* **Client-certificate auth** does no CRL/OCSP revocation checking and sends no CA-name hints; **JWT verification** supports `HS256`/`RS256`/`ES256` only (no `PS256`, `EdDSA`, JWE, or token introspection/revocation lists) and does not fetch remote JWKS URLs: point `jwks_file` at a file your own tooling refreshes. **IP lists** apply to L7 routes, not to `[[tcp_proxy]]` listeners.
 * **PROXY protocol** is inbound only (Velox does not add one towards backends) and not available for HTTP/3.
 * **DNS**: without an upstream `dns` table hostnames are resolved by the OS on each *new* connection (no background refresh). With it, `A`/`AAAA` answers are tracked, but there is no SRV or EDNS-client-subnet support, and Velox honours its own `refresh_interval` rather than record TTLs.
 * **HTTP/2 upstream uses `:authority` = backend address** (the original host travels in `X-Forwarded-Host`); HTTP/1 upstreams receive the original `Host`.

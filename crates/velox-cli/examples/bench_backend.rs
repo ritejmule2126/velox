@@ -21,7 +21,15 @@ async fn main() -> std::io::Result<()> {
         let (stream, _) = listener.accept().await?;
         stream.set_nodelay(true)?;
         tokio::spawn(async move {
-            let svc = service_fn(|_req: Request<hyper::body::Incoming>| async {
+            let svc = service_fn(|req: Request<hyper::body::Incoming>| async move {
+                // `/big…` answers a cacheable 64 KiB body (exercises large buffers and
+                // the response cache); everything else is a tiny fixed reply.
+                if req.uri().path().starts_with("/big") {
+                    let mut r = Response::new(Full::new(Bytes::from(vec![b'x'; 64 * 1024])));
+                    r.headers_mut().insert("cache-control", http::HeaderValue::from_static("max-age=300"));
+                    r.headers_mut().insert("content-type", http::HeaderValue::from_static("application/octet-stream"));
+                    return Ok::<_, Infallible>(r);
+                }
                 Ok::<_, Infallible>(Response::new(Full::new(Bytes::from_static(b"hello from the backend\n"))))
             });
             let _ = hyper::server::conn::http1::Builder::new().serve_connection(TokioIo::new(stream), svc).await;

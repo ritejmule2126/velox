@@ -23,6 +23,8 @@ pub struct Snapshot {
     pub router: Router,
     /// Upstream pools by name.
     pub upstreams: HashMap<String, Arc<UpstreamGroup>>,
+    /// The global client ACL (`[security] ip_allow` / `ip_deny`).
+    pub acl: crate::acl::IpFilter,
 }
 
 impl Snapshot {
@@ -57,7 +59,8 @@ impl Snapshot {
             let route = Route::compile(config.route_id(i), rc, config.rate_limit.as_ref(), group);
             entries.push((rc.hosts.clone(), Arc::new(route)));
         }
-        Ok(Self { generation, router: Router::build(entries), upstreams, config: Arc::new(config) })
+        let acl = crate::acl::IpFilter::new(&config.security.ip_allow, &config.security.ip_deny);
+        Ok(Self { generation, router: Router::build(entries), upstreams, acl, config: Arc::new(config) })
     }
 }
 

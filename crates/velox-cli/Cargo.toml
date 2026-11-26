@@ -1,6 +1,6 @@
 [package]
 name = "velox-cli"
-description = "The `velox` binary: start, validate, reload, version"
+description = "The `velox` binary: start, validate, reload, doctor, version"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -20,9 +20,13 @@ name = "velox_cli"
 path = "src/lib.rs"
 
 [features]
-default = []
+default = ["mimalloc"]
 # Automatic certificates via ACME HTTP-01.
 acme = ["velox-security/acme"]
+# Use mimalloc as the global allocator of the `velox` binary (library crates are
+# unaffected and stay `#![forbid(unsafe_code)]`). Build with `--no-default-features`
+# for the system allocator.
+mimalloc = ["dep:mimalloc"]
 
 [dependencies]
 velox-core.workspace = true
@@ -33,12 +37,15 @@ velox-proxy.workspace = true
 velox-admin.workspace = true
 anyhow.workspace = true
 clap.workspace = true
+serde.workspace = true
 serde_json.workspace = true
+mimalloc = { workspace = true, optional = true }
 tokio.workspace = true
 tokio-util.workspace = true
 tracing.workspace = true
 
 [dev-dependencies]
+time.workspace = true
 brotli.workspace = true
 bytes.workspace = true
 flate2.workspace = true

@@ -119,6 +119,8 @@ impl CertTable {
 #[derive(Debug)]
 pub struct SniResolver {
     table: ArcSwap<CertTable>,
+    /// Inbound client-certificate policy (`tls.client_ca_file`), reloaded with the certificates.
+    client_auth: Arc<crate::client_cert::ClientAuth>,
     /// Certificates obtained dynamically (ACME), consulted first.
     dynamic: ArcSwap<HashMap<String, Arc<CertifiedKey>>>,
 }
@@ -127,6 +129,7 @@ impl SniResolver {
     /// Build a resolver from the `[tls]` section.
     pub fn from_config(cfg: &TlsConfig) -> Result<Arc<Self>, TlsError> {
         let r = Arc::new(Self {
+            client_auth: crate::client_cert::ClientAuth::from_config(cfg)?,
             table: ArcSwap::from_pointee(CertTable::default()),
             dynamic: ArcSwap::from_pointee(HashMap::new()),
         });
@@ -134,8 +137,16 @@ impl SniResolver {
         Ok(r)
     }
 
-    /// Re-read certificate files. On error the previous table stays active.
+    /// The inbound client-certificate policy shared by every listener.
+    pub fn client_auth(&self) -> &Arc<crate::client_cert::ClientAuth> {
+        &self.client_auth
+    }
+
+    /// Re-read certificate files and the client CA bundle. On error nothing
+    /// changes: the previous certificates and client policy stay active.
     pub fn reload(&self, cfg: &TlsConfig) -> Result<(), TlsError> {
+        // Build every new piece first, then install them; a failure leaves all as it was.
+        let client_auth = crate::client_cert::ClientAuth::prepare(cfg)?;
         let mut table = CertTable::default();
         for c in &cfg.certs {
             let ck = load_certified_key(&c.cert_file, &c.key_file)?;
@@ -159,6 +170,7 @@ impl SniResolver {
             let names: Vec<String> = cfg.certs.iter().flat_map(|c| c.server_names.clone()).collect();
             table.default = Some(self_signed(&names)?);
         }
+        self.client_auth.install(client_auth);
         self.table.store(Arc::new(table));
         Ok(())
     }
@@ -196,22 +208,24 @@ impl ResolvesServerCert for SniResolver {
 
 fn base_builder(
     versions: &[&'static rustls::SupportedProtocolVersion],
+    client_auth: Arc<crate::client_cert::ClientAuth>,
 ) -> Result<rustls::ConfigBuilder<rustls::ServerConfig, rustls::server::WantsServerCert>, TlsError> {
     Ok(rustls::ServerConfig::builder_with_provider(Arc::new(ring_provider::default_provider()))
         .with_protocol_versions(versions)?
-        .with_no_client_auth())
+        .with_client_cert_verifier(client_auth))
 }
 
 /// `ServerConfig` for the TCP listener: TLS 1.2/1.3, ALPN `h2` + `http/1.1`.
 pub fn tcp_server_config(resolver: Arc<SniResolver>) -> Result<Arc<rustls::ServerConfig>, TlsError> {
-    let mut cfg = base_builder(rustls::ALL_VERSIONS)?.with_cert_resolver(resolver);
+    let mut cfg = base_builder(rustls::ALL_VERSIONS, Arc::clone(resolver.client_auth()))?.with_cert_resolver(resolver);
     cfg.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
     Ok(Arc::new(cfg))
 }
 
 /// `ServerConfig` for QUIC: TLS 1.3 only, ALPN `h3`.
 pub fn quic_server_config(resolver: Arc<SniResolver>) -> Result<Arc<rustls::ServerConfig>, TlsError> {
-    let mut cfg = base_builder(&[&rustls::version::TLS13])?.with_cert_resolver(resolver);
+    let mut cfg =
+        base_builder(&[&rustls::version::TLS13], Arc::clone(resolver.client_auth()))?.with_cert_resolver(resolver);
     cfg.alpn_protocols = vec![b"h3".to_vec()];
     Ok(Arc::new(cfg))
 }
@@ -316,5 +330,65 @@ mod tests {
         assert_eq!(tcp.alpn_protocols, vec![b"h2".to_vec(), b"http/1.1".to_vec()]);
         let quic = quic_server_config(r).unwrap();
         assert_eq!(quic.alpn_protocols, vec![b"h3".to_vec()]);
+    }
+}
+
+/// When a PEM certificate chain's *leaf* stops being valid (`notAfter`), as seconds
+/// since the Unix epoch. Used by `velox doctor` to warn before certificates lapse.
+pub fn leaf_not_after(path: &Path) -> Result<i64, TlsError> {
+    let display = path.display().to_string();
+    let pem = std::fs::read(path).map_err(|source| TlsError::Io { path: display.clone(), source })?;
+    let leaf = CertificateDer::pem_slice_iter(&pem)
+        .next()
+        .ok_or_else(|| TlsError::Pem { path: display.clone(), reason: "no certificates found".into() })?
+        .map_err(|e| TlsError::Pem { path: display.clone(), reason: e.to_string() })?;
+    let (_, cert) = x509_parser::parse_x509_certificate(leaf.as_ref())
+        .map_err(|e| TlsError::Pem { path: display, reason: format!("not a valid X.509 certificate: {e}") })?;
+    Ok(cert.validity().not_after.timestamp())
+}
+
+/// Like [`leaf_not_after`] for every certificate in a bundle; returns the soonest
+/// `notAfter` (a CA bundle is only as good as its first expiry).
+pub fn bundle_earliest_not_after(path: &Path) -> Result<i64, TlsError> {
+    let display = path.display().to_string();
+    let pem = std::fs::read(path).map_err(|source| TlsError::Io { path: display.clone(), source })?;
+    let mut earliest: Option<i64> = None;
+    for cert in CertificateDer::pem_slice_iter(&pem) {
+        let cert = cert.map_err(|e| TlsError::Pem { path: display.clone(), reason: e.to_string() })?;
+        let (_, parsed) = x509_parser::parse_x509_certificate(cert.as_ref()).map_err(|e| TlsError::Pem {
+            path: display.clone(),
+            reason: format!("not a valid X.509 certificate: {e}"),
+        })?;
+        let t = parsed.validity().not_after.timestamp();
+        earliest = Some(earliest.map_or(t, |e| e.min(t)));
+    }
+    earliest.ok_or(TlsError::Pem { path: display, reason: "no certificates found".into() })
+}
+
+#[cfg(test)]
+mod expiry_tests {
+    use super::*;
+
+    #[test]
+    fn expiry_is_read_from_the_leaf_and_the_earliest_of_a_bundle() {
+        let dir = tempfile::tempdir().unwrap();
+        let make = |days: i64| {
+            let mut p = rcgen::CertificateParams::new(vec!["x.test".into()]).unwrap();
+            let now = time::OffsetDateTime::now_utc();
+            p.not_before = now - time::Duration::days(1);
+            p.not_after = now + time::Duration::days(days);
+            p.self_signed(&rcgen::KeyPair::generate().unwrap()).unwrap().pem()
+        };
+        let (soon, late) = (dir.path().join("soon.pem"), dir.path().join("bundle.pem"));
+        std::fs::write(&soon, make(10)).unwrap();
+        std::fs::write(&late, format!("{}{}", make(400), make(30))).unwrap();
+        let now = time::OffsetDateTime::now_utc().unix_timestamp();
+        let days = |t: i64| (t - now) / 86_400;
+        assert!((9..=10).contains(&days(leaf_not_after(&soon).unwrap())));
+        assert!((399..=400).contains(&days(leaf_not_after(&late).unwrap())), "the first certificate is the leaf");
+        assert!((29..=30).contains(&days(bundle_earliest_not_after(&late).unwrap())), "the soonest in a bundle");
+        std::fs::write(dir.path().join("junk.pem"), "nope").unwrap();
+        assert!(leaf_not_after(&dir.path().join("junk.pem")).is_err());
+        assert!(bundle_earliest_not_after(&dir.path().join("missing.pem")).is_err());
     }
 }

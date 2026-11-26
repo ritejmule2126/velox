@@ -36,7 +36,10 @@ async fn plain_app(backend: std::net::SocketAddr, extra: &str) -> App {
 
 fn header(head: &str, name: &str) -> String {
     head.lines()
-        .find_map(|l| l.to_ascii_lowercase().strip_prefix(&format!("{name}:")).map(|v| v.trim().to_owned()))
+        .find_map(|l| {
+            let (k, v) = l.split_once(':')?;
+            k.trim().eq_ignore_ascii_case(name).then(|| v.trim().to_owned())
+        })
         .unwrap_or_default()
 }
 
@@ -49,8 +52,8 @@ async fn the_admin_api_reports_and_purges_the_cache() {
     let state = |path: &'static str| async move { header(&plain(http, path, "").await.1, "x-velox-cache") };
 
     for p in ["/static/a.js", "/static/b.js", "/api/users?page=1"] {
-        assert_eq!(state(p).await, "miss", "{p}");
-        assert_eq!(state(p).await, "hit", "{p}");
+        assert_eq!(state(p).await, "MISS", "{p}");
+        assert_eq!(state(p).await, "HIT", "{p}");
     }
     assert_eq!(hits.load(Ordering::SeqCst), 3);
     let (status, stats) = admin(adm, "GET", "/admin/v1/cache", None).await;
@@ -73,8 +76,8 @@ async fn the_admin_api_reports_and_purges_the_cache() {
     // Precise purges.
     let (status, v) = admin(adm, "POST", "/admin/v1/cache/purge", Some(json!({ "path_prefix": "/static/" }))).await;
     assert_eq!((status, v["purged"].as_u64()), (200, Some(2)));
-    assert_eq!(state("/static/a.js").await, "miss", "purged");
-    assert_eq!(state("/api/users?page=1").await, "hit", "untouched");
+    assert_eq!(state("/static/a.js").await, "MISS", "purged");
+    assert_eq!(state("/api/users?page=1").await, "HIT", "untouched");
     let (_, v) =
         admin(adm, "POST", "/admin/v1/cache/purge", Some(json!({ "route": "site", "path": "/api/users?page=1" })))
             .await;
@@ -116,12 +119,12 @@ async fn cached_responses_are_served_identically_over_http2_and_http3() {
 
     // Fill over HTTP/1.1, then hit over HTTP/2 and HTTP/3 (and again over h1).
     let first = https1(tcp, &der, Method::GET, "/doc", Bytes::new()).await;
-    assert_eq!(first.headers["x-velox-cache"], "miss");
+    assert_eq!(first.headers["x-velox-cache"], "MISS");
     let h2 = https2(tcp, &der, Method::GET, "/doc", Bytes::new()).await;
-    assert_eq!((h2.status, h2.headers["x-velox-cache"].to_str().unwrap()), (StatusCode::OK, "hit"));
+    assert_eq!((h2.status, h2.headers["x-velox-cache"].to_str().unwrap()), (StatusCode::OK, "HIT"));
     assert_eq!(h2.body, first.body);
     let h3 = http3(udp, &der, Method::GET, "/doc", Bytes::new()).await;
-    assert_eq!((h3.status, h3.headers["x-velox-cache"].to_str().unwrap()), (StatusCode::OK, "hit"));
+    assert_eq!((h3.status, h3.headers["x-velox-cache"].to_str().unwrap()), (StatusCode::OK, "HIT"));
     assert_eq!(h3.body, first.body);
     assert_eq!(hits.load(Ordering::SeqCst), 1, "one backend request served all three protocols");
     assert!(h2.headers.contains_key("age"));
@@ -134,7 +137,7 @@ async fn cached_responses_are_served_identically_over_http2_and_http3() {
         .body(http_body_util::Full::new(Bytes::new()))
         .unwrap();
     let resp = conn.send_request(req).await.unwrap();
-    assert_eq!(resp.headers()["x-velox-cache"], "hit");
+    assert_eq!(resp.headers()["x-velox-cache"], "HIT");
     assert_eq!(resp.headers()["content-encoding"], "gzip");
     let compressed = resp.into_body().collect().await.unwrap().to_bytes();
     let mut plain_out = Vec::new();
@@ -180,15 +183,15 @@ async fn http_and_https_responses_are_cached_separately() {
     let over_tls = || async { https1(https, &der, Method::GET, "/same", Bytes::new()).await };
 
     let (_, head, body) = over_http().await;
-    assert_eq!((header(&head, "x-velox-cache").as_str(), body.as_str()), ("miss", "seen over http"));
+    assert_eq!((header(&head, "x-velox-cache").as_str(), body.as_str()), ("MISS", "seen over http"));
     let r = over_tls().await;
-    assert_eq!(r.headers["x-velox-cache"], "miss", "the https request must not be served the http copy");
+    assert_eq!(r.headers["x-velox-cache"], "MISS", "the https request must not be served the http copy");
     assert_eq!(r.text(), "seen over https");
     // Each is then served from its own entry.
     let (_, head, body) = over_http().await;
-    assert_eq!((header(&head, "x-velox-cache").as_str(), body.as_str()), ("hit", "seen over http"));
+    assert_eq!((header(&head, "x-velox-cache").as_str(), body.as_str()), ("HIT", "seen over http"));
     let r = over_tls().await;
-    assert_eq!((r.headers["x-velox-cache"].to_str().unwrap(), r.text().as_str()), ("hit", "seen over https"));
+    assert_eq!((r.headers["x-velox-cache"].to_str().unwrap(), r.text().as_str()), ("HIT", "seen over https"));
     assert_eq!(backend.hits(), 2);
     assert!(app.shutdown().await);
 }

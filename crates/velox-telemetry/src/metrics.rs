@@ -70,10 +70,16 @@ pub struct Metrics {
     compression_bytes: IntCounterVec,
     compression_skipped: IntCounterVec,
     cors_denied: IntCounterVec,
+    acl_denied: IntCounterVec,
+    jwt_rejected: IntCounterVec,
     cache_hits: IntCounterVec,
     cache_misses: IntCounterVec,
     cache_bypass: IntCounterVec,
     cache_stores: IntCounter,
+    cache_coalesced: IntCounterVec,
+    cache_coalesce_timeouts: IntCounterVec,
+    cache_stale: IntCounterVec,
+    cache_revalidations: IntCounterVec,
     cache_evictions: IntCounter,
     cache_purged: IntCounter,
     cache_entries: IntGauge,
@@ -258,11 +264,47 @@ impl Metrics {
                 "Requests or responses the cache declined, by reason",
                 &["reason"],
             )?,
+            cache_coalesced: counter(
+                &r,
+                "cache_coalesced_total",
+                "Requests that waited for another request's fetch and shared its result",
+                &["route"],
+            )?,
+            cache_coalesce_timeouts: counter(
+                &r,
+                "cache_coalesce_timeouts_total",
+                "Waiting requests that gave up on the leader and fetched for themselves",
+                &["route"],
+            )?,
+            cache_stale: counter(
+                &r,
+                "cache_stale_served_total",
+                "Responses served from a stale entry (kind: swr = while revalidating, sie = backend failing)",
+                &["route", "kind"],
+            )?,
+            cache_revalidations: counter(
+                &r,
+                "cache_revalidations_total",
+                "Background revalidations by result (updated, not_modified, error)",
+                &["route", "result"],
+            )?,
             cache_stores: plain_counter(&r, "cache_stores_total", "Responses stored in the cache")?,
             cache_evictions: plain_counter(&r, "cache_evictions_total", "Entries evicted to make room")?,
             cache_purged: plain_counter(&r, "cache_purged_total", "Entries removed by purge or invalidation")?,
             cache_entries: plain_gauge(&r, "cache_entries", "Objects currently cached")?,
             cache_bytes: plain_gauge(&r, "cache_bytes", "Bytes currently cached")?,
+            jwt_rejected: counter(
+                &r,
+                "jwt_rejected_total",
+                "Requests refused by edge JWT verification, by reason",
+                &["route", "reason"],
+            )?,
+            acl_denied: counter(
+                &r,
+                "acl_denied_total",
+                "Requests refused by an IP allow/deny list (scope: global or route)",
+                &["route", "scope", "reason"],
+            )?,
             cors_denied: counter(
                 &r,
                 "cors_denied_total",
@@ -378,6 +420,26 @@ impl Metrics {
         self.cache_misses.with_label_values(&[route]).inc();
     }
 
+    /// Count a request that shared another request's fetch.
+    pub fn cache_coalesced(&self, route: &str) {
+        self.cache_coalesced.with_label_values(&[route]).inc();
+    }
+
+    /// Count a waiter that gave up on the leader.
+    pub fn cache_coalesce_timeout(&self, route: &str) {
+        self.cache_coalesce_timeouts.with_label_values(&[route]).inc();
+    }
+
+    /// Count a response served from a stale entry (`swr` or `sie`).
+    pub fn cache_stale_served(&self, route: &str, kind: &str) {
+        self.cache_stale.with_label_values(&[route, kind]).inc();
+    }
+
+    /// Count a finished background revalidation.
+    pub fn cache_revalidation(&self, route: &str, result: &str) {
+        self.cache_revalidations.with_label_values(&[route, result]).inc();
+    }
+
     /// Count a request or response the cache declined, and why.
     pub fn cache_bypassed(&self, reason: &str) {
         self.cache_bypass.with_label_values(&[reason]).inc();
@@ -412,6 +474,16 @@ impl Metrics {
     /// Count a DNS refresh that changed an upstream's members.
     pub fn dns_changed(&self, upstream: &str) {
         self.dns_changes.with_label_values(&[upstream]).inc();
+    }
+
+    /// Count a request refused by JWT verification.
+    pub fn jwt_rejected(&self, route: &str, reason: &str) {
+        self.jwt_rejected.with_label_values(&[route, reason]).inc();
+    }
+
+    /// Count a request refused by an IP access list.
+    pub fn acl_denied(&self, route: &str, scope: &str, reason: &str) {
+        self.acl_denied.with_label_values(&[route, scope, reason]).inc();
     }
 
     /// Count a refused CORS preflight.

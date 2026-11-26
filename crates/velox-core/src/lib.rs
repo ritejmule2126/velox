@@ -14,6 +14,7 @@
 #![forbid(unsafe_code)]
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used, clippy::panic))]
 
+pub mod acl;
 pub mod cache_admin;
 pub mod clock;
 pub mod config;

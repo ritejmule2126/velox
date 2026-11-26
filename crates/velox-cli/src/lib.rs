@@ -9,5 +9,6 @@
 
 pub mod app;
 pub mod cli;
+pub mod doctor;
 
 pub use app::{App, FileReloader};

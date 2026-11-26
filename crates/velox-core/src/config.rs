@@ -202,6 +202,14 @@ pub struct TlsConfig {
     pub hsts: HstsConfig,
     /// Automatic certificates via ACME HTTP-01 (requires the `acme` feature).
     pub acme: Option<AcmeConfig>,
+    /// PEM bundle of CAs that client certificates must chain to (mutual TLS on
+    /// the HTTPS and HTTP/3 listeners). Re-read on reload / `SIGHUP`; a bundle
+    /// that fails to load keeps the previous one.
+    pub client_ca_file: Option<PathBuf>,
+    /// With `client_ca_file`: `true` (the default) rejects clients that present
+    /// no valid certificate during the handshake; `false` lets anonymous clients
+    /// through but still rejects a certificate that does not verify.
+    pub client_auth_required: Option<bool>,
 }
 
 /// A certificate / key pair and the SNI names it serves.
@@ -282,6 +290,11 @@ pub struct SecurityConfig {
     /// underscores are not valid hostname characters (RFC 1123) and lenient
     /// parsing invites host-confusion bugs.
     pub allow_underscores_in_host: bool,
+    /// If non-empty, only these client networks may use any route (matched
+    /// against the client address *after* PROXY protocol / `trusted_proxies`).
+    pub ip_allow: Vec<IpNet>,
+    /// Client networks refused on every route. Deny always wins over allow.
+    pub ip_deny: Vec<IpNet>,
 }
 
 impl Default for SecurityConfig {
@@ -292,6 +305,8 @@ impl Default for SecurityConfig {
             response_headers: BTreeMap::new(),
             hide_server_header: false,
             allow_underscores_in_host: false,
+            ip_allow: Vec::new(),
+            ip_deny: Vec::new(),
         }
     }
 }
@@ -1008,6 +1023,105 @@ pub struct RouteConfig {
     /// `cache = {}` turns it on with defaults.
     #[serde(default)]
     pub cache: Option<RouteCacheConfig>,
+    /// Extra allow-list for this route; the client must also pass the global
+    /// `[security]` lists (a route can only narrow access).
+    #[serde(default)]
+    pub ip_allow: Vec<IpNet>,
+    /// Extra deny-list for this route.
+    #[serde(default)]
+    pub ip_deny: Vec<IpNet>,
+    /// Verify a JSON Web Token at the edge; invalid tokens never reach the backend.
+    #[serde(default)]
+    pub jwt: Option<JwtConfig>,
+}
+
+/// A JWT signature algorithm Velox verifies.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum JwtAlgorithm {
+    /// HMAC-SHA256 with a shared secret.
+    HS256,
+    /// RSASSA-PKCS1-v1_5 with SHA-256 (RSA keys of 2048–8192 bits).
+    RS256,
+    /// ECDSA over P-256 with SHA-256.
+    ES256,
+}
+
+impl JwtAlgorithm {
+    /// The `alg` header value.
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::HS256 => "HS256",
+            Self::RS256 => "RS256",
+            Self::ES256 => "ES256",
+        }
+    }
+}
+
+/// Per-route edge JWT verification.
+///
+/// Only the listed `algorithms` are accepted (`none` never is), and each token
+/// is checked only against keys of the matching type, which closes the classic
+/// "verify an HS256 token with the RSA public key as the secret" confusion.
+/// `exp` is mandatory by default; `nbf`, `iss` and `aud` are checked when
+/// configured / present.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct JwtConfig {
+    /// Accepted signature algorithms. `HS256` must be listed explicitly: shared
+    /// secrets are opt-in.
+    pub algorithms: Vec<JwtAlgorithm>,
+    /// Environment variable holding the HS256 secret (at least 32 bytes).
+    pub secret_env: Option<String>,
+    /// File holding the HS256 secret (one trailing newline is ignored).
+    pub secret_file: Option<PathBuf>,
+    /// PEM file with one or more `PUBLIC KEY` (SPKI) blocks: RSA or P-256.
+    pub public_key_file: Option<PathBuf>,
+    /// JWKS document (`{"keys": [...]}`) with RSA / P-256 public keys, selected by `kid`.
+    pub jwks_file: Option<PathBuf>,
+    /// Required `iss`.
+    pub issuer: Option<String>,
+    /// Accepted `aud` values (the token needs at least one of them).
+    pub audience: Vec<String>,
+    /// Clock-skew allowance for `exp` / `nbf`.
+    #[serde(with = "humantime_serde")]
+    pub leeway: Duration,
+    /// Reject tokens without an `exp` claim.
+    pub require_exp: bool,
+    /// `true`: a missing token is `401`. `false`: a missing token is allowed
+    /// (anonymous) but a *present* one must still be valid.
+    pub required: bool,
+    /// The request header carrying the token.
+    pub header: String,
+    /// Scheme prefix of that header's value (`Bearer`); empty for a bare token.
+    pub scheme: String,
+    /// Claims passed to the backend as `X-Jwt-<claim>` headers (strings,
+    /// numbers, booleans, or arrays of strings joined with `,`). Any
+    /// client-supplied `X-Jwt-*` header is removed on JWT routes.
+    pub forward_claims: Vec<String>,
+    /// How often key files are checked for rotation.
+    #[serde(with = "humantime_serde")]
+    pub reload_interval: Duration,
+}
+
+impl Default for JwtConfig {
+    fn default() -> Self {
+        Self {
+            algorithms: vec![JwtAlgorithm::RS256, JwtAlgorithm::ES256],
+            secret_env: None,
+            secret_file: None,
+            public_key_file: None,
+            jwks_file: None,
+            issuer: None,
+            audience: Vec::new(),
+            leeway: Duration::from_secs(30),
+            require_exp: true,
+            required: true,
+            header: "authorization".to_owned(),
+            scheme: "Bearer".to_owned(),
+            forward_claims: Vec::new(),
+            reload_interval: Duration::from_secs(5),
+        }
+    }
 }
 
 /// Sizing of the shared response cache. Which routes use it, and how long
@@ -1048,6 +1162,26 @@ pub struct RouteCacheConfig {
     /// Ignore the query string when forming the cache key (`?utm=…` busting).
     /// Only safe if the backend's answer really does not depend on it.
     pub ignore_query: bool,
+    /// Collapse concurrent misses on the same object into one backend fetch
+    /// (the "leader"); the others wait for it and share the result. If the
+    /// response turns out not to be cacheable, or the leader fails, waiters
+    /// simply fetch for themselves.
+    pub coalesce: bool,
+    /// How long a waiting request will wait for the leader before it fetches
+    /// for itself.
+    #[serde(with = "humantime_serde")]
+    pub coalesce_timeout: Duration,
+    /// Serve an entry up to this long past its expiry **immediately** while one
+    /// background request refreshes it (RFC 5861 `stale-while-revalidate`).
+    /// A response's own `stale-while-revalidate=N` takes precedence; this is the
+    /// default for responses that say nothing. Never applied to `must-revalidate`.
+    #[serde(with = "humantime_serde::option")]
+    pub stale_while_revalidate: Option<Duration>,
+    /// Serve an entry up to this long past its expiry when the backend is
+    /// failing (connect error, timeout, `500`/`502`/`503`/`504`) (RFC 5861
+    /// `stale-if-error`). Same precedence and `must-revalidate` rules.
+    #[serde(with = "humantime_serde::option")]
+    pub stale_if_error: Option<Duration>,
     /// Serve and store requests that carry a `Cookie` header. Off by default:
     /// a backend that personalises on cookies without saying `Vary: Cookie` or
     /// `private` would otherwise show one visitor's page to another. Turn it on
@@ -1057,7 +1191,17 @@ pub struct RouteCacheConfig {
 
 impl Default for RouteCacheConfig {
     fn default() -> Self {
-        Self { enabled: true, default_ttl: None, max_ttl: None, ignore_query: false, allow_cookies: false }
+        Self {
+            enabled: true,
+            default_ttl: None,
+            max_ttl: None,
+            ignore_query: false,
+            coalesce: true,
+            coalesce_timeout: Duration::from_secs(10),
+            stale_while_revalidate: None,
+            stale_if_error: None,
+            allow_cookies: false,
+        }
     }
 }
 
@@ -1155,6 +1299,19 @@ impl Config {
                 }
             }
         }
+        for (i, r) in self.routes.iter().enumerate() {
+            let Some(j) = &r.jwt else { continue };
+            for p in [&j.secret_file, &j.public_key_file, &j.jwks_file].into_iter().flatten() {
+                if !p.is_file() {
+                    errs.push(format!("route `{}`: jwt file {} does not exist", self.route_id(i), p.display()));
+                }
+            }
+        }
+        if let Some(p) = &self.tls.client_ca_file {
+            if !p.is_file() {
+                errs.push(format!("tls: client_ca_file {} does not exist", p.display()));
+            }
+        }
         for u in &self.upstreams {
             let Some(t) = &u.tls else { continue };
             for p in [&t.ca_file, &t.client_cert_file, &t.client_key_file].into_iter().flatten() {
@@ -1190,6 +1347,14 @@ impl Config {
         }
         if s.h3 && s.h3_addr.is_some() && s.https_addr.is_none() {
             errs.push("server.h3_addr requires https_addr (TLS material)".into());
+        }
+        if self.tls.client_auth_required.is_some() && self.tls.client_ca_file.is_none() {
+            errs.push("tls.client_auth_required needs tls.client_ca_file (otherwise nothing would be verified)".into());
+        }
+        if self.tls.client_ca_file.is_some() && s.https_addr.is_none() {
+            errs.push(
+                "tls.client_ca_file needs https_addr (client certificates are checked on the TLS listeners)".into(),
+            );
         }
         if s.proxy_protocol {
             if s.proxy_protocol_trusted.is_empty() {
@@ -1372,6 +1537,19 @@ impl Config {
             if let Some(c) = &r.cors {
                 validate_cors(&format!("route `{id}`"), c, errs);
             }
+            if let Some(j) = &r.jwt {
+                validate_jwt(&format!("route `{id}`"), j, errs);
+                // Requests carrying `Authorization` never touch the cache; a token in
+                // any other header would, and one holder's response could then be
+                // served to another.
+                if r.cache.as_ref().is_some_and(|c| c.enabled) && !j.header.eq_ignore_ascii_case("authorization") {
+                    errs.push(format!(
+                        "route `{id}`: caching a route whose jwt.header is `{}` could share one token holder's \
+                         responses with another; use the Authorization header or disable the cache",
+                        j.header
+                    ));
+                }
+            }
             if let Some(c) = &r.cache {
                 let year = Duration::from_secs(365 * 86_400);
                 for (name, v) in [("default_ttl", c.default_ttl), ("max_ttl", c.max_ttl)] {
@@ -1381,6 +1559,16 @@ impl Config {
                 }
                 if c.default_ttl.zip(c.max_ttl).is_some_and(|(d, m)| d > m) {
                     errs.push(format!("route `{id}`: cache.default_ttl exceeds cache.max_ttl"));
+                }
+                if !(Duration::from_millis(100)..=Duration::from_secs(300)).contains(&c.coalesce_timeout) {
+                    errs.push(format!("route `{id}`: cache.coalesce_timeout must be within 100ms..=5m"));
+                }
+                for (name, v) in
+                    [("stale_while_revalidate", c.stale_while_revalidate), ("stale_if_error", c.stale_if_error)]
+                {
+                    if v.is_some_and(|d| d > Duration::from_secs(86_400)) {
+                        errs.push(format!("route `{id}`: cache.{name} must be at most 24h"));
+                    }
                 }
             }
         }
@@ -1475,6 +1663,55 @@ impl Config {
         if self.telemetry.log_level.trim().is_empty() {
             errs.push("telemetry.log_level must not be empty".into());
         }
+    }
+}
+
+fn validate_jwt(ctx: &str, j: &JwtConfig, errs: &mut Vec<String>) {
+    use JwtAlgorithm::{ES256, HS256, RS256};
+    if j.algorithms.is_empty() {
+        errs.push(format!("{ctx}: jwt.algorithms must not be empty"));
+    }
+    let wants_secret = j.algorithms.contains(&HS256);
+    let wants_public = j.algorithms.iter().any(|a| matches!(a, RS256 | ES256));
+    let has_secret = j.secret_env.is_some() || j.secret_file.is_some();
+    let has_public = j.public_key_file.is_some() || j.jwks_file.is_some();
+    if j.secret_env.is_some() && j.secret_file.is_some() {
+        errs.push(format!("{ctx}: set only one of jwt.secret_env and jwt.secret_file"));
+    }
+    if wants_secret && !has_secret {
+        errs.push(format!("{ctx}: jwt accepts HS256 but has no secret_env / secret_file"));
+    }
+    if wants_public && !has_public {
+        errs.push(format!("{ctx}: jwt accepts RS256/ES256 but has no public_key_file / jwks_file"));
+    }
+    // Key material that no listed algorithm can use is a configuration mistake
+    // (and, for a secret, a tempting leftover): refuse it.
+    if has_secret && !wants_secret {
+        errs.push(format!("{ctx}: jwt has a secret but HS256 is not in jwt.algorithms"));
+    }
+    if has_public && !wants_public {
+        errs.push(format!("{ctx}: jwt has public keys but neither RS256 nor ES256 is in jwt.algorithms"));
+    }
+    if http::HeaderName::from_bytes(j.header.as_bytes()).is_err() {
+        errs.push(format!("{ctx}: jwt.header `{}` is not a valid header name", j.header));
+    }
+    if j.scheme.contains(char::is_whitespace) {
+        errs.push(format!("{ctx}: jwt.scheme must be a single token (or empty)"));
+    }
+    if j.leeway > Duration::from_secs(300) {
+        errs.push(format!("{ctx}: jwt.leeway must be at most 5m"));
+    }
+    if j.reload_interval < Duration::from_millis(50) {
+        errs.push(format!("{ctx}: jwt.reload_interval must be at least 50ms"));
+    }
+    for c in &j.forward_claims {
+        let ok = !c.is_empty() && c.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-');
+        if !ok {
+            errs.push(format!("{ctx}: jwt.forward_claims entry `{c}` must be letters, digits, `_` or `-`"));
+        }
+    }
+    if j.issuer.as_deref().is_some_and(str::is_empty) || j.audience.iter().any(String::is_empty) {
+        errs.push(format!("{ctx}: jwt.issuer / jwt.audience entries must not be empty"));
     }
 }
 
@@ -1841,5 +2078,78 @@ mod tests {
         };
         assert!(live(route("{ enabled = false }")).is_none());
         assert!(live(route("{ default_ttl = \"9s\" }")).is_some_and(|c| c.default_ttl == Some(Duration::from_secs(9))));
+    }
+
+    #[test]
+    fn ip_lists_parse_globally_and_per_route() {
+        let cfg = Config::from_toml_str(MINIMAL).unwrap();
+        assert!(cfg.security.ip_allow.is_empty() && cfg.security.ip_deny.is_empty(), "open by default");
+        let text = format!("{MINIMAL}\nip_allow = [\"10.0.0.0/8\", \"2001:db8::/32\"]\nip_deny = [\"10.6.0.0/16\"]\n")
+            .replace("\n[server]", "\n[server]"); // (route-level keys are appended to the last table)
+        let cfg = Config::from_toml_str(&text).unwrap();
+        assert_eq!((cfg.routes[0].ip_allow.len(), cfg.routes[0].ip_deny.len()), (2, 1));
+        let sec = format!("{MINIMAL}\n[security]\nip_deny = [\"192.0.2.0/24\"]\n");
+        assert_eq!(Config::from_toml_str(&sec).unwrap().security.ip_deny.len(), 1);
+        // A malformed CIDR is a parse error, not a silently ignored rule.
+        assert!(Config::from_toml_str(&format!("{MINIMAL}\n[security]\nip_deny = [\"10.0.0.0/33\"]\n")).is_err());
+        assert!(Config::from_toml_str(&format!("{MINIMAL}\n[security]\nip_allow = [\"not-an-ip\"]\n")).is_err());
+    }
+
+    #[test]
+    fn jwt_config_defaults_and_validation() {
+        let text = |jwt: &str| format!("{MINIMAL}\n[route.jwt]\n{jwt}\n");
+        let d = JwtConfig::default();
+        assert_eq!(d.algorithms, [JwtAlgorithm::RS256, JwtAlgorithm::ES256], "shared secrets are opt-in");
+        assert!(d.require_exp && d.required);
+        assert_eq!(
+            (d.header.as_str(), d.scheme.as_str(), d.leeway),
+            ("authorization", "Bearer", Duration::from_secs(30))
+        );
+        assert!(Config::from_toml_str(MINIMAL).unwrap().routes[0].jwt.is_none(), "off unless configured");
+
+        let ok = Config::from_toml_str(&text(
+            "public_key_file = \"k.pem\"\naudience = [\"api\"]\nforward_claims = [\"sub\", \"tenant_id\"]",
+        ))
+        .unwrap();
+        assert_eq!(ok.routes[0].jwt.as_ref().unwrap().audience, ["api"]);
+        assert!(Config::from_toml_str(&text("algorithms = [\"HS256\"]\nsecret_env = \"JWT_SECRET\"")).is_ok());
+        assert!(Config::from_toml_str(&text(
+            "algorithms = [\"HS256\", \"ES256\"]\nsecret_file = \"s\"\njwks_file = \"j.json\""
+        ))
+        .is_ok());
+
+        let err = |jwt: &str| Config::from_toml_str(&text(jwt)).unwrap_err().to_string();
+        assert!(err("").contains("no public_key_file / jwks_file"), "RS256/ES256 need public keys");
+        assert!(err("algorithms = [\"HS256\"]").contains("no secret_env / secret_file"));
+        assert!(err("algorithms = []").contains("must not be empty"));
+        assert!(err("algorithms = [\"none\"]").contains("unknown variant"), "no `none`, ever");
+        assert!(err("algorithms = [\"HS384\"]\nsecret_env = \"X\"").contains("unknown variant"));
+        // Key material that nothing listed can use is a mistake.
+        assert!(err("public_key_file = \"k\"\nsecret_env = \"X\"").contains("HS256 is not in"));
+        assert!(
+            err("algorithms = [\"HS256\"]\nsecret_env = \"X\"\njwks_file = \"j\"").contains("neither RS256 nor ES256")
+        );
+        assert!(err("algorithms = [\"HS256\"]\nsecret_env = \"X\"\nsecret_file = \"s\"").contains("only one of"));
+        assert!(err("public_key_file = \"k\"\nheader = \"bad header\"").contains("jwt.header"));
+        assert!(err("public_key_file = \"k\"\nscheme = \"Bearer token\"").contains("jwt.scheme"));
+        assert!(err("public_key_file = \"k\"\nleeway = \"1h\"").contains("leeway"));
+        assert!(err("public_key_file = \"k\"\nforward_claims = [\"a b\"]").contains("forward_claims"));
+        assert!(err("public_key_file = \"k\"\nissuer = \"\"").contains("must not be empty"));
+        assert!(err("public_key_file = \"k\"\nbogus = 1").contains("unknown field"));
+        // Files are checked by validate_files.
+        let cfg = Config::from_toml_str(&text("public_key_file = \"/nonexistent/k.pem\"")).unwrap();
+        assert!(cfg.validate_files().unwrap_err().to_string().contains("/nonexistent/k.pem"));
+
+        // A custom token header plus the cache could share one holder's response with another.
+        let cached = |header: &str| {
+            format!(
+                "{MINIMAL}\ncache = {{}}\n[route.jwt]\npublic_key_file = \"k\"\nheader = \"{header}\"\nscheme = \"\"\n"
+            )
+        };
+        assert!(Config::from_toml_str(&cached("x-api-token"))
+            .unwrap_err()
+            .to_string()
+            .contains("share one token holder"));
+        assert!(Config::from_toml_str(&cached("Authorization")).is_ok(), "Authorization requests never use the cache");
     }
 }

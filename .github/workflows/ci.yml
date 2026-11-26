@@ -49,6 +49,14 @@ jobs:
       - run: cargo build --release --locked
       - name: Validate the shipped configuration
         run: ./target/release/velox validate -c velox.toml
+      - name: velox doctor runs and accepts the shipped configuration
+        # Findings about this runner (low descriptor limit, default UDP buffers) are
+        # expected and not what is under test; the config check must pass.
+        run: |
+          ./target/release/velox doctor -c velox.toml | tee doctor.txt || true
+          grep -q "\[ OK \] config" doctor.txt
+      - name: The system-allocator build still works (mimalloc is a default-on feature)
+        run: cargo check -p velox-cli --no-default-features --locked
 
   msrv:
     name: MSRV (1.88)
@@ -110,7 +118,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        target: [request_head, guard_stream, chunked, typed_headers, proxy_protocol, accept_encoding, traceparent, cache_policy]
+        target: [request_head, guard_stream, chunked, typed_headers, proxy_protocol, accept_encoding, traceparent, cache_policy, jwt_token]
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@nightly

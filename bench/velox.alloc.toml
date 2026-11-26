@@ -1,0 +1,37 @@
+# Allocator comparison: plain HTTP, no limits, no access log.
+[server]
+http_addr = "127.0.0.1:8080"
+
+[limits]
+max_connections        = 0
+max_connections_per_ip = 0
+
+[admin]
+addr = "127.0.0.1:9901"
+
+[telemetry]
+log_level  = "warn"
+access_log = false
+
+[[upstream]]
+name      = "bench"
+algorithm = "least_conn"
+backends  = [{ addr = "127.0.0.1:3000" }, { addr = "127.0.0.1:3001" }]
+
+# small replies, proxied
+[[route]]
+name     = "small"
+upstream = "bench"
+
+# 64 KiB replies, proxied every time
+[[route]]
+name        = "big"
+path_prefix = "/big"
+upstream    = "bench"
+
+# 64 KiB replies served from the in-memory cache
+[[route]]
+name        = "big-cached"
+path_prefix = "/big-cached"
+upstream    = "bench"
+cache       = {}

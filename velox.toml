@@ -27,8 +27,10 @@ h3              = true
 # h3_addr       = "0.0.0.0:8443"
 alt_svc_max_age = 86400
 
-accept_workers = 1          # parallel accept loops per TCP listener
-reuse_port     = true       # SO_REUSEPORT when accept_workers > 1
+accept_workers = 1          # parallel accept loops per TCP listener; keep <= CPU cores. Raise it
+                            # (with reuse_port) only if one accept loop saturates a core.
+reuse_port     = true       # SO_REUSEPORT when accept_workers > 1: one socket per worker, the kernel
+                            # spreads connections. Run `velox doctor` to check OS limits first.
 tcp_nodelay    = true
 backlog        = 1024
 drain_timeout  = "30s"      # SIGTERM/SIGINT: wait this long for in-flight requests
@@ -86,6 +88,13 @@ self_signed_fallback = true
 # cert_file    = "/etc/velox/certs/example.com.crt"
 # key_file     = "/etc/velox/certs/example.com.key"
 
+# Mutual TLS: require (or, with client_auth_required = false, accept) client
+# certificates on the HTTPS and HTTP/3 listeners. The verified identity reaches
+# the backend as X-Client-Cert-Subject / X-Client-Cert-Serial; the same headers
+# from clients are always stripped first. The bundle hot-reloads (SIGHUP).
+# client_ca_file       = "/etc/velox/client-ca.pem"
+# client_auth_required = true
+
 [tls.hsts]                    # sent on TLS responses only
 enabled            = true
 max_age            = 31536000
@@ -110,6 +119,11 @@ preload            = false
 # load balancer). From anyone else those headers are discarded and rebuilt, so
 # clients cannot spoof their address.
 trusted_proxies    = []        # e.g. ["10.0.0.0/8", "fd00::/8"]
+# Client address ACLs, judged on the *resolved* client (after PROXY protocol and
+# trusted_proxies) before anything else. Deny beats allow; IPv4-mapped IPv6 is
+# matched as IPv4. Routes can add their own lists (they can only narrow access).
+# ip_allow = ["10.0.0.0/8"]     # if set, only these may connect
+# ip_deny  = ["10.6.6.0/24"]
 nosniff            = true      # add X-Content-Type-Options: nosniff if the upstream did not
 hide_server_header = false
 allow_underscores_in_host = false   # '_' is not an RFC 1123 hostname character; enable for container service names
@@ -265,10 +279,28 @@ upstream      = "app"
 #                                   #  balancers cannot cause a redirect loop)
 # compress       = true             # override [compression].enabled for this route
 # cache = { default_ttl = "30s", max_ttl = "1h" }   # enable the response cache (see [cache])
+#                                   # stampede protection and stale serving (RFC 5861):
+#                                   #   coalesce = true, coalesce_timeout = "10s"   (one backend fetch per object)
+#                                   #   stale_while_revalidate = "30s"  (serve instantly, refresh in the background)
+#                                   #   stale_if_error = "5m"           (serve the old copy while the backend fails)
+# ip_allow = ["10.1.0.0/16"]        # per-route ACL (in addition to [security] ip_allow / ip_deny)
+# ip_deny  = []
 #                                   # also: ignore_query = true, allow_cookies = true (read the README first)
 # timeout        = "10s"            # override timeouts.upstream_response
 # request_headers = { "x-env" = "prod" }
 # rate_limit = { requests_per_second = 20.0, burst = 40, key = "header:x-api-key" }
+#
+# Verify a JWT at the edge: invalid tokens get 401 and never reach the backend.
+# HS256 / RS256 / ES256 only (allow-listed; `none` is never accepted), keys from
+# a PEM, a JWKS file or an HS256 secret (file or env var), hot-rotated.
+# [route.jwt]
+# algorithms     = ["RS256", "ES256"]
+# jwks_file      = "/etc/velox/jwks.json"      # or public_key_file = "...", secret_file / secret_env (HS256)
+# issuer         = "https://login.example.com"
+# audience       = ["api"]
+# leeway         = "30s"
+# forward_claims = ["sub", "roles"]            # -> X-Jwt-sub, X-Jwt-roles (client X-Jwt-* is always stripped)
+# required       = true                        # false: anonymous allowed, a presented token must still be valid
 #
 # CORS, enforced at the edge: preflights are answered by Velox (204/403) and never
 # reach the backend; the backend's own Access-Control-* headers are replaced by

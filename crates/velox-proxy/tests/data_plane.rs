@@ -1738,21 +1738,21 @@ async fn cacheable_responses_are_served_from_memory_until_they_expire() {
     let h = start(&cache_config(b, "{}", "")).await;
 
     let (s1, h1, b1) = fetch(h.addr, "GET", "/page?x=1", &[]).await;
-    assert_eq!((s1.as_u16(), cache_state(&h1)), (200, "miss"));
+    assert_eq!((s1.as_u16(), cache_state(&h1)), (200, "MISS"));
     let (s2, h2, b2) = fetch(h.addr, "GET", "/page?x=1", &[]).await;
-    assert_eq!((s2.as_u16(), cache_state(&h2)), (200, "hit"));
+    assert_eq!((s2.as_u16(), cache_state(&h2)), (200, "HIT"));
     assert_eq!(b1, b2, "the hit is byte-identical to the stored response");
     assert_eq!(hits.load(Ordering::SeqCst), 1, "the backend was asked once");
     assert!(h2.contains_key("age") && h2["etag"] == "\"v1\"", "{h2:?}");
     assert_eq!(h2["content-length"].to_str().unwrap(), b2.len().to_string());
     // A different query string is a different object.
     let (_, h3, b3) = fetch(h.addr, "GET", "/page?x=2", &[]).await;
-    assert_eq!(cache_state(&h3), "miss");
+    assert_eq!(cache_state(&h3), "MISS");
     assert_ne!(b3, b1);
     assert_eq!(hits.load(Ordering::SeqCst), 2);
     // A HEAD is answered from the stored GET: headers, no body.
     let (sh, hh, bh) = fetch(h.addr, "HEAD", "/page?x=1", &[]).await;
-    assert_eq!((sh.as_u16(), cache_state(&hh)), (200, "hit"));
+    assert_eq!((sh.as_u16(), cache_state(&hh)), (200, "HIT"));
     assert!(bh.is_empty());
     assert_eq!(hh["content-length"].to_str().unwrap(), b1.len().to_string());
     assert_eq!(hits.load(Ordering::SeqCst), 2);
@@ -1760,7 +1760,7 @@ async fn cacheable_responses_are_served_from_memory_until_they_expire() {
     // After max-age the entry is gone and the backend is asked again.
     tokio::time::sleep(Duration::from_millis(1300)).await;
     let (_, h4, b4) = fetch(h.addr, "GET", "/page?x=1", &[]).await;
-    assert_eq!(cache_state(&h4), "miss");
+    assert_eq!(cache_state(&h4), "MISS");
     assert_ne!(b4, b1, "fresh content, not the stale entry");
     let m = h.proxy.metrics().render().unwrap();
     assert!(m.contains("velox_cache_hits_total{route=\"route-0\"} 2"), "{m}");
@@ -1787,9 +1787,9 @@ async fn responses_the_backend_forbids_or_does_not_date_are_never_cached() {
             let (status, headers, _) = fetch(h.addr, "GET", "/x", &[]).await;
             assert_eq!(status, 200, "{label}");
             let expect_hit = cached && i > 0;
-            assert_eq!(cache_state(&headers) == "hit", expect_hit, "{label} request {i}: {headers:?}");
+            assert_eq!(cache_state(&headers) == "HIT", expect_hit, "{label} request {i}: {headers:?}");
             if !cached {
-                assert_eq!(cache_state(&headers), "pass", "{label}");
+                assert_eq!(cache_state(&headers), "PASS", "{label}");
             }
         }
         assert_eq!(hits.load(Ordering::SeqCst), if cached { 1 } else { 3 }, "{label}");
@@ -1829,7 +1829,7 @@ async fn vary_creates_separate_variants_and_conditionals_return_304_from_the_cac
     let (_, h_fr2, b_fr2) = get("fr").await;
     assert_eq!(
         (cache_state(&h_en1), cache_state(&h_fr1), cache_state(&h_en2), cache_state(&h_fr2)),
-        ("miss", "miss", "hit", "hit")
+        ("MISS", "MISS", "HIT", "HIT")
     );
     assert!(text_of(&b_en1).contains("lang=en") && text_of(&b_fr1).contains("lang=fr"));
     assert_eq!((b_en1, b_fr1), (b_en2, b_fr2), "each client gets its own variant back");
@@ -1842,7 +1842,7 @@ async fn vary_creates_separate_variants_and_conditionals_return_304_from_the_cac
             fetch(h.addr, "GET", "/doc", &[("accept-language", "en"), ("if-none-match", inm)]).await;
         assert_eq!(status, 304, "{inm}");
         assert!(body.is_empty());
-        assert_eq!((cache_state(&headers), headers["etag"].to_str().unwrap()), ("hit", "\"v1\""));
+        assert_eq!((cache_state(&headers), headers["etag"].to_str().unwrap()), ("HIT", "\"v1\""));
         assert!(!headers.contains_key("content-type"), "no content headers on a 304");
     }
     let (status, _, body) =
@@ -1868,21 +1868,21 @@ async fn requests_that_must_not_be_cached_bypass_it_and_writes_invalidate() {
     ] {
         let before = hits.load(Ordering::SeqCst);
         let (_, headers, body) = fetch(h.addr, "GET", "/res", &[hdr]).await;
-        assert_eq!(cache_state(&headers), "bypass", "{label}");
+        assert_eq!(cache_state(&headers), "BYPASS", "{label}");
         assert_eq!(hits.load(Ordering::SeqCst), before + 1, "{label}: went to the backend");
         assert!(text_of(&body).starts_with(&format!("n={}", before + 1)), "{label}");
     }
     // The entry that was already there is untouched by those.
     let (_, headers, body) = fetch(h.addr, "GET", "/res", &[]).await;
-    assert_eq!(cache_state(&headers), "hit");
+    assert_eq!(cache_state(&headers), "HIT");
     assert!(text_of(&body).starts_with("n=1 "), "{}", text_of(&body));
 
     // `no-cache` skips the lookup but refreshes the stored copy.
     let (_, headers, body) = fetch(h.addr, "GET", "/res", &[("cache-control", "no-cache")]).await;
-    assert_eq!(cache_state(&headers), "miss");
+    assert_eq!(cache_state(&headers), "MISS");
     let refreshed = text_of(&body);
     let (_, headers, body) = fetch(h.addr, "GET", "/res", &[]).await;
-    assert_eq!((cache_state(&headers), text_of(&body)), ("hit", refreshed), "the refresh replaced the entry");
+    assert_eq!((cache_state(&headers), text_of(&body)), ("HIT", refreshed), "the refresh replaced the entry");
 
     // A successful write to the URL invalidates it (RFC 9111 §4.4).
     let stream = TcpStream::connect(h.addr).await.unwrap();
@@ -1896,9 +1896,9 @@ async fn requests_that_must_not_be_cached_bypass_it_and_writes_invalidate() {
         .unwrap();
     let r = sender.send_request(post).await.unwrap();
     assert_eq!(r.status(), 200);
-    assert_eq!(r.headers()["x-velox-cache"], "bypass");
+    assert_eq!(r.headers()["x-velox-cache"], "BYPASS");
     let (_, headers, _) = fetch(h.addr, "GET", "/res", &[]).await;
-    assert_eq!(cache_state(&headers), "miss", "the POST dropped the cached GET");
+    assert_eq!(cache_state(&headers), "MISS", "the POST dropped the cached GET");
     h.running.shutdown().await;
 }
 
@@ -1913,7 +1913,7 @@ async fn oversized_bodies_stream_through_intact_and_are_not_stored() {
         let (status, headers, body) = fetch(h.addr, "GET", "/big", &[]).await;
         assert_eq!(status, 200);
         assert_eq!(text_of(&body), big, "the client always gets the whole body");
-        assert_eq!(cache_state(&headers), "pass");
+        assert_eq!(cache_state(&headers), "PASS");
     }
     assert_eq!(hits.load(Ordering::SeqCst), 3);
     assert!(h.proxy.metrics().render().unwrap().contains("velox_cache_bypass_total{reason=\"too-large\"} 3"));
@@ -1938,7 +1938,7 @@ async fn memory_stays_bounded_and_the_hot_entries_survive() {
         fetch(h.addr, "GET", &format!("/cold/{i}"), &[]).await;
         // Keep /hot warm.
         let (_, headers, _) = fetch(h.addr, "GET", "/hot", &[]).await;
-        assert_eq!(cache_state(&headers), "hit", "round {i}: the recently used entry must not be evicted");
+        assert_eq!(cache_state(&headers), "HIT", "round {i}: the recently used entry must not be evicted");
     }
     let m = h.proxy.metrics().render().unwrap();
     let gauge = |name: &str| -> usize {
@@ -1962,16 +1962,16 @@ async fn compression_and_cors_are_applied_per_client_on_cached_responses() {
     let h = start(&cfg).await;
     // Fill with an identity client from origin A.
     let (_, h1, b1) = fetch(h.addr, "GET", "/doc", &[("origin", "https://a.test")]).await;
-    assert_eq!((cache_state(&h1), h1["access-control-allow-origin"].to_str().unwrap()), ("miss", "https://a.test"));
+    assert_eq!((cache_state(&h1), h1["access-control-allow-origin"].to_str().unwrap()), ("MISS", "https://a.test"));
     assert_eq!(b1, doc);
     // Hits are compressed per client and carry the *requesting* origin's CORS headers.
     let (_, h2, b2) = fetch(h.addr, "GET", "/doc", &[("accept-encoding", "gzip"), ("origin", "https://b.test")]).await;
-    assert_eq!(cache_state(&h2), "hit");
+    assert_eq!(cache_state(&h2), "HIT");
     assert_eq!(h2["content-encoding"], "gzip");
     assert_eq!(decode("gzip", &b2), doc);
     assert_eq!(h2["access-control-allow-origin"], "https://b.test", "origin A's header must not leak to B");
     let (_, h3, b3) = fetch(h.addr, "GET", "/doc", &[]).await;
-    assert_eq!((cache_state(&h3), b3), ("hit", doc));
+    assert_eq!((cache_state(&h3), b3), ("HIT", doc));
     assert!(!h3.contains_key("content-encoding") && !h3.contains_key("access-control-allow-origin"));
     assert_eq!(hits.load(Ordering::SeqCst), 1, "one backend request served all three clients");
     h.running.shutdown().await;
@@ -1985,7 +1985,7 @@ async fn routes_hosts_and_the_ignore_query_option_form_the_cache_key() {
     let (_, h2, b2) = fetch(h.addr, "GET", "/p?utm=2", &[]).await;
     assert_eq!(
         (cache_state(&h1), cache_state(&h2), b1 == b2),
-        ("miss", "hit", true),
+        ("MISS", "HIT", true),
         "the query is not part of the key"
     );
     h.running.shutdown().await;
@@ -2001,9 +2001,9 @@ async fn routes_hosts_and_the_ignore_query_option_form_the_cache_key() {
             s.send_request(req).await.unwrap().headers()["x-velox-cache"].to_str().unwrap().to_owned()
         }
     };
-    assert_eq!(on_host("a.test").await, "miss");
-    assert_eq!(on_host("A.TEST").await, "hit", "hosts compare case-insensitively");
-    assert_eq!(on_host("b.test").await, "miss", "another host is another object");
+    assert_eq!(on_host("a.test").await, "MISS");
+    assert_eq!(on_host("A.TEST").await, "HIT", "hosts compare case-insensitively");
+    assert_eq!(on_host("b.test").await, "MISS", "another host is another object");
     let _ = hits;
     h.running.shutdown().await;
 }
@@ -2034,16 +2034,16 @@ async fn requests_with_cookies_never_see_or_fill_the_shared_cache_unless_the_rou
     let (b, hits) = backend(counting_backend(&[("cache-control", "max-age=60")])).await;
     let h = start(&cache_config(b, "{}", "")).await;
     let (_, cold, _) = fetch(h.addr, "GET", "/profile", &[]).await; // an anonymous visitor fills the cache
-    assert_eq!(cache_state(&cold), "miss");
+    assert_eq!(cache_state(&cold), "MISS");
     for who in ["sid=alice", "sid=bob"] {
         let (_, headers, body) = fetch(h.addr, "GET", "/profile", &[("cookie", who)]).await;
-        assert_eq!(cache_state(&headers), "bypass", "{who}");
+        assert_eq!(cache_state(&headers), "BYPASS", "{who}");
         assert!(text_of(&body).starts_with("n="), "{who}");
     }
     assert_eq!(hits.load(Ordering::SeqCst), 3, "each cookie-bearing request went to the backend");
     // …and their (possibly personal) responses were not stored for others.
     let (_, anon, body) = fetch(h.addr, "GET", "/profile", &[]).await;
-    assert_eq!(cache_state(&anon), "hit");
+    assert_eq!(cache_state(&anon), "HIT");
     assert!(text_of(&body).starts_with("n=1 "), "still the anonymous copy: {}", text_of(&body));
     assert!(h.proxy.metrics().render().unwrap().contains("velox_cache_bypass_total{reason=\"cookie\"} 2"));
     h.running.shutdown().await;
@@ -2053,7 +2053,802 @@ async fn requests_with_cookies_never_see_or_fill_the_shared_cache_unless_the_rou
     let h = start(&cache_config(b, "{ allow_cookies = true }", "")).await;
     fetch(h.addr, "GET", "/asset.js", &[("cookie", "sid=alice")]).await;
     let (_, headers, _) = fetch(h.addr, "GET", "/asset.js", &[("cookie", "sid=bob")]).await;
-    assert_eq!(cache_state(&headers), "hit");
+    assert_eq!(cache_state(&headers), "HIT");
     assert_eq!(hits.load(Ordering::SeqCst), 1);
+    h.running.shutdown().await;
+}
+
+// ---------------- cache: coalescing and stale serving ----------------
+
+use std::sync::atomic::{AtomicU64, AtomicU8};
+use std::sync::Mutex as StdMutex;
+
+/// A backend the test drives: latency, failure mode, validators and counters.
+struct Script {
+    /// Every request that reached the backend.
+    hits: AtomicUsize,
+    /// Requests answered with a full `200`.
+    full: AtomicUsize,
+    /// Conditional requests answered `304`.
+    not_modified: AtomicUsize,
+    delay_ms: AtomicU64,
+    /// 0 = healthy, 1 = `500`, 2 = `503`, 3 = drop the connection.
+    mode: AtomicU8,
+    cache_control: StdMutex<String>,
+    etag: StdMutex<String>,
+}
+
+impl Script {
+    fn new(cache_control: &str) -> Arc<Self> {
+        Arc::new(Self {
+            hits: AtomicUsize::new(0),
+            full: AtomicUsize::new(0),
+            not_modified: AtomicUsize::new(0),
+            delay_ms: AtomicU64::new(0),
+            mode: AtomicU8::new(0),
+            cache_control: StdMutex::new(cache_control.to_owned()),
+            etag: StdMutex::new("\"v1\"".to_owned()),
+        })
+    }
+}
+
+async fn scripted_backend(script: Arc<Script>) -> SocketAddr {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        loop {
+            let Ok((stream, _)) = listener.accept().await else { return };
+            let script = Arc::clone(&script);
+            tokio::spawn(async move {
+                let svc = service_fn(move |req: Request<Incoming>| {
+                    let s = Arc::clone(&script);
+                    async move {
+                        s.hits.fetch_add(1, Ordering::SeqCst);
+                        // A backend decides how to answer when the request arrives, not after it dawdles.
+                        let mode = s.mode.load(Ordering::SeqCst);
+                        let delay = s.delay_ms.load(Ordering::SeqCst);
+                        if delay > 0 {
+                            tokio::time::sleep(Duration::from_millis(delay)).await;
+                        }
+                        let status = match mode {
+                            1 => Some(500),
+                            2 => Some(503),
+                            3 => return Err("connection dropped by the test"),
+                            _ => None,
+                        };
+                        if let Some(code) = status {
+                            let mut r = text("backend failure");
+                            *r.status_mut() = http::StatusCode::from_u16(code).unwrap();
+                            return Ok::<_, &'static str>(r);
+                        }
+                        let (etag, cc) = (s.etag.lock().unwrap().clone(), s.cache_control.lock().unwrap().clone());
+                        let matches =
+                            req.headers().get("if-none-match").is_some_and(|v| v.to_str().unwrap_or("") == etag);
+                        let mut r;
+                        if matches {
+                            s.not_modified.fetch_add(1, Ordering::SeqCst);
+                            r = text("");
+                            *r.status_mut() = http::StatusCode::NOT_MODIFIED;
+                        } else {
+                            let n = s.full.fetch_add(1, Ordering::SeqCst) + 1;
+                            r = text(&format!("body#{n} etag={etag}"));
+                        }
+                        r.headers_mut().insert("etag", etag.parse().unwrap());
+                        r.headers_mut().insert("cache-control", cc.parse().unwrap());
+                        r.headers_mut().insert("content-type", "text/plain".parse().unwrap());
+                        Ok(r)
+                    }
+                });
+                let _ = hyper::server::conn::http1::Builder::new().serve_connection(TokioIo::new(stream), svc).await;
+            });
+        }
+    });
+    addr
+}
+
+async fn until(what: &str, mut f: impl FnMut() -> bool) {
+    for _ in 0..500 {
+        if f() {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    panic!("timed out waiting for {what}");
+}
+
+#[tokio::test]
+async fn ten_concurrent_misses_make_one_backend_request() {
+    let script = Script::new("max-age=60");
+    script.delay_ms.store(300, Ordering::SeqCst);
+    let b = scripted_backend(Arc::clone(&script)).await;
+    let h = start(&cache_config(b, "{}", "")).await;
+
+    let t0 = std::time::Instant::now();
+    let clients: Vec<_> = (0..10)
+        .map(|_| {
+            let addr = h.addr;
+            tokio::spawn(async move { fetch(addr, "GET", "/hot", &[]).await })
+        })
+        .collect();
+    let mut tags = Vec::new();
+    let mut bodies = Vec::new();
+    for c in clients {
+        let (status, headers, body) = c.await.unwrap();
+        assert_eq!(status, 200);
+        tags.push(cache_state(&headers).to_owned());
+        bodies.push(text_of(&body));
+    }
+    assert_eq!(script.hits.load(Ordering::SeqCst), 1, "ten simultaneous misses, one backend request");
+    assert!(bodies.iter().all(|b| b == &bodies[0]), "everyone got the leader's response: {bodies:?}");
+    assert_eq!(tags.iter().filter(|t| *t == "MISS").count(), 1, "{tags:?}");
+    assert_eq!(tags.iter().filter(|t| *t == "HIT").count(), 9, "{tags:?}");
+    assert!(t0.elapsed() < Duration::from_millis(900), "followers waited for one fetch, not ten: {:?}", t0.elapsed());
+    let m = h.proxy.metrics().render().unwrap();
+    assert!(m.contains("velox_cache_coalesced_total{route=\"route-0\"} 9"), "{m}");
+    // And the object is now simply cached.
+    assert_eq!(cache_state(&fetch(h.addr, "GET", "/hot", &[]).await.1), "HIT");
+    assert_eq!(script.hits.load(Ordering::SeqCst), 1);
+    h.running.shutdown().await;
+}
+
+#[tokio::test]
+async fn followers_fall_back_to_their_own_fetch_when_the_result_cannot_be_shared() {
+    // Not cacheable: nothing to share, so every waiter fetches for itself — and none fails.
+    let script = Script::new("no-store");
+    script.delay_ms.store(200, Ordering::SeqCst);
+    let b = scripted_backend(Arc::clone(&script)).await;
+    let h = start(&cache_config(b, "{}", "")).await;
+    let results = futures_util::future::join_all((0..6).map(|_| fetch(h.addr, "GET", "/p", &[]))).await;
+    assert!(results.iter().all(|(s, ..)| *s == 200));
+    assert_eq!(script.hits.load(Ordering::SeqCst), 6, "no coalescing for an unshareable response");
+    assert!(results.iter().all(|(_, hd, _)| cache_state(hd) == "PASS"));
+    h.running.shutdown().await;
+
+    // The leader fails: followers do not inherit its failure.
+    let script = Script::new("max-age=60");
+    script.delay_ms.store(250, Ordering::SeqCst);
+    script.mode.store(2, Ordering::SeqCst); // the first request will see a 503
+    let b = scripted_backend(Arc::clone(&script)).await;
+    let h = start(&cache_config(b, "{}", "")).await;
+    let leader = tokio::spawn({
+        let addr = h.addr;
+        async move { fetch(addr, "GET", "/f", &[]).await }
+    });
+    until("the leader to reach the backend", || script.hits.load(Ordering::SeqCst) == 1).await;
+    script.mode.store(0, Ordering::SeqCst); // the backend recovers while the followers wait
+    let followers: Vec<_> = (0..4).map(|_| fetch(h.addr, "GET", "/f", &[])).collect();
+    let followers = futures_util::future::join_all(followers).await;
+    assert_eq!(leader.await.unwrap().0, 503, "the leader reports the failure it saw");
+    assert!(followers.iter().all(|(s, ..)| *s == 200), "followers fetched for themselves and succeeded");
+    h.running.shutdown().await;
+}
+
+#[tokio::test]
+async fn coalescing_can_be_disabled_and_waiters_give_up_after_their_timeout() {
+    let script = Script::new("max-age=60");
+    script.delay_ms.store(300, Ordering::SeqCst);
+    let b = scripted_backend(Arc::clone(&script)).await;
+    let h = start(&cache_config(b, "{ coalesce = false }", "")).await;
+    futures_util::future::join_all((0..5).map(|_| fetch(h.addr, "GET", "/x", &[]))).await;
+    assert_eq!(script.hits.load(Ordering::SeqCst), 5, "opt-out: every miss goes to the backend");
+    h.running.shutdown().await;
+
+    let script = Script::new("max-age=60");
+    script.delay_ms.store(900, Ordering::SeqCst);
+    let b = scripted_backend(Arc::clone(&script)).await;
+    let h = start(&cache_config(b, "{ coalesce_timeout = \"150ms\" }", "")).await;
+    let t0 = std::time::Instant::now();
+    let r = futures_util::future::join_all((0..4).map(|_| fetch(h.addr, "GET", "/slow", &[]))).await;
+    assert!(r.iter().all(|(s, ..)| *s == 200));
+    assert_eq!(script.hits.load(Ordering::SeqCst), 4, "waiters stopped waiting and fetched themselves");
+    assert!(t0.elapsed() < Duration::from_millis(1800), "{:?}", t0.elapsed());
+    assert!(h.proxy.metrics().render().unwrap().contains("velox_cache_coalesce_timeouts_total{route=\"route-0\"} 3"));
+    h.running.shutdown().await;
+}
+
+#[tokio::test]
+async fn stale_while_revalidate_answers_instantly_and_refreshes_once_in_the_background() {
+    let script = Script::new("max-age=1, stale-while-revalidate=30");
+    let b = scripted_backend(Arc::clone(&script)).await;
+    let h = start(&cache_config(b, "{}", "")).await;
+    let (_, h1, b1) = fetch(h.addr, "GET", "/doc", &[]).await;
+    assert_eq!(cache_state(&h1), "MISS");
+    assert_eq!(text_of(&b1), "body#1 etag=\"v1\"");
+    tokio::time::sleep(Duration::from_millis(1300)).await; // now stale, inside the window
+
+    // The backend is slow now; the client must not feel it. Several stale
+    // requests at once trigger exactly one revalidation.
+    script.delay_ms.store(500, Ordering::SeqCst);
+    let t0 = std::time::Instant::now();
+    let stale = futures_util::future::join_all((0..5).map(|_| fetch(h.addr, "GET", "/doc", &[]))).await;
+    assert!(
+        t0.elapsed() < Duration::from_millis(400),
+        "answered from the stale copy, not the slow backend: {:?}",
+        t0.elapsed()
+    );
+    for (status, headers, body) in &stale {
+        assert_eq!(*status, 200);
+        assert_eq!(cache_state(headers), "REVALIDATING");
+        assert_eq!(text_of(body), "body#1 etag=\"v1\"", "the stale copy");
+        assert!(headers["age"].to_str().unwrap().parse::<u64>().unwrap() >= 1, "Age reflects how old it is");
+    }
+    // The refresh is conditional: the backend confirms with a 304, no body re-sent.
+    until("the revalidation to finish", || script.not_modified.load(Ordering::SeqCst) == 1).await;
+    script.delay_ms.store(0, Ordering::SeqCst);
+    until("the entry to be fresh again", || {
+        h.proxy
+            .metrics()
+            .render()
+            .unwrap()
+            .contains("velox_cache_revalidations_total{result=\"not_modified\",route=\"route-0\"} 1")
+    })
+    .await;
+    assert_eq!(
+        script.hits.load(Ordering::SeqCst),
+        2,
+        "one full fetch + ONE conditional refresh for five stale requests"
+    );
+    assert_eq!(script.full.load(Ordering::SeqCst), 1, "no second body was transferred");
+    let (_, h2, b2) = fetch(h.addr, "GET", "/doc", &[]).await;
+    assert_eq!(cache_state(&h2), "HIT", "fresh again");
+    assert_eq!(text_of(&b2), "body#1 etag=\"v1\"");
+    let m = h.proxy.metrics().render().unwrap();
+    assert!(m.contains("velox_cache_stale_served_total{kind=\"swr\",route=\"route-0\"} 5"), "{m}");
+    h.running.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_changed_object_replaces_the_stale_copy_after_background_revalidation() {
+    let script = Script::new("max-age=1, stale-while-revalidate=30");
+    let b = scripted_backend(Arc::clone(&script)).await;
+    let h = start(&cache_config(b, "{}", "")).await;
+    fetch(h.addr, "GET", "/doc", &[]).await;
+    tokio::time::sleep(Duration::from_millis(1300)).await;
+    // The object changed at the origin (new validator, so the conditional request gets a full 200).
+    *script.etag.lock().unwrap() = "\"v2\"".to_owned();
+    let (_, headers, body) = fetch(h.addr, "GET", "/doc", &[]).await;
+    assert_eq!(
+        (cache_state(&headers), text_of(&body).as_str()),
+        ("REVALIDATING", "body#1 etag=\"v1\""),
+        "the caller still gets the old copy"
+    );
+    until("the new version to be stored", || script.full.load(Ordering::SeqCst) == 2).await;
+    let mut replaced = false;
+    for _ in 0..100 {
+        let (_, headers, body) = fetch(h.addr, "GET", "/doc", &[]).await;
+        if cache_state(&headers) == "HIT" && text_of(&body).contains("v2") {
+            assert_eq!(text_of(&body), "body#2 etag=\"v2\"");
+            replaced = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(replaced, "the revalidated object never replaced the stale one");
+    assert!(h
+        .proxy
+        .metrics()
+        .render()
+        .unwrap()
+        .contains("velox_cache_revalidations_total{result=\"updated\",route=\"route-0\"} 1"));
+    h.running.shutdown().await;
+}
+
+#[tokio::test]
+async fn stale_if_error_serves_the_expired_copy_while_the_backend_is_failing() {
+    let script = Script::new("max-age=1, stale-if-error=30");
+    let b = scripted_backend(Arc::clone(&script)).await;
+    let h = start(&cache_config(b, "{}", "")).await;
+    let (_, h0, b0) = fetch(h.addr, "GET", "/doc", &[]).await;
+    assert_eq!((cache_state(&h0), text_of(&b0).as_str()), ("MISS", "body#1 etag=\"v1\""));
+    tokio::time::sleep(Duration::from_millis(1300)).await; // expired, inside the error window
+
+    for (mode, what) in [(1, "500"), (2, "503"), (3, "a dropped connection")] {
+        script.mode.store(mode, Ordering::SeqCst);
+        let (status, headers, body) = fetch(h.addr, "GET", "/doc", &[]).await;
+        assert_eq!(status, 200, "{what}: the client never sees the failure");
+        assert_eq!(cache_state(&headers), "STALE", "{what}");
+        assert_eq!(text_of(&body), "body#1 etag=\"v1\"", "{what}: the expired copy");
+        assert!(headers["age"].to_str().unwrap().parse::<u64>().unwrap() >= 1, "{what}");
+    }
+    let m = h.proxy.metrics().render().unwrap();
+    assert!(m.contains("velox_cache_stale_served_total{kind=\"sie\",route=\"route-0\"} 3"), "{m}");
+
+    // Once the backend is healthy again the object is simply refetched.
+    script.mode.store(0, Ordering::SeqCst);
+    let (_, headers, body) = fetch(h.addr, "GET", "/doc", &[]).await;
+    assert_eq!((cache_state(&headers), text_of(&body).as_str()), ("MISS", "body#2 etag=\"v1\""));
+    assert_eq!(cache_state(&fetch(h.addr, "GET", "/doc", &[]).await.1), "HIT");
+    h.running.shutdown().await;
+}
+
+#[tokio::test]
+async fn stale_if_error_ends_with_its_window_and_never_applies_to_must_revalidate() {
+    // Window of 1 s after a 1 s lifetime.
+    let script = Script::new("max-age=1, stale-if-error=1");
+    let b = scripted_backend(Arc::clone(&script)).await;
+    let h = start(&cache_config(b, "{}", "")).await;
+    fetch(h.addr, "GET", "/doc", &[]).await;
+    script.mode.store(1, Ordering::SeqCst);
+    tokio::time::sleep(Duration::from_millis(1300)).await;
+    assert_eq!(cache_state(&fetch(h.addr, "GET", "/doc", &[]).await.1), "STALE", "inside the window");
+    tokio::time::sleep(Duration::from_millis(1100)).await;
+    let (status, headers, _) = fetch(h.addr, "GET", "/doc", &[]).await;
+    assert_eq!(status, 500, "past the window the failure is the client's problem again");
+    assert!(!headers.contains_key("x-velox-cache") || cache_state(&headers) == "PASS");
+    h.running.shutdown().await;
+
+    // must-revalidate forbids serving stale at all, whatever else is said.
+    let script = Script::new("max-age=1, stale-if-error=60, stale-while-revalidate=60, must-revalidate");
+    let b = scripted_backend(Arc::clone(&script)).await;
+    let h = start(&cache_config(b, "{ stale_if_error = \"60s\" }", "")).await;
+    fetch(h.addr, "GET", "/doc", &[]).await;
+    tokio::time::sleep(Duration::from_millis(1300)).await;
+    script.mode.store(2, Ordering::SeqCst);
+    let (status, headers, _) = fetch(h.addr, "GET", "/doc", &[]).await;
+    assert_eq!(status, 503, "no stale copy for must-revalidate");
+    assert_ne!(cache_state(&headers), "STALE");
+    script.mode.store(0, Ordering::SeqCst);
+    let (_, headers, _) = fetch(h.addr, "GET", "/doc", &[]).await;
+    assert_eq!(cache_state(&headers), "MISS", "no stale-while-revalidate either: it was refetched synchronously");
+    h.running.shutdown().await;
+}
+
+#[tokio::test]
+async fn route_defaults_enable_stale_serving_for_backends_that_do_not_ask_for_it() {
+    let script = Script::new("max-age=1"); // says nothing about staleness
+    let b = scripted_backend(Arc::clone(&script)).await;
+    let h = start(&cache_config(b, "{ stale_if_error = \"30s\", stale_while_revalidate = \"30s\" }", "")).await;
+    fetch(h.addr, "GET", "/doc", &[]).await;
+    tokio::time::sleep(Duration::from_millis(1300)).await;
+    // stale-while-revalidate takes precedence while the backend is fine…
+    let (_, headers, _) = fetch(h.addr, "GET", "/doc", &[]).await;
+    assert_eq!(cache_state(&headers), "REVALIDATING");
+    until("the refresh", || script.not_modified.load(Ordering::SeqCst) == 1).await;
+    // …and the entry is fresh again; let it expire and break the backend.
+    until("fresh again", || {
+        h.proxy.metrics().render().unwrap().contains("velox_cache_revalidations_total{result=\"not_modified\"")
+    })
+    .await;
+    tokio::time::sleep(Duration::from_millis(1300)).await;
+    script.mode.store(1, Ordering::SeqCst);
+    let (status, headers, _) = fetch(h.addr, "GET", "/doc", &[]).await;
+    // …the stale-while-revalidate window is open too, so the stale copy is served either way,
+    // and the failing refresh does not take the object away.
+    assert_eq!(status, 200);
+    assert!(matches!(cache_state(&headers), "REVALIDATING" | "STALE"), "{headers:?}");
+    until("the failed refresh to be counted", || {
+        h.proxy.metrics().render().unwrap().contains("velox_cache_revalidations_total{result=\"error\"")
+    })
+    .await;
+    let (status, headers, body) = fetch(h.addr, "GET", "/doc", &[]).await;
+    assert_eq!(status, 200, "still served from the stale copy after the refresh failed");
+    assert!(cache_state(&headers) == "REVALIDATING" || cache_state(&headers) == "STALE");
+    assert!(text_of(&body).starts_with("body#1"));
+    h.running.shutdown().await;
+}
+
+// ---------------- IP access lists ----------------
+
+fn acl_config(backend: SocketAddr, security: &str, route: &str) -> String {
+    base(route, &[backend]).replace("[admin]", &format!("[security]\n{security}\n[admin]"))
+}
+
+#[tokio::test]
+async fn deny_and_allow_lists_apply_to_the_client_address_before_anything_else_happens() {
+    let (b, hits) = backend(echo_headers()).await;
+    // The test client is 127.0.0.1.
+    let h = start(&acl_config(b, "ip_deny = [\"127.0.0.0/8\"]", "")).await;
+    let r = raw(h.addr, &get("/secret"), Duration::from_secs(1)).await;
+    assert_eq!(status(&r), 403, "{r}");
+    assert!(
+        body(&r).contains("forbidden") && !body(&r).contains("127.0.0.1") && !body(&r).contains("deny"),
+        "no detail leaks: {r}"
+    );
+    assert_eq!(hits.load(Ordering::SeqCst), 0, "the backend never saw it");
+    assert!(h
+        .proxy
+        .metrics()
+        .render()
+        .unwrap()
+        .contains("velox_acl_denied_total{reason=\"deny\",route=\"route-0\",scope=\"global\"} 1"));
+    h.running.shutdown().await;
+
+    // An allow list that does not include the client.
+    let h = start(&acl_config(b, "ip_allow = [\"10.0.0.0/8\"]", "")).await;
+    assert_eq!(status(&raw(h.addr, &get("/"), Duration::from_secs(1)).await), 403);
+    assert!(h.proxy.metrics().render().unwrap().contains("reason=\"not_allowed\""));
+    h.running.shutdown().await;
+
+    // One that does, and deny still beats it.
+    let h = start(&acl_config(b, "ip_allow = [\"127.0.0.0/8\"]", "")).await;
+    assert_eq!(status(&raw(h.addr, &get("/"), Duration::from_secs(1)).await), 200);
+    h.running.shutdown().await;
+    let h = start(&acl_config(b, "ip_allow = [\"127.0.0.0/8\"]\nip_deny = [\"127.0.0.1/32\"]", "")).await;
+    assert_eq!(status(&raw(h.addr, &get("/"), Duration::from_secs(1)).await), 403, "deny wins");
+    h.running.shutdown().await;
+}
+
+#[tokio::test]
+async fn acls_see_the_real_client_not_the_proxy_in_front_of_us() {
+    let (b, hits) = backend(echo_headers()).await;
+    // 127.0.0.1 is a trusted proxy; the *client* it reports is what the lists judge.
+    let cfg = |extra: &str| acl_config(b, &format!("trusted_proxies = [\"127.0.0.0/8\"]\n{extra}"), "");
+    let h = start(&cfg("ip_deny = [\"203.0.113.0/24\"]")).await;
+    let via = |xff: &'static str| {
+        let addr = h.addr;
+        async move {
+            let req =
+                format!("GET / HTTP/1.1\r\nHost: example.test\r\nX-Forwarded-For: {xff}\r\nConnection: close\r\n\r\n");
+            status(&raw(addr, req.as_bytes(), Duration::from_secs(1)).await)
+        }
+    };
+    assert_eq!(via("203.0.113.9").await, 403, "the denied client behind the trusted proxy");
+    assert_eq!(via("198.51.100.4").await, 200, "another client behind the same proxy");
+    // The chain is walked right-to-left past trusted hops: the rightmost entry is what the
+    // trusted proxy actually saw, everything to its left is just a claim.
+    assert_eq!(
+        via("198.51.100.4, 203.0.113.9").await,
+        403,
+        "prepending a harmless address cannot launder a denied client"
+    );
+    assert_eq!(via("203.0.113.9, 198.51.100.4").await, 200, "a denied address further left is only a claim");
+    h.running.shutdown().await;
+
+    // Without trust, X-Forwarded-For is ignored: the TCP peer (127.0.0.1) is the client.
+    let h = start(&acl_config(b, "ip_deny = [\"203.0.113.0/24\"]", "")).await;
+    let req = b"GET / HTTP/1.1\r\nHost: example.test\r\nX-Forwarded-For: 203.0.113.9\r\nConnection: close\r\n\r\n";
+    assert_eq!(
+        status(&raw(h.addr, req, Duration::from_secs(1)).await),
+        200,
+        "a client cannot talk its way into or out of a list"
+    );
+    h.running.shutdown().await;
+    let _ = hits;
+}
+
+#[tokio::test]
+async fn proxy_protocol_addresses_are_what_the_acl_judges() {
+    use velox_proxy::proxy_protocol::encode_v2;
+    let (b, hits) = backend(echo_headers()).await;
+    let cfg = pp_config(b, "", "").replace("[admin]", "[security]\nip_deny = [\"203.0.113.0/24\"]\n[admin]");
+    let h = start(&cfg).await;
+    for (client, expect) in [("203.0.113.50:1", 403), ("198.51.100.50:1", 200)] {
+        let mut req = encode_v2(sa(client), sa("10.0.0.1:80"), &[]);
+        req.extend_from_slice(&get("/"));
+        assert_eq!(status(&raw(h.addr, &req, Duration::from_secs(1)).await), expect, "{client}");
+    }
+    assert_eq!(hits.load(Ordering::SeqCst), 1);
+    h.running.shutdown().await;
+}
+
+#[tokio::test]
+async fn route_lists_only_narrow_what_the_global_lists_allow_and_come_before_redirects_and_limits() {
+    let (b, hits) = backend(echo_headers()).await;
+    let toml = format!(
+        "[server]\nhttp_addr = \"127.0.0.1:0\"\n[security]\nip_allow = [\"127.0.0.0/8\"]\n\
+         [[upstream]]\nname = \"app\"\nbackends = [{{ addr = \"{b}\" }}]\n\
+         [[route]]\nname = \"open\"\nhosts = [\"open.test\"]\nupstream = \"app\"\n\
+         [[route]]\nname = \"closed\"\nhosts = [\"closed.test\"]\nupstream = \"app\"\nip_deny = [\"127.0.0.1/32\"]\n\
+         [[route]]\nname = \"redir\"\nhosts = [\"redir.test\"]\nupstream = \"app\"\nredirect_https = true\nip_deny = [\"127.0.0.1/32\"]\n\
+         [[route]]\nname = \"limited\"\nhosts = [\"limited.test\"]\nupstream = \"app\"\nip_deny = [\"127.0.0.1/32\"]\n\
+         rate_limit = {{ requests_per_second = 0.001, burst = 1 }}\n"
+    );
+    let h = start(&toml).await;
+    let on = |host: &'static str| {
+        let addr = h.addr;
+        async move {
+            let req = format!("GET / HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\r\n");
+            status(&raw(addr, req.as_bytes(), Duration::from_secs(1)).await)
+        }
+    };
+    assert_eq!(on("open.test").await, 200);
+    assert_eq!(on("closed.test").await, 403, "the route list narrows");
+    assert_eq!(on("redir.test").await, 403, "a refused client is not even redirected");
+    for _ in 0..3 {
+        assert_eq!(on("limited.test").await, 403, "refused every time: never reaches (or exhausts) the rate limiter");
+    }
+    assert!(!h.proxy.metrics().render().unwrap().contains("velox_rate_limited_total{"));
+    assert_eq!(hits.load(Ordering::SeqCst), 1);
+    h.running.shutdown().await;
+
+    // A route cannot widen the global allow list.
+    let toml = format!(
+        "[server]\nhttp_addr = \"127.0.0.1:0\"\n[security]\nip_allow = [\"10.0.0.0/8\"]\n\
+         [[upstream]]\nname = \"app\"\nbackends = [{{ addr = \"{b}\" }}]\n\
+         [[route]]\nupstream = \"app\"\nip_allow = [\"127.0.0.0/8\"]\n"
+    );
+    let h = start(&toml).await;
+    assert_eq!(status(&raw(h.addr, &get("/"), Duration::from_secs(1)).await), 403);
+    h.running.shutdown().await;
+}
+
+// ---------------- edge JWT verification ----------------
+
+mod jwt_support {
+    use base64::engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD};
+    use base64::Engine;
+    use ring::hmac;
+    use ring::rand::SystemRandom;
+    use ring::signature::{EcdsaKeyPair, KeyPair, ECDSA_P256_SHA256_FIXED_SIGNING};
+    use std::path::Path;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    pub const SECRET: &[u8] = b"an-hs256-secret-that-is-comfortably-long";
+
+    pub fn now() -> u64 {
+        SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs()
+    }
+
+    pub struct Es256 {
+        pair: EcdsaKeyPair,
+        pub spki_pem: String,
+    }
+
+    pub fn es256() -> Es256 {
+        let rng = SystemRandom::new();
+        let pkcs8 = EcdsaKeyPair::generate_pkcs8(&ECDSA_P256_SHA256_FIXED_SIGNING, &rng).unwrap();
+        let pair = EcdsaKeyPair::from_pkcs8(&ECDSA_P256_SHA256_FIXED_SIGNING, pkcs8.as_ref(), &rng).unwrap();
+        // SubjectPublicKeyInfo for a P-256 key: fixed prefix + the uncompressed point.
+        let mut spki = hex_to_bytes("3059301306072a8648ce3d020106082a8648ce3d030107034200");
+        spki.extend_from_slice(pair.public_key().as_ref());
+        let body = STANDARD
+            .encode(&spki)
+            .as_bytes()
+            .chunks(64)
+            .map(|c| std::str::from_utf8(c).unwrap().to_owned())
+            .collect::<Vec<_>>()
+            .join("\n");
+        Es256 { pair, spki_pem: format!("-----BEGIN PUBLIC KEY-----\n{body}\n-----END PUBLIC KEY-----\n") }
+    }
+
+    fn hex_to_bytes(s: &str) -> Vec<u8> {
+        (0..s.len()).step_by(2).map(|i| u8::from_str_radix(&s[i..i + 2], 16).unwrap()).collect()
+    }
+
+    fn enc(v: &serde_json::Value) -> String {
+        URL_SAFE_NO_PAD.encode(serde_json::to_vec(v).unwrap())
+    }
+
+    impl Es256 {
+        pub fn token(&self, claims: &serde_json::Value) -> String {
+            let input = format!("{}.{}", enc(&serde_json::json!({ "alg": "ES256" })), enc(claims));
+            let sig = self.pair.sign(&SystemRandom::new(), input.as_bytes()).unwrap();
+            format!("{input}.{}", URL_SAFE_NO_PAD.encode(sig.as_ref()))
+        }
+    }
+
+    pub fn hs256(claims: &serde_json::Value) -> String {
+        let input = format!("{}.{}", enc(&serde_json::json!({ "alg": "HS256" })), enc(claims));
+        let sig = hmac::sign(&hmac::Key::new(hmac::HMAC_SHA256, SECRET), input.as_bytes());
+        format!("{input}.{}", URL_SAFE_NO_PAD.encode(sig.as_ref()))
+    }
+
+    pub fn write(dir: &Path, name: &str, data: &[u8]) -> String {
+        let p = dir.join(name);
+        std::fs::write(&p, data).unwrap();
+        p.display().to_string()
+    }
+}
+
+fn jwt_config(backend: SocketAddr, jwt_table: &str) -> String {
+    base(&format!("[route.jwt]\n{jwt_table}\n"), &[backend])
+}
+
+fn bearer(token: &str) -> [(&'static str, String); 1] {
+    [("authorization", format!("Bearer {token}"))]
+}
+
+async fn get_with(
+    addr: SocketAddr,
+    path: &str,
+    headers: &[(&'static str, String)],
+) -> (http::StatusCode, http::HeaderMap, Vec<u8>) {
+    let hs: Vec<(&str, &str)> = headers.iter().map(|(k, v)| (*k, v.as_str())).collect();
+    fetch(addr, "GET", path, &hs).await
+}
+
+#[tokio::test]
+async fn invalid_tokens_never_reach_the_backend_and_valid_ones_do() {
+    use jwt_support::*;
+    let dir = tempfile::tempdir().unwrap();
+    let ec = es256();
+    let pem = write(dir.path(), "pub.pem", ec.spki_pem.as_bytes());
+    let secret = write(dir.path(), "secret", SECRET);
+    let (b, hits) = backend(echo_headers()).await;
+    let h = start(&jwt_config(
+        b,
+        &format!(
+            "algorithms = [\"ES256\", \"HS256\"]\npublic_key_file = \"{pem}\"\nsecret_file = \"{secret}\"\n\
+             issuer = \"https://issuer.test\"\naudience = [\"api\"]\nleeway = \"0s\""
+        ),
+    ))
+    .await;
+    let good = |extra: serde_json::Value| {
+        let mut c =
+            serde_json::json!({ "sub": "alice", "iss": "https://issuer.test", "aud": "api", "exp": now() + 300 });
+        c.as_object_mut().unwrap().extend(extra.as_object().unwrap().clone());
+        c
+    };
+
+    // 200 for both algorithms.
+    for (label, token) in
+        [("ES256", ec.token(&good(serde_json::json!({})))), ("HS256", hs256(&good(serde_json::json!({}))))]
+    {
+        let (status, _, _) = get_with(h.addr, "/", &bearer(&token)).await;
+        assert_eq!(status, 200, "{label}");
+    }
+    assert_eq!(hits.load(Ordering::SeqCst), 2);
+
+    // Everything else is a 401 before the backend is involved.
+    let expired = ec.token(&good(serde_json::json!({ "exp": now() - 60 })));
+    let wrong_iss = ec.token(&good(serde_json::json!({ "iss": "https://evil.test" })));
+    let wrong_aud = ec.token(&good(serde_json::json!({ "aud": "other" })));
+    let not_yet = ec.token(&good(serde_json::json!({ "nbf": now() + 600 })));
+    let no_exp = ec.token(&serde_json::json!({ "sub": "a", "iss": "https://issuer.test", "aud": "api" }));
+    let other_key = es256().token(&good(serde_json::json!({})));
+    let tampered = {
+        let t = ec.token(&good(serde_json::json!({})));
+        let mut p: Vec<&str> = t.split('.').collect();
+        let forged = base64::Engine::encode(
+            &base64::engine::general_purpose::URL_SAFE_NO_PAD,
+            br#"{"sub":"admin","iss":"https://issuer.test","aud":"api","exp":9999999999}"#,
+        );
+        p[1] = &forged;
+        p.join(".")
+    };
+    let none_alg = format!(
+        "{}.{}.AAAA",
+        base64::Engine::encode(&base64::engine::general_purpose::URL_SAFE_NO_PAD, br#"{"alg":"none"}"#),
+        base64::Engine::encode(
+            &base64::engine::general_purpose::URL_SAFE_NO_PAD,
+            serde_json::to_vec(&good(serde_json::json!({}))).unwrap()
+        )
+    );
+    for (label, token) in [
+        ("expired", expired),
+        ("wrong issuer", wrong_iss),
+        ("wrong audience", wrong_aud),
+        ("not yet valid", not_yet),
+        ("no exp", no_exp),
+        ("signed by another key", other_key),
+        ("tampered payload", tampered),
+        ("alg none", none_alg),
+        ("garbage", "not.a.jwt".to_owned()),
+        ("empty", String::new()),
+    ] {
+        let (status, headers, body) = get_with(h.addr, "/", &bearer(&token)).await;
+        assert_eq!(status, 401, "{label}");
+        assert_eq!(headers["www-authenticate"], "Bearer realm=\"velox\", error=\"invalid_token\"", "{label}");
+        let body = text_of(&body);
+        assert!(
+            !body.contains("expired") && !body.contains("signature") && !body.contains("audience"),
+            "{label}: no oracle: {body}"
+        );
+    }
+    // No token at all: 401 with the plain challenge (RFC 6750 §3.1).
+    let (status, headers, _) = fetch(h.addr, "GET", "/", &[]).await;
+    assert_eq!(status, 401);
+    assert_eq!(headers["www-authenticate"], "Bearer realm=\"velox\"");
+    assert_eq!(hits.load(Ordering::SeqCst), 2, "not one rejected request reached the backend");
+
+    let m = h.proxy.metrics().render().unwrap();
+    for reason in ["expired", "issuer", "audience", "not_yet_valid", "signature", "algorithm", "malformed", "missing"] {
+        assert!(
+            m.contains(&format!("velox_jwt_rejected_total{{reason=\"{reason}\",route=\"route-0\"}}")),
+            "{reason}: {m}"
+        );
+    }
+    h.running.shutdown().await;
+}
+
+#[tokio::test]
+async fn verified_claims_are_forwarded_and_client_supplied_claim_headers_are_discarded() {
+    use jwt_support::*;
+    let dir = tempfile::tempdir().unwrap();
+    let ec = es256();
+    let pem = write(dir.path(), "pub.pem", ec.spki_pem.as_bytes());
+    let (b, _) = backend(echo_headers()).await;
+    let h = start(&jwt_config(
+        b,
+        &format!("public_key_file = \"{pem}\"\nforward_claims = [\"sub\", \"roles\", \"tenant_id\", \"missing\", \"nested\"]"),
+    ))
+    .await;
+    let token = ec.token(&serde_json::json!({
+        "sub": "alice", "roles": ["admin", "dev"], "tenant_id": 42, "nested": { "x": 1 }, "exp": now() + 300
+    }));
+    let mut headers = bearer(&token).to_vec();
+    // A client trying to assert its own identity to the backend.
+    headers.push(("x-jwt-sub", "root".to_owned()));
+    headers.push(("x-jwt-admin", "true".to_owned()));
+    let (status, _, body) = get_with(h.addr, "/who", &headers).await;
+    assert_eq!(status, 200);
+    let echoed = text_of(&body).to_ascii_lowercase();
+    assert!(echoed.contains("x-jwt-sub: alice"), "{echoed}");
+    assert!(echoed.contains("x-jwt-roles: admin,dev"), "{echoed}");
+    assert!(echoed.contains("x-jwt-tenant_id: 42"), "{echoed}");
+    assert!(!echoed.contains("root") && !echoed.contains("x-jwt-admin"), "spoofed headers must be dropped: {echoed}");
+    assert!(!echoed.contains("x-jwt-nested") && !echoed.contains("x-jwt-missing"), "{echoed}");
+    assert!(echoed.contains("authorization: bearer"), "the token itself still travels on: {echoed}");
+    h.running.shutdown().await;
+}
+
+#[tokio::test]
+async fn optional_tokens_cors_preflights_and_unprotected_routes() {
+    use jwt_support::*;
+    let dir = tempfile::tempdir().unwrap();
+    let ec = es256();
+    let pem = write(dir.path(), "pub.pem", ec.spki_pem.as_bytes());
+    let (b, hits) = backend(echo_headers()).await;
+
+    // `required = false`: anonymous passes, a presented token must still be valid.
+    let h = start(&jwt_config(b, &format!("public_key_file = \"{pem}\"\nrequired = false"))).await;
+    assert_eq!(fetch(h.addr, "GET", "/", &[]).await.0, 200, "anonymous allowed");
+    let (status, ..) = get_with(h.addr, "/", &bearer(&ec.token(&serde_json::json!({ "exp": now() + 60 })))).await;
+    assert_eq!(status, 200);
+    assert_eq!(get_with(h.addr, "/", &bearer("bad.token.here")).await.0, 401, "a present token is always checked");
+    h.running.shutdown().await;
+
+    // CORS preflights carry no credentials: they must not be blocked by JWT.
+    let toml = jwt_config(b, &format!("public_key_file = \"{pem}\"")).replace(
+        "[route.jwt]",
+        "[route.cors]\nallow_origins = [\"https://app.test\"]\nallow_headers = [\"authorization\"]\n[route.jwt]",
+    );
+    let h = start(&toml).await;
+    let (status, headers, _) = fetch(
+        h.addr,
+        "OPTIONS",
+        "/api",
+        &[
+            ("origin", "https://app.test"),
+            ("access-control-request-method", "GET"),
+            ("access-control-request-headers", "authorization"),
+        ],
+    )
+    .await;
+    assert_eq!(status, 204, "the preflight is answered before authentication");
+    assert_eq!(headers["access-control-allow-origin"], "https://app.test");
+    // …while the real request still needs a token, and its 401 carries the CORS headers.
+    let (status, headers, _) = fetch(h.addr, "GET", "/api", &[("origin", "https://app.test")]).await;
+    assert_eq!(status, 401);
+    assert_eq!(headers["access-control-allow-origin"], "https://app.test");
+    h.running.shutdown().await;
+    assert_eq!(hits.load(Ordering::SeqCst), 2);
+
+    // A route without [route.jwt] is open.
+    let h = start(&base("", &[b])).await;
+    assert_eq!(fetch(h.addr, "GET", "/", &[]).await.0, 200);
+    h.running.shutdown().await;
+}
+
+#[tokio::test]
+async fn jwt_keys_rotate_live_and_a_broken_rotation_does_not_lock_users_out() {
+    use jwt_support::*;
+    let dir = tempfile::tempdir().unwrap();
+    let (old, new) = (es256(), es256());
+    let pem = write(dir.path(), "pub.pem", old.spki_pem.as_bytes());
+    let (b, _) = backend(echo_headers()).await;
+    let h = start(&jwt_config(b, &format!("public_key_file = \"{pem}\"\nreload_interval = \"100ms\""))).await;
+    let claims = || serde_json::json!({ "exp": now() + 600 });
+    assert_eq!(get_with(h.addr, "/", &bearer(&old.token(&claims()))).await.0, 200);
+    assert_eq!(get_with(h.addr, "/", &bearer(&new.token(&claims()))).await.0, 401, "not yet trusted");
+
+    // Rotate: publish the new key in place (different length, so the change is certain to be seen).
+    let rotated = format!("{}\n# rotated\n", new.spki_pem);
+    std::fs::write(dir.path().join("pub.pem"), rotated).unwrap();
+    let mut switched = false;
+    for _ in 0..60 {
+        if get_with(h.addr, "/", &bearer(&new.token(&claims()))).await.0 == 200 {
+            switched = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(switched, "the rotated key was never picked up");
+    assert_eq!(get_with(h.addr, "/", &bearer(&old.token(&claims()))).await.0, 401, "the retired key stopped working");
+
+    // A half-written key file keeps the last good key serving.
+    std::fs::write(dir.path().join("pub.pem"), "-----BEGIN PUBLIC KEY-----\ngarbage").unwrap();
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    assert_eq!(get_with(h.addr, "/", &bearer(&new.token(&claims()))).await.0, 200, "last good keys kept");
     h.running.shutdown().await;
 }

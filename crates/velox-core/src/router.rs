@@ -28,6 +28,10 @@ pub struct Route {
     pub timeout: Option<Duration>,
     /// Per-route override of `compression.enabled` (`None` = follow the global switch).
     pub compress: Option<bool>,
+    /// Edge JWT verification settings, if the route has them.
+    pub jwt: Option<crate::config::JwtConfig>,
+    /// This route's own client ACL (applied in addition to the global one).
+    pub acl: crate::acl::IpFilter,
     /// Response-cache settings, if the route caches (and has not disabled it).
     pub cache: Option<crate::config::RouteCacheConfig>,
     /// Compiled CORS policy, if the route has one.
@@ -61,6 +65,8 @@ impl Route {
             request_headers,
             timeout: cfg.timeout,
             compress: cfg.compress,
+            jwt: cfg.jwt.clone(),
+            acl: crate::acl::IpFilter::new(&cfg.ip_allow, &cfg.ip_deny),
             cache: cfg.cache.clone().filter(|c| c.enabled),
             cors: cfg.cors.as_ref().and_then(crate::cors::CorsPolicy::new),
             upstream,

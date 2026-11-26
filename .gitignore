@@ -15,3 +15,5 @@
 *.pem
 *.key
 /acme-cache/
+# Throwaway, clearly-labelled test fixtures (see the README next to them)
+!/crates/velox-security/tests/fixtures/*.pem

@@ -13,6 +13,9 @@ arbitrary = { version = "1", features = ["derive"] }
 http = "1"
 velox-core = { path = "../crates/velox-core" }
 velox-proxy = { path = "../crates/velox-proxy" }
+velox-security = { path = "../crates/velox-security" }
+ring = "0.17"
+base64 = "0.22"
 
 [workspace]
 
@@ -68,6 +71,13 @@ bench = false
 [[bin]]
 name = "cache_policy"
 path = "fuzz_targets/cache_policy.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "jwt_token"
+path = "fuzz_targets/jwt_token.rs"
 test = false
 doc = false
 bench = false

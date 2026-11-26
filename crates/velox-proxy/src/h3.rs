@@ -2,7 +2,7 @@
 
 use crate::body::{BodyError, ChannelBody, LengthMismatch};
 use crate::error::{empty, BoxError, ProxyBody};
-use crate::handler::{ConnMeta, Proxy};
+use crate::handler::{ClientCertInfo, ConnMeta, Proxy};
 use crate::socket;
 use bytes::{Buf, Bytes};
 use http::{Method, Request, Response};
@@ -14,6 +14,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{mpsc, oneshot};
 use velox_core::Config;
+use velox_security::client_cert::ClientCert;
 use velox_security::SniResolver;
 use velox_telemetry::Protocol;
 
@@ -132,6 +133,12 @@ async fn serve_connection(conn: quinn::Connection, peer: SocketAddr, proxy: Arc<
             return;
         }
     };
+    // The QUIC handshake verified any client certificate; this is who it names.
+    let client_cert: Option<Arc<ClientCert>> = conn
+        .peer_identity()
+        .and_then(|id| id.downcast::<Vec<rustls::pki_types::CertificateDer<'static>>>().ok())
+        .and_then(|chain| ClientCert::from_chain(Some(&chain)))
+        .map(Arc::new);
     let sd = proxy.shutdown().clone();
     let mut draining = false;
     loop {
@@ -149,8 +156,9 @@ async fn serve_connection(conn: quinn::Connection, peer: SocketAddr, proxy: Arc<
         match next {
             Ok(Some(resolver)) => {
                 let proxy = Arc::clone(&proxy);
+                let client_cert = client_cert.clone();
                 sd.tasks.spawn(async move {
-                    if let Err(e) = serve_request(resolver, peer, &proxy).await {
+                    if let Err(e) = serve_request(resolver, peer, client_cert, &proxy).await {
                         tracing::debug!(%peer, error = %e, "HTTP/3 request ended with error");
                     }
                 });
@@ -295,6 +303,7 @@ async fn pump_request_body(
 async fn serve_request(
     resolver: h3::server::RequestResolver<h3_quinn::Connection, Bytes>,
     peer: SocketAddr,
+    client_cert: Option<Arc<ClientCert>>,
     proxy: &Arc<Proxy>,
 ) -> Result<(), BoxError> {
     let cfg = proxy.state().load().config.clone();
@@ -354,7 +363,10 @@ async fn serve_request(
         }
     };
 
-    let request = Request::from_parts(parts, body);
+    let mut request = Request::from_parts(parts, body);
+    if let Some(cert) = client_cert {
+        request.extensions_mut().insert(ClientCertInfo(cert));
+    }
     let meta = ConnMeta { peer, protocol: Protocol::H3, tls: true };
     let response = proxy.handle(request, meta, None).await;
     write_response(&mut send, response, is_head, cfg.timeouts.write_stall).await

@@ -48,6 +48,10 @@ pub struct CacheStats {
     pub misses: u64,
     /// Entries removed to make room.
     pub evictions: u64,
+    /// Requests answered with a stale entry (`stale-while-revalidate` / `stale-if-error`).
+    pub stale_served: u64,
+    /// Requests that waited for another request's fetch instead of making their own.
+    pub coalesced: u64,
 }
 
 /// What the admin API needs from the cache.
